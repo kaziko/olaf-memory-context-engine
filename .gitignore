@@ -1,0 +1,6 @@
+/target
+.olaf/
+*.snap
+# Claude Code auto-generated meta-files (not project code)
+_bmad-output/
+**/CLAUDE.md

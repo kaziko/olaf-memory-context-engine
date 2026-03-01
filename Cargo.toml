@@ -1,0 +1,22 @@
+[package]
+name = "olaf"
+version = "0.1.0"
+edition = "2024"
+description = "Codebase context engine for Claude Code"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite_migration = "2.4"
+blake3 = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+pretty_assertions = "1.4"
