@@ -339,3 +339,49 @@ fn test_notification_with_invalid_jsonrpc_produces_no_output() {
         "notification must produce zero output even with invalid jsonrpc"
     );
 }
+
+#[test]
+fn test_object_without_method_returns_32600() {
+    // {"jsonrpc":"2.0"} — valid JSON object, no id, no method — invalid request not notification
+    let req = serde_json::json!({"jsonrpc": "2.0"});
+
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+
+    let r = &responses[0];
+    assert!(r["id"].is_null(), "id must be null when request had no id");
+    assert_eq!(r["error"]["code"], -32600, "absent id + missing method must be -32600, not silence");
+}
+
+#[test]
+fn test_object_with_non_string_method_and_no_id_returns_32600() {
+    // {"jsonrpc":"2.0","method":123} — non-string method, no id — invalid request not notification
+    let mut child = spawn_server();
+    {
+        let stdin = child.stdin.take().unwrap();
+        let mut w = BufWriter::new(stdin);
+        writeln!(w, r#"{{"jsonrpc":"2.0","method":123}}"#).unwrap();
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "must produce exactly one error response");
+
+    let r: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert!(r["id"].is_null());
+    assert_eq!(r["error"]["code"], -32600);
+}
+
+#[test]
+fn test_non_object_payload_returns_32600() {
+    // [] and 42 are valid JSON but not JSON objects — must return -32600, not silence
+    let responses = run_requests(&[serde_json::json!([]), serde_json::json!(42)]);
+    assert_eq!(responses.len(), 2, "both non-object payloads must produce error responses");
+
+    for r in &responses {
+        assert!(r["id"].is_null());
+        assert_eq!(r["error"]["code"], -32600);
+    }
+}
