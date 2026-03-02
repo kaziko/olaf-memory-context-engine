@@ -15,7 +15,7 @@ enum Commands {
     Index,
     /// Start the MCP stdio server
     Serve,
-    /// Show index statistics and diagnostics
+    /// Show index statistics
     Status,
     /// Initialize Olaf in the current project
     Init,

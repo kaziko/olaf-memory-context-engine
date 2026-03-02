@@ -15,8 +15,33 @@ pub(crate) struct SymbolDiff {
     pub removed: usize,
 }
 
+/// Index statistics as stored in the DB — shared by `olaf status` (CLI)
+/// and the `index_status` MCP tool (Story 2.3).
+pub struct DbStats {
+    pub files: i64,
+    pub symbols: i64,
+    pub edges: i64,
+    pub observations: i64,
+    /// Unix timestamp of most recently indexed file; `None` if no files indexed.
+    pub last_indexed_at: Option<i64>,
+}
+
+pub fn load_db_stats(conn: &Connection) -> Result<DbStats, StoreError> {
+    let (files, symbols, edges, observations, last_indexed_at) = conn.query_row(
+        "SELECT \
+            (SELECT COUNT(*) FROM files), \
+            (SELECT COUNT(*) FROM symbols), \
+            (SELECT COUNT(*) FROM edges), \
+            (SELECT COUNT(*) FROM observations), \
+            (SELECT MAX(last_indexed_at) FROM files)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    Ok(DbStats { files, symbols, edges, observations, last_indexed_at })
+}
+
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StoreError {
+pub enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -586,5 +611,31 @@ mod tests {
         assert!(map.contains_key("src/x.rs::fn_a"));
         assert!(map.contains_key("src/x.rs::fn_b"));
         assert!(map.contains_key("src/x.rs::fn_c"));
+    }
+
+    #[test]
+    fn test_load_db_stats_empty_db() {
+        let conn = open_test_db();
+        let stats = load_db_stats(&conn).unwrap();
+        assert_eq!(stats.files, 0);
+        assert_eq!(stats.symbols, 0);
+        assert_eq!(stats.edges, 0);
+        assert_eq!(stats.observations, 0);
+        assert!(stats.last_indexed_at.is_none());
+    }
+
+    #[test]
+    fn test_load_db_stats_after_index() {
+        let dir = tempdir().unwrap();
+        // Write a Rust source file so the indexer has something to parse
+        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+
+        let mut conn = db::open(&dir.path().join("index.db")).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let stats = load_db_stats(&conn).unwrap();
+        assert!(stats.files > 0, "at least one file must be indexed");
+        assert!(stats.symbols > 0, "at least one symbol must be indexed");
+        assert!(stats.last_indexed_at.is_some(), "last_indexed_at must be set after indexing");
     }
 }
