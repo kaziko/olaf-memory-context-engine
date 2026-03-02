@@ -254,6 +254,72 @@ fn test_source_hash_populated() {
     );
 }
 
+// ──── Code-review regression tests (bugs fixed after Story 1.3 review) ────
+
+#[test]
+fn test_php_namespaced_functions_are_disambiguated() {
+    // Regression: top-level functions must be namespace-qualified to prevent FQN collisions.
+    // Before fix: both produced `src/demo.php::f`; after fix they are distinct.
+    let source = b"<?php\nnamespace A { function f() {} }\nnamespace B { function f() {} }";
+    let (symbols, _) = parse_file("src/demo.php", source).unwrap();
+    let fqns: Vec<_> = symbols.iter().map(|s| s.fqn.as_str()).collect();
+    assert!(
+        fqns.iter().any(|f| *f == "src/demo.php::A\\f"),
+        "function f in namespace A must be qualified as A\\f; got: {:?}",
+        fqns
+    );
+    assert!(
+        fqns.iter().any(|f| *f == "src/demo.php::B\\f"),
+        "function f in namespace B must be qualified as B\\f; got: {:?}",
+        fqns
+    );
+    assert_eq!(
+        fqns.iter().filter(|f| f.ends_with("::f")).count(),
+        0,
+        "no unqualified ::f FQN should exist; got: {:?}",
+        fqns
+    );
+}
+
+#[test]
+fn test_python_nested_function_inside_method_is_not_a_method() {
+    // Regression: `inner` defined inside a method must be Function, not Method.
+    // Before fix: parent_class was carried into function bodies, misclassifying inner.
+    let source = b"class A:\n    def m(self):\n        def inner(): pass";
+    let (symbols, _) = parse_file("src/demo.py", source).unwrap();
+    let inner = symbols.iter().find(|s| s.name == "inner");
+    assert!(inner.is_some(), "inner function must be extracted");
+    let inner = inner.unwrap();
+    assert_eq!(
+        inner.kind,
+        olaf::parser::SymbolKind::Function,
+        "nested function inside method must be SymbolKind::Function, not Method; fqn={}",
+        inner.fqn
+    );
+    assert!(
+        !inner.fqn.contains("::A::"),
+        "inner function FQN must not include the class prefix; got: {}",
+        inner.fqn
+    );
+}
+
+#[test]
+fn test_rust_pub_use_import_strips_visibility_modifier() {
+    // Regression: `pub use foo;` must yield target "foo", not "pub use foo".
+    let source = b"pub use std::path::Path;";
+    let (_, edges) = parse_file("src/demo.rs", source).unwrap();
+    let import_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .collect();
+    assert_eq!(import_edges.len(), 1, "expected exactly 1 imports edge");
+    assert_eq!(
+        import_edges[0].target_fqn, "std::path::Path",
+        "pub use target must strip visibility modifier; got: {:?}",
+        import_edges[0].target_fqn
+    );
+}
+
 // ──── Story 1.3: Python parser ────
 
 #[test]
