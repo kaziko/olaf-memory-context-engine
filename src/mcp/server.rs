@@ -1,5 +1,6 @@
 // stdout-pure: no print!/println! ever in this module
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::mcp::{
@@ -7,7 +8,7 @@ use crate::mcp::{
     tools,
 };
 
-pub(crate) fn run() -> anyhow::Result<()> {
+pub(crate) fn run(mut conn: rusqlite::Connection, project_root: PathBuf) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Lock both for the duration — avoids repeated locking overhead in the hot loop
@@ -27,7 +28,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             continue;
         }
 
-        if let Some(response) = handle_message(&line) {
+        if let Some(response) = handle_message(&mut conn, &project_root, &line) {
             let json = match serde_json::to_string(&response) {
                 Ok(j) => j,
                 Err(e) => {
@@ -44,7 +45,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_message(line: &str) -> Option<Response> {
+fn handle_message(conn: &mut rusqlite::Connection, project_root: &std::path::Path, line: &str) -> Option<Response> {
     // Stage 1: parse as raw JSON value.
     // True parse failures (malformed JSON) → -32700, id: null.
     let value: Value = match serde_json::from_str(line) {
@@ -128,10 +129,12 @@ fn handle_message(line: &str) -> Option<Response> {
         }
     };
 
-    Some(dispatch_request(id, method, obj.get("params")))
+    Some(dispatch_request(conn, project_root, id, method, obj.get("params")))
 }
 
 fn dispatch_request(
+    conn: &mut rusqlite::Connection,
+    project_root: &std::path::Path,
     id: Value,
     method: &str,
     params: Option<&Value>,
@@ -153,7 +156,7 @@ fn dispatch_request(
             Response::ok(id, serde_json::json!({ "tools": tools::list() }))
         }
 
-        "tools/call" => match tools::dispatch(params) {
+        "tools/call" => match tools::dispatch(conn, project_root, params) {
             Ok(text) => Response::ok(
                 id,
                 serde_json::json!({ "content": [{ "type": "text", "text": text }] }),

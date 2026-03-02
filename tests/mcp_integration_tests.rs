@@ -1,21 +1,24 @@
 use std::io::{BufWriter, Write};
 use std::process::{Command, Stdio};
 
-fn spawn_server() -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_olaf"))
+fn spawn_server() -> (std::process::Child, tempfile::TempDir) {
+    let tmpdir = tempfile::tempdir().expect("tempdir creation failed");
+    let child = Command::new(env!("CARGO_BIN_EXE_olaf"))
         .arg("serve")
+        .current_dir(tmpdir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null()) // suppress server diagnostics in test output
         .spawn()
-        .expect("failed to spawn olaf serve")
+        .expect("failed to spawn olaf serve");
+    (child, tmpdir)
 }
 
 /// Write requests (each as a newline-terminated JSON string), close stdin,
 /// wait for process exit, collect and parse all stdout lines.
 /// Asserts that the process exits successfully.
 fn run_requests(requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
 
     {
         let stdin = child.stdin.take().unwrap();
@@ -73,7 +76,7 @@ fn test_notification_produces_no_output() {
         // no "id" field
     });
 
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -91,6 +94,8 @@ fn test_notification_produces_no_output() {
 
 #[test]
 fn test_tools_list_empty() {
+    // This test was written for Story 2.1; after Story 2.2 the list is non-empty.
+    // We keep the test but relax the assertion to just verify it's an array.
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -104,7 +109,6 @@ fn test_tools_list_empty() {
     let r = &responses[0];
     assert_eq!(r["id"], 2);
     assert!(r["result"]["tools"].is_array(), "tools must be array");
-    assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 0, "tools must be empty in Story 2.1");
 }
 
 #[test]
@@ -164,7 +168,7 @@ fn test_invalid_params_returns_32602() {
 #[test]
 fn test_parse_error_returns_32700_with_null_id() {
     // Malformed JSON → -32700 with id: null (JSON-RPC 2.0 §5 requirement)
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -226,7 +230,7 @@ fn test_stdout_purity() {
         }
     });
 
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -283,7 +287,7 @@ fn test_invalid_jsonrpc_version_returns_32600() {
 #[test]
 fn test_invalid_id_type_returns_32600() {
     // id: true (boolean) is not a valid JSON-RPC 2.0 id type — must return -32600
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -325,7 +329,7 @@ fn test_valid_json_missing_method_returns_32600() {
 #[test]
 fn test_notification_with_invalid_jsonrpc_produces_no_output() {
     // No id field → notification, so server must stay silent even though jsonrpc is wrong (P2b)
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -356,7 +360,7 @@ fn test_object_without_method_returns_32600() {
 #[test]
 fn test_object_with_non_string_method_and_no_id_returns_32600() {
     // {"jsonrpc":"2.0","method":123} — non-string method, no id — invalid request not notification
-    let mut child = spawn_server();
+    let (mut child, _tmpdir) = spawn_server();
     {
         let stdin = child.stdin.take().unwrap();
         let mut w = BufWriter::new(stdin);
@@ -383,5 +387,90 @@ fn test_non_object_payload_returns_32600() {
     for r in &responses {
         assert!(r["id"].is_null());
         assert_eq!(r["error"]["code"], -32600);
+    }
+}
+
+// ─── Story 2.2 Tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_tools_list_includes_context_and_impact() {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools must be array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    // Do NOT assert exact count — Story 2.3 adds more tools
+    assert!(names.contains(&"get_context"), "must include get_context");
+    assert!(names.contains(&"get_impact"), "must include get_impact");
+}
+
+#[test]
+fn test_get_context_empty_db() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"intent":"test intent"}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    let r = &responses[0];
+    assert_eq!(r["id"], 2);
+    // Must succeed (result with content), not return -32603 internal error
+    assert!(r["result"].is_object(), "get_context must return result, not error; got: {}", r);
+    assert!(r["result"]["content"].is_array(), "result must have content array");
+}
+
+#[test]
+fn test_get_context_missing_intent_returns_32602() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"file_hints":["src/main.rs"]}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["error"]["code"], -32602, "missing intent must return -32602");
+}
+
+#[test]
+fn test_get_impact_empty_db() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":4,"method":"tools/call",
+        "params":{"name":"get_impact","arguments":{"symbol_fqn":"src/main.rs::some_fn"}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    let r = &responses[0];
+    assert_eq!(r["id"], 4);
+    // Returns "not found" text response, NOT a JSON-RPC error
+    assert!(r["result"].is_object(), "get_impact must return result, not error; got: {}", r);
+}
+
+#[test]
+fn test_get_impact_missing_fqn_returns_32602() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":5,"method":"tools/call",
+        "params":{"name":"get_impact","arguments":{}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["error"]["code"], -32602, "missing symbol_fqn must return -32602");
+}
+
+#[test]
+fn test_get_impact_depth_parameter_accepted() {
+    // Verify depth=1 and depth=3 are both accepted (not -32602) and return success responses.
+    // Content difference is not testable with an empty DB — both return "Symbol not found" text.
+    // This test confirms the depth parameter is parsed correctly without error.
+    let depth1 = serde_json::json!({
+        "jsonrpc":"2.0","id":6,"method":"tools/call",
+        "params":{"name":"get_impact","arguments":{"symbol_fqn":"src/lib.rs::some_fn","depth":1}}
+    });
+    let depth3 = serde_json::json!({
+        "jsonrpc":"2.0","id":7,"method":"tools/call",
+        "params":{"name":"get_impact","arguments":{"symbol_fqn":"src/lib.rs::some_fn","depth":3}}
+    });
+    let responses = run_requests(&[depth1, depth3]);
+    assert_eq!(responses.len(), 2, "both requests must produce responses");
+    for (i, r) in responses.iter().enumerate() {
+        assert!(r["result"].is_object(), "depth={} request must return result, not error; got: {}", i+1, r);
     }
 }
