@@ -6,6 +6,7 @@ description = "Codebase context engine for Claude Code"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4"
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"

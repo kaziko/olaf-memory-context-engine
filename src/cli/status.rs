@@ -1,10 +1,16 @@
 use anyhow::Context;
+use crate::cli::setup::{check_hooks_installed, check_mcp_registered, print_branding};
 
 pub(crate) fn run() -> anyhow::Result<()> {
-    let db_path = std::env::current_dir()?.join(".olaf/index.db");
+    let cwd = std::env::current_dir()?;
+    let db_path = cwd.join(".olaf/index.db");
+
+    print_branding();
 
     if !db_path.exists() {
         println!("Index not initialized. Run `olaf index` to build the index.");
+        // Still show MCP/hook diagnostics even when uninitialized
+        print_diagnostics(&cwd)?;
         return Ok(());
     }
 
@@ -23,6 +29,35 @@ pub(crate) fn run() -> anyhow::Result<()> {
     println!("Edges:          {}", stats.edges);
     println!("Observations:   {}", stats.observations);
     println!("Last indexed:   {}", last_indexed);
+
+    print_diagnostics(&cwd)?;
+
+    Ok(())
+}
+
+fn print_diagnostics(cwd: &std::path::Path) -> anyhow::Result<()> {
+    println!();
+
+    let (registered, mcp_path) = check_mcp_registered(cwd)?;
+    println!("MCP config:         {}", mcp_path.display());
+    println!(
+        "MCP status:         {}",
+        if registered { "registered" } else { "not registered" }
+    );
+
+    let [post, pre, session] = check_hooks_installed(cwd)?;
+    println!(
+        "Hook PostToolUse:   {}",
+        if post { "installed" } else { "missing" }
+    );
+    println!(
+        "Hook PreToolUse:    {}",
+        if pre { "installed" } else { "missing" }
+    );
+    println!(
+        "Hook SessionEnd:    {}",
+        if session { "installed" } else { "missing" }
+    );
 
     Ok(())
 }

@@ -4,4 +4,5 @@ pub(crate) mod observe;
 pub(crate) mod restore;
 pub(crate) mod serve;
 pub(crate) mod sessions;
+pub(crate) mod setup;
 pub(crate) mod status;

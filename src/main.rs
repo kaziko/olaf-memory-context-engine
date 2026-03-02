@@ -3,7 +3,7 @@ mod cli;
 use clap::Parser;
 
 #[derive(clap::Parser)]
-#[command(version, about = "Codebase context engine for Claude Code")]
+#[command(about = "Codebase context engine for Claude Code", disable_version_flag = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -36,6 +36,11 @@ enum Commands {
         file: Option<std::path::PathBuf>,
         timestamp: Option<i64>,
     },
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -52,7 +57,30 @@ enum RestoreSubcommands {
     List { file: std::path::PathBuf },
 }
 
+/// Returns true only when `--version` or `-V` appears before any positional argument in argv.
+/// Any subcommand (including `help` and future additions) is a positional argument and does
+/// not start with `-`, so this check is future-proof without maintaining a name list.
+fn has_toplevel_version_flag() -> bool {
+    for arg in std::env::args().skip(1) {
+        if !arg.starts_with('-') {
+            return false; // positional arg (subcommand) found before --version/-V
+        }
+        if arg == "--version" || arg == "-V" {
+            return true;
+        }
+    }
+    false
+}
+
 fn main() -> anyhow::Result<()> {
+    // Intercept top-level --version/-V before clap so the branding block appears first.
+    // With disable_version_flag = true, clap does not handle these flags itself.
+    if has_toplevel_version_flag() {
+        cli::setup::print_branding();
+        println!("olaf {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let cli = Cli::parse();
@@ -99,6 +127,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "olaf", &mut std::io::stdout());
+        }
     }
 
     Ok(())
