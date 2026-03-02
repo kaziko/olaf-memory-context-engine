@@ -1,4 +1,10 @@
 pub(crate) fn run() -> anyhow::Result<()> {
-    eprintln!("not yet implemented");
+    let project_root = std::env::current_dir()?;
+    let db_path = project_root.join(".olaf").join("index.db");
+    let mut conn = olaf::db::open(&db_path)?;
+
+    let stats = olaf::index::run(&mut conn, &project_root)?;
+
+    eprintln!("indexed {} files, {} symbols, {} edges", stats.files, stats.symbols, stats.edges);
     Ok(())
 }

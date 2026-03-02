@@ -264,12 +264,12 @@ fn test_php_namespaced_functions_are_disambiguated() {
     let (symbols, _) = parse_file("src/demo.php", source).unwrap();
     let fqns: Vec<_> = symbols.iter().map(|s| s.fqn.as_str()).collect();
     assert!(
-        fqns.iter().any(|f| *f == "src/demo.php::A\\f"),
+        fqns.contains(&"src/demo.php::A\\f"),
         "function f in namespace A must be qualified as A\\f; got: {:?}",
         fqns
     );
     assert!(
-        fqns.iter().any(|f| *f == "src/demo.php::B\\f"),
+        fqns.contains(&"src/demo.php::B\\f"),
         "function f in namespace B must be qualified as B\\f; got: {:?}",
         fqns
     );
@@ -610,17 +610,17 @@ fn test_php_braced_namespace_does_not_leak_to_siblings() {
     let (symbols, _) = parse_file("src/foo.php", source).unwrap();
     let fqns: Vec<_> = symbols.iter().map(|s| s.fqn.as_str()).collect();
     assert!(
-        fqns.iter().any(|f| *f == "src/foo.php::A\\X"),
+        fqns.contains(&"src/foo.php::A\\X"),
         "X must be in namespace A; got: {:?}",
         fqns
     );
     assert!(
-        fqns.iter().any(|f| *f == "src/foo.php::Y"),
+        fqns.contains(&"src/foo.php::Y"),
         "Y must NOT be namespace-qualified (braced scope ended); got: {:?}",
         fqns
     );
     assert!(
-        !fqns.iter().any(|f| *f == "src/foo.php::A\\Y"),
+        !fqns.contains(&"src/foo.php::A\\Y"),
         "Y must not inherit namespace A — braced scope must not leak; got: {:?}",
         fqns
     );
@@ -633,12 +633,12 @@ fn test_php_unbraced_namespace_applies_to_subsequent_declarations() {
     let (symbols, _) = parse_file("src/foo.php", source).unwrap();
     let fqns: Vec<_> = symbols.iter().map(|s| s.fqn.as_str()).collect();
     assert!(
-        fqns.iter().any(|f| *f == "src/foo.php::A\\X"),
+        fqns.contains(&"src/foo.php::A\\X"),
         "X must be in namespace A after unbraced declaration; got: {:?}",
         fqns
     );
     assert!(
-        fqns.iter().any(|f| *f == "src/foo.php::A\\Y"),
+        fqns.contains(&"src/foo.php::A\\Y"),
         "Y must also be in namespace A — unbraced namespace continues for all siblings; got: {:?}",
         fqns
     );
