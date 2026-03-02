@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite_migration::{Migrations, M};
+use rusqlite_migration::{M, Migrations};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {

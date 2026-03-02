@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{make_fqn, make_symbol, Edge, EdgeKind, ParserError, Symbol, SymbolKind};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -12,7 +12,15 @@ pub(crate) fn parse(
     let root = tree.root_node();
     let mut symbols = Vec::new();
     let mut edges = Vec::new();
-    extract_nodes(root, source, relative_path, None, None, &mut symbols, &mut edges)?;
+    extract_nodes(
+        root,
+        source,
+        relative_path,
+        None,
+        None,
+        &mut symbols,
+        &mut edges,
+    )?;
     Ok((symbols, edges))
 }
 
@@ -35,14 +43,22 @@ fn extract_nodes(
                     SymbolKind::Function
                 };
                 let fqn = make_fqn(relative_path, parent_class, name);
-                symbols.push(make_symbol(relative_path, parent_class, name, kind, node, source));
-                // Recurse into body with updated _current_fqn
+                symbols.push(make_symbol(
+                    relative_path,
+                    parent_class,
+                    name,
+                    kind,
+                    node,
+                    source,
+                ));
+                // Recurse into body with parent_class reset to None — nested functions
+                // inside a method body are not class members.
                 if let Some(body) = node.child_by_field_name("body") {
                     extract_nodes(
                         body,
                         source,
                         relative_path,
-                        parent_class,
+                        None,
                         Some(&fqn),
                         symbols,
                         edges,
@@ -53,7 +69,14 @@ fn extract_nodes(
         "class_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source)?;
-                symbols.push(make_symbol(relative_path, None, name, SymbolKind::Class, node, source));
+                symbols.push(make_symbol(
+                    relative_path,
+                    None,
+                    name,
+                    SymbolKind::Class,
+                    node,
+                    source,
+                ));
                 if let Some(body) = node.child_by_field_name("body") {
                     let class_fqn = make_fqn(relative_path, None, name);
                     extract_nodes(
@@ -71,7 +94,15 @@ fn extract_nodes(
         "decorated_definition" => {
             // @decorator\ndef foo(): ... or @decorator\nclass Foo: ...
             if let Some(inner) = node.child_by_field_name("definition") {
-                extract_nodes(inner, source, relative_path, parent_class, _current_fqn, symbols, edges)?;
+                extract_nodes(
+                    inner,
+                    source,
+                    relative_path,
+                    parent_class,
+                    _current_fqn,
+                    symbols,
+                    edges,
+                )?;
             }
         }
         "import_statement" => {
@@ -112,7 +143,15 @@ fn extract_nodes(
         _ => {
             let mut walker = node.walk();
             for child in node.children(&mut walker) {
-                extract_nodes(child, source, relative_path, parent_class, _current_fqn, symbols, edges)?;
+                extract_nodes(
+                    child,
+                    source,
+                    relative_path,
+                    parent_class,
+                    _current_fqn,
+                    symbols,
+                    edges,
+                )?;
             }
         }
     }

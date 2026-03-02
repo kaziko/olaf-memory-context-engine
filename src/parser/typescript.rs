@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{make_fqn, Edge, EdgeKind, ParserError, Symbol, SymbolKind};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn};
 
 pub(crate) enum TsDialect {
     TypeScript,
@@ -33,7 +33,15 @@ pub(crate) fn parse(
 
     let mut symbols = Vec::new();
     let mut edges = Vec::new();
-    extract_nodes(root, source, relative_path, None, None, &mut symbols, &mut edges)?;
+    extract_nodes(
+        root,
+        source,
+        relative_path,
+        None,
+        None,
+        &mut symbols,
+        &mut edges,
+    )?;
     Ok((symbols, edges))
 }
 
@@ -265,10 +273,9 @@ fn extract_nodes(
                 {
                     let name = name_node.utf8_text(source)?;
                     let fqn = make_fqn(relative_path, parent_class, name);
-                    let source_hash =
-                        blake3::hash(&source[child.start_byte()..child.end_byte()])
-                            .to_hex()
-                            .to_string();
+                    let source_hash = blake3::hash(&source[child.start_byte()..child.end_byte()])
+                        .to_hex()
+                        .to_string();
                     symbols.push(Symbol {
                         fqn: fqn.clone(),
                         name: name.to_string(),
@@ -362,13 +369,7 @@ fn extract_nodes(
                         let type_name = child.utf8_text(source)?;
                         if !matches!(
                             type_name,
-                            "string"
-                                | "number"
-                                | "boolean"
-                                | "void"
-                                | "any"
-                                | "never"
-                                | "unknown"
+                            "string" | "number" | "boolean" | "void" | "any" | "never" | "unknown"
                         ) {
                             edges.push(Edge {
                                 source_fqn: caller_fqn.to_string(),

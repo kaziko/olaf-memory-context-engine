@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{make_fqn, make_symbol, Edge, EdgeKind, ParserError, Symbol, SymbolKind};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -160,12 +160,16 @@ fn extract_nodes(
         }
         "function_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source)?;
-                let fn_fqn = make_fqn(relative_path, None, name);
+                let raw_name = name_node.utf8_text(source)?;
+                let qualified_name = match current_namespace.as_deref() {
+                    Some(ns) => format!("{}\\{}", ns, raw_name),
+                    None => raw_name.to_string(),
+                };
+                let fn_fqn = make_fqn(relative_path, None, &qualified_name);
                 symbols.push(make_symbol(
                     relative_path,
                     None,
-                    name,
+                    &qualified_name,
                     SymbolKind::Function,
                     node,
                     source,

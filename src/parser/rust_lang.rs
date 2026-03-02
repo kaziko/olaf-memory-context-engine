@@ -1,7 +1,7 @@
 // Named rust_lang.rs to avoid collision with the `rust` keyword
 use tree_sitter::Parser;
 
-use super::symbols::{make_symbol, Edge, EdgeKind, ParserError, Symbol, SymbolKind};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -81,14 +81,28 @@ fn extract_nodes(
                 } else {
                     SymbolKind::Function
                 };
-                symbols.push(make_symbol(relative_path, parent_type, name, kind, node, source));
+                symbols.push(make_symbol(
+                    relative_path,
+                    parent_type,
+                    name,
+                    kind,
+                    node,
+                    source,
+                ));
             }
         }
         "struct_item" | "enum_item" => {
             // No native Struct/Enum kind — use Class
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source)?;
-                symbols.push(make_symbol(relative_path, None, name, SymbolKind::Class, node, source));
+                symbols.push(make_symbol(
+                    relative_path,
+                    None,
+                    name,
+                    SymbolKind::Class,
+                    node,
+                    source,
+                ));
             }
         }
         "trait_item" => {
@@ -114,11 +128,12 @@ fn extract_nodes(
             }
         }
         "use_declaration" => {
-            let target = node
-                .utf8_text(source)?
-                .trim_start_matches("use ")
-                .trim_end_matches(';')
-                .trim()
+            let raw = node.utf8_text(source)?;
+            // Find "use " to skip any leading visibility modifier (pub, pub(crate), etc.)
+            let target = raw
+                .find("use ")
+                .map(|pos| raw[pos + 4..].trim_end_matches(';').trim())
+                .unwrap_or("")
                 .to_string();
             edges.push(Edge {
                 source_fqn: relative_path.to_string(),

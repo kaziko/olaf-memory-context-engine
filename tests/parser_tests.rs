@@ -1,11 +1,16 @@
-use olaf::parser::{detect_language, parse_file, EdgeKind, Language};
-
+use olaf::parser::{EdgeKind, Language, detect_language, parse_file};
 
 #[test]
 fn test_detect_language_extensions() {
-    assert!(matches!(detect_language("foo.ts"), Some(Language::TypeScript)));
+    assert!(matches!(
+        detect_language("foo.ts"),
+        Some(Language::TypeScript)
+    ));
     assert!(matches!(detect_language("foo.tsx"), Some(Language::Tsx)));
-    assert!(matches!(detect_language("foo.js"), Some(Language::JavaScript)));
+    assert!(matches!(
+        detect_language("foo.js"),
+        Some(Language::JavaScript)
+    ));
     assert!(matches!(detect_language("foo.jsx"), Some(Language::Jsx)));
     assert!(matches!(detect_language("foo.py"), Some(Language::Python)));
     assert!(matches!(detect_language("foo.rs"), Some(Language::Rust)));
@@ -63,11 +68,19 @@ fn test_imports_edge_source_is_file_path() {
     let source = std::fs::read("tests/fixtures/typescript/sample.ts").unwrap();
     let (_, edges) = parse_file("tests/fixtures/typescript/sample.ts", &source).unwrap();
 
-    let import_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Imports).collect();
-    assert!(!import_edges.is_empty(), "expected at least one imports edge");
+    let import_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .collect();
+    assert!(
+        !import_edges.is_empty(),
+        "expected at least one imports edge"
+    );
     // source_fqn for imports is the file path, not a symbol FQN
     assert!(
-        import_edges.iter().all(|e| e.source_fqn == "tests/fixtures/typescript/sample.ts"),
+        import_edges
+            .iter()
+            .all(|e| e.source_fqn == "tests/fixtures/typescript/sample.ts"),
         "imports edge source_fqn must be the file path"
     );
     // target is the module specifier string
@@ -82,11 +95,13 @@ fn test_extends_edge() {
     let source = std::fs::read("tests/fixtures/typescript/sample.ts").unwrap();
     let (_, edges) = parse_file("tests/fixtures/typescript/sample.ts", &source).unwrap();
 
-    let extends_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Extends).collect();
+    let extends_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Extends)
+        .collect();
     assert_eq!(extends_edges.len(), 1, "expected exactly one extends edge");
     assert_eq!(
-        extends_edges[0].source_fqn,
-        "tests/fixtures/typescript/sample.ts::Greeter",
+        extends_edges[0].source_fqn, "tests/fixtures/typescript/sample.ts::Greeter",
         "extends source must be the class FQN"
     );
     assert_eq!(
@@ -100,7 +115,10 @@ fn test_implements_edge() {
     let source = b"interface IFoo {} class Bar implements IFoo {}";
     let (_, edges) = parse_file("src/bar.ts", source).unwrap();
 
-    let impl_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Implements).collect();
+    let impl_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Implements)
+        .collect();
     assert_eq!(impl_edges.len(), 1, "expected exactly one implements edge");
     assert_eq!(impl_edges[0].source_fqn, "src/bar.ts::Bar");
     assert_eq!(impl_edges[0].target_fqn, "IFoo");
@@ -115,8 +133,9 @@ fn test_calls_edge_attributed_to_calling_symbol() {
     let calls_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
     assert!(!calls_edges.is_empty(), "expected at least one calls edge");
     assert!(
-        calls_edges.iter().any(|e| e.source_fqn == "src/x.ts::caller"
-            && e.target_fqn == "callee"),
+        calls_edges
+            .iter()
+            .any(|e| e.source_fqn == "src/x.ts::caller" && e.target_fqn == "callee"),
         "calls edge must have the calling function as source; got: {:?}",
         calls_edges
             .iter()
@@ -133,9 +152,14 @@ fn test_calls_edge_attributed_to_method_not_class() {
     let calls_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
     assert!(!calls_edges.is_empty(), "expected calls edge inside method");
     assert!(
-        calls_edges.iter().any(|e| e.source_fqn == "src/foo.ts::Foo::bar"),
+        calls_edges
+            .iter()
+            .any(|e| e.source_fqn == "src/foo.ts::Foo::bar"),
         "calls edge source must be the method FQN, not the class; got: {:?}",
-        calls_edges.iter().map(|e| &e.source_fqn).collect::<Vec<_>>()
+        calls_edges
+            .iter()
+            .map(|e| &e.source_fqn)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -157,7 +181,10 @@ fn test_uses_type_edge_attributed_to_function() {
     let source = b"type MyType = string; function doSomething(x: MyType): void {}";
     let (_, edges) = parse_file("src/x.ts", source).unwrap();
 
-    let type_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::UsesType).collect();
+    let type_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::UsesType)
+        .collect();
     assert!(
         type_edges
             .iter()
@@ -209,8 +236,7 @@ fn test_line_numbers_are_one_based() {
     let (symbols, _) = parse_file("src/foo.ts", source).unwrap();
     if let Some(sym) = symbols.iter().find(|s| s.name == "foo") {
         assert_eq!(
-            sym.start_line,
-            2,
+            sym.start_line, 2,
             "start_line must be 1-based (tree-sitter row + 1)"
         );
     } else {
@@ -249,7 +275,10 @@ fn test_parse_python_exact_symbol_set() {
     );
 
     // Exact imports: verify count, unique targets, and source attribution
-    let import_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Imports).collect();
+    let import_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .collect();
     assert_eq!(
         import_edges.len(),
         3,
@@ -302,11 +331,13 @@ fn test_parse_rust_exact_symbol_set() {
     );
 
     // Exact imports assertion — verify target and source, not just count
-    let import_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Imports).collect();
+    let import_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .collect();
     assert_eq!(import_edges.len(), 1, "expected exactly 1 imports edge");
     assert_eq!(
-        import_edges[0].source_fqn,
-        "tests/fixtures/rust/sample.rs",
+        import_edges[0].source_fqn, "tests/fixtures/rust/sample.rs",
         "Imports edge source must be file path"
     );
     assert_eq!(
@@ -376,7 +407,7 @@ fn test_parse_php_exact_symbol_set() {
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler",
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::handle",
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::on_save",
-            "tests/fixtures/php/sample.php::bootstrap",
+            "tests/fixtures/php/sample.php::MyPlugin\\bootstrap",
         ],
         "PHP exact symbol set mismatch"
     );
@@ -415,17 +446,15 @@ fn test_php_hooks_into_edges_exact() {
     // handle() calls add_action('save_post', ...) — source must be method FQN
     assert_eq!(hooks_into[0].target_fqn, "save_post");
     assert_eq!(
-        hooks_into[0].source_fqn,
-        "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::handle",
+        hooks_into[0].source_fqn, "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::handle",
         "hooks_into source must be method FQN, not class or file"
     );
 
-    // bootstrap() calls add_filter('the_content', ...) — source must be function FQN
+    // bootstrap() calls add_filter('the_content', ...) — source must be namespace-qualified FQN
     assert_eq!(hooks_into[1].target_fqn, "the_content");
     assert_eq!(
-        hooks_into[1].source_fqn,
-        "tests/fixtures/php/sample.php::bootstrap",
-        "hooks_into source must be enclosing function FQN"
+        hooks_into[1].source_fqn, "tests/fixtures/php/sample.php::MyPlugin\\bootstrap",
+        "hooks_into source must be enclosing function FQN (namespace-qualified)"
     );
 }
 
@@ -439,11 +468,14 @@ fn test_php_fires_hook_edge_exact() {
         .filter(|e| e.kind == EdgeKind::FiresHook)
         .collect();
 
-    assert_eq!(fires_hook.len(), 1, "expected exactly 1 fires_hook edge (do_action)");
+    assert_eq!(
+        fires_hook.len(),
+        1,
+        "expected exactly 1 fires_hook edge (do_action)"
+    );
     assert_eq!(fires_hook[0].target_fqn, "myPlugin_post_saved");
     assert_eq!(
-        fires_hook[0].source_fqn,
-        "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::on_save",
+        fires_hook[0].source_fqn, "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::on_save",
         "fires_hook source must be enclosing method FQN"
     );
 }
@@ -458,11 +490,14 @@ fn test_php_uses_trait_edge_exact() {
         .filter(|e| e.kind == EdgeKind::UsesTrait)
         .collect();
 
-    assert_eq!(uses_trait.len(), 1, "expected exactly 1 uses_trait edge (`use Loggable`)");
+    assert_eq!(
+        uses_trait.len(),
+        1,
+        "expected exactly 1 uses_trait edge (`use Loggable`)"
+    );
     assert_eq!(uses_trait[0].target_fqn, "Loggable");
     assert_eq!(
-        uses_trait[0].source_fqn,
-        "tests/fixtures/php/sample.php::MyPlugin\\PostHandler",
+        uses_trait[0].source_fqn, "tests/fixtures/php/sample.php::MyPlugin\\PostHandler",
         "uses_trait source must be the class FQN, not a method FQN"
     );
 }
@@ -473,7 +508,10 @@ fn test_php_namespace_use_declaration_imports_edge() {
     let source = std::fs::read("tests/fixtures/php/sample.php").unwrap();
     let (_, edges) = parse_file("tests/fixtures/php/sample.php", &source).unwrap();
 
-    let import_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Imports).collect();
+    let import_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .collect();
     assert_eq!(
         import_edges.len(),
         1,

@@ -1,2 +1,2 @@
-pub(crate) mod incremental;
 pub(crate) mod full;
+pub(crate) mod incremental;
