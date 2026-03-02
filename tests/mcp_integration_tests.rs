@@ -301,3 +301,41 @@ fn test_invalid_id_type_returns_32600() {
     assert_eq!(r["error"]["code"], -32600, "boolean id must return -32600");
     assert!(r["id"].is_null(), "response id must be null for invalid id type");
 }
+
+#[test]
+fn test_valid_json_missing_method_returns_32600() {
+    // Valid JSON but missing "method" — structural error must be -32600, not -32700 (P1)
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7
+        // "method" intentionally absent
+    });
+
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+
+    let r = &responses[0];
+    assert_eq!(r["id"], 7, "id must be echoed back");
+    assert_eq!(
+        r["error"]["code"], -32600,
+        "missing method must return -32600 Invalid Request, not -32700 Parse Error"
+    );
+}
+
+#[test]
+fn test_notification_with_invalid_jsonrpc_produces_no_output() {
+    // No id field → notification, so server must stay silent even though jsonrpc is wrong (P2b)
+    let mut child = spawn_server();
+    {
+        let stdin = child.stdin.take().unwrap();
+        let mut w = BufWriter::new(stdin);
+        writeln!(w, r#"{{"jsonrpc":"1.0","method":"notifications/initialized"}}"#).unwrap();
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "server must exit successfully");
+    assert_eq!(
+        output.stdout.len(), 0,
+        "notification must produce zero output even with invalid jsonrpc"
+    );
+}
