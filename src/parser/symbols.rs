@@ -89,6 +89,29 @@ pub enum ParserError {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
+/// Convenience constructor — avoids duplicating hash/line-number logic in every parser.
+pub(crate) fn make_symbol(
+    relative_path: &str,
+    parent: Option<&str>,
+    name: &str,
+    kind: SymbolKind,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Symbol {
+    Symbol {
+        fqn: make_fqn(relative_path, parent, name),
+        name: name.to_string(),
+        kind,
+        start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        signature: None,
+        docstring: None,
+        source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
+            .to_hex()
+            .to_string(),
+    }
+}
+
 /// Sole FQN construction function.
 ///
 /// Format:

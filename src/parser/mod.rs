@@ -56,9 +56,8 @@ pub fn parse_file(
             typescript::parse(relative_path, source, typescript::TsDialect::JavaScript)
         }
         Language::Jsx => typescript::parse(relative_path, source, typescript::TsDialect::Jsx),
-        Language::Python | Language::Rust | Language::Php => {
-            log::debug!("parser stub for Story 1.3: {}", relative_path);
-            Ok((vec![], vec![]))
-        }
+        Language::Python => python::parse(relative_path, source),
+        Language::Rust => rust_lang::parse(relative_path, source),
+        Language::Php => php::parse(relative_path, source),
     }
 }
