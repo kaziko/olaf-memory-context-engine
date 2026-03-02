@@ -1,12 +1,4 @@
 mod cli;
-mod config;
-mod db;
-mod graph;
-mod index;
-mod memory;
-mod mcp;
-mod parser;
-mod restore;
 
 use clap::Parser;
 
