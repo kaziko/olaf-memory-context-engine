@@ -54,11 +54,30 @@ fn handle_message(line: &str) -> Option<Response> {
         }
     };
 
-    // Notifications have no id — process silently, no response
+    // Validate protocol version — echo parsed id (or null if absent) in error response
+    if req.jsonrpc != "2.0" {
+        let id = req.id.clone().unwrap_or(Value::Null);
+        return Some(Response::error(
+            id,
+            -32600,
+            format!("Invalid Request: unsupported jsonrpc version '{}'", req.jsonrpc),
+        ));
+    }
+
+    // Notifications have no id field — process silently, no response (JSON-RPC 2.0 §4.1 vs §4.2)
     let Some(id) = req.id.clone() else {
         log::debug!("notification received: {}", req.method);
         return None;
     };
+
+    // Validate id type — JSON-RPC 2.0 §5: id MUST be null, number, or string
+    if !matches!(id, Value::Null | Value::Number(_) | Value::String(_)) {
+        return Some(Response::error(
+            Value::Null,
+            -32600,
+            "Invalid Request: id must be null, number, or string".to_string(),
+        ));
+    }
 
     Some(dispatch_request(id, &req.method, req.params.as_ref()))
 }

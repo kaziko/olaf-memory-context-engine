@@ -29,9 +29,6 @@ pub(crate) fn dispatch(params: Option<&Value>) -> Result<String, ToolError> {
         .and_then(|n| n.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: name".to_string()))?;
 
-    // Stories 2.2 and 2.3 will add match arms here; suppress single-binding lint
-    #[allow(clippy::match_single_binding)]
-    match tool_name {
-        _ => Err(ToolError::UnknownTool(tool_name.to_string())),
-    }
+    // Stories 2.2 and 2.3 replace this with a match on tool_name adding one arm per tool
+    Err(ToolError::UnknownTool(tool_name.to_string()))
 }

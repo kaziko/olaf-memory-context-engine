@@ -1,13 +1,28 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+/// Deserialize `id` such that:
+/// - field **absent** → `None` (notification, no response required)
+/// - field **present** (even `null`) → `Some(value)` (request, response required)
+///
+/// `#[serde(default)]` provides `None` when the field is absent;
+/// this function is called only when the field is present in the JSON.
+fn deserialize_id<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
 /// Incoming JSON-RPC 2.0 message (request or notification).
-/// Notifications have no `id` field — `serde(default)` maps absence to `None`.
+///
+/// `id` distinguishes requests from notifications:
+/// - absent → notification (deserializer never called; `#[serde(default)]` yields `None`)
+/// - present (any value including `null`) → request
 #[derive(Debug, Deserialize)]
 pub(crate) struct Request {
-    #[allow(dead_code)]
     pub jsonrpc: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_id")]
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
