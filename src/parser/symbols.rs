@@ -13,9 +13,14 @@ pub struct Symbol {
 
 #[derive(Debug, Clone)]
 pub struct Edge {
-    /// FQN of the source symbol (always resolved — must exist in the symbol list)
+    /// FQN of the source symbol, or the file path for `Imports` edges.
+    ///
+    /// For all edge kinds except `Imports` this is a symbol FQN (must exist in the symbols
+    /// table once persisted). For `Imports` edges the source is the containing file's relative
+    /// path — a permitted exception because the file itself is the logical importer, not any
+    /// single symbol within it. See `import_statement` handling in `parser/typescript.rs`.
     pub source_fqn: String,
-    /// FQN or module path of the target (may be unresolved — see Edge Contract)
+    /// FQN or module path of the target (may be unresolved — see Edge Contract in Dev Notes)
     pub target_fqn: String,
     pub kind: EdgeKind,
 }

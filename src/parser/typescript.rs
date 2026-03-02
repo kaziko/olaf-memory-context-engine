@@ -33,15 +33,22 @@ pub(crate) fn parse(
 
     let mut symbols = Vec::new();
     let mut edges = Vec::new();
-    extract_nodes(root, source, relative_path, None, &mut symbols, &mut edges)?;
+    extract_nodes(root, source, relative_path, None, None, &mut symbols, &mut edges)?;
     Ok((symbols, edges))
 }
 
-fn extract_nodes<'a>(
-    node: tree_sitter::Node<'a>,
+/// Recursive AST walker.
+///
+/// `parent_class` — name of the enclosing class (for FQN construction of methods).
+/// `current_fqn`  — FQN of the innermost enclosing function or method symbol; used as
+///                  `source_fqn` for best-effort `Calls` and `UsesType` edges.
+///                  `None` at file scope and inside class bodies (not yet inside a function).
+fn extract_nodes(
+    node: tree_sitter::Node<'_>,
     source: &[u8],
     relative_path: &str,
     parent_class: Option<&str>,
+    current_fqn: Option<&str>,
     symbols: &mut Vec<Symbol>,
     edges: &mut Vec<Edge>,
 ) -> Result<(), ParserError> {
@@ -54,7 +61,7 @@ fn extract_nodes<'a>(
                     .to_hex()
                     .to_string();
                 symbols.push(Symbol {
-                    fqn,
+                    fqn: fqn.clone(),
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     start_line: node.start_position().row as u32 + 1,
@@ -63,9 +70,17 @@ fn extract_nodes<'a>(
                     docstring: None,
                     source_hash,
                 });
-                // Recurse into body to catch nested calls/types
+                // Recurse into body with this function as the enclosing symbol
                 for child in node.children(&mut node.walk()) {
-                    extract_nodes(child, source, relative_path, parent_class, symbols, edges)?;
+                    extract_nodes(
+                        child,
+                        source,
+                        relative_path,
+                        parent_class,
+                        Some(&fqn),
+                        symbols,
+                        edges,
+                    )?;
                 }
             }
         }
@@ -88,55 +103,74 @@ fn extract_nodes<'a>(
                     source_hash,
                 });
 
-                // Handle extends_clause and implements_clause before body recursion
+                // class_heritage wraps extends_clause / implements_clause (TS) or
+                // holds the parent class identifier directly (JS).
+                // class_body is a separate direct child.
                 for child in node.children(&mut node.walk()) {
                     match child.kind() {
-                        "extends_clause" => {
-                            // extends_clause has children: "extends" keyword + type/identifier
-                            for grandchild in child.children(&mut child.walk()) {
-                                if grandchild.kind() == "identifier"
-                                    || grandchild.kind() == "type_identifier"
-                                {
-                                    let target = grandchild.utf8_text(source)?;
-                                    edges.push(Edge {
-                                        source_fqn: fqn.clone(),
-                                        target_fqn: target.to_string(),
-                                        kind: EdgeKind::Extends,
-                                    });
-                                }
-                            }
-                        }
-                        "implements_clause" => {
-                            for grandchild in child.children(&mut child.walk()) {
-                                if grandchild.kind() == "type_identifier"
-                                    || grandchild.kind() == "identifier"
-                                    || grandchild.kind() == "generic_type"
-                                {
-                                    // For generic_type, get the actual type name (first child)
-                                    let target = if grandchild.kind() == "generic_type" {
-                                        grandchild
-                                            .child(0)
-                                            .and_then(|n| n.utf8_text(source).ok())
-                                            .unwrap_or("")
-                                    } else {
-                                        grandchild.utf8_text(source)?
-                                    };
-                                    if !target.is_empty() {
+                        "class_heritage" => {
+                            for hchild in child.children(&mut child.walk()) {
+                                match hchild.kind() {
+                                    "extends_clause" => {
+                                        // TS: children are "extends" keyword + identifier/type_identifier
+                                        for echild in hchild.children(&mut hchild.walk()) {
+                                            if echild.kind() == "identifier"
+                                                || echild.kind() == "type_identifier"
+                                            {
+                                                let target = echild.utf8_text(source)?;
+                                                edges.push(Edge {
+                                                    source_fqn: fqn.clone(),
+                                                    target_fqn: target.to_string(),
+                                                    kind: EdgeKind::Extends,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    "implements_clause" => {
+                                        // TS: children are "implements" keyword + type_identifier(s)
+                                        for ichild in hchild.children(&mut hchild.walk()) {
+                                            let target = if ichild.kind() == "type_identifier"
+                                                || ichild.kind() == "identifier"
+                                            {
+                                                Some(ichild.utf8_text(source)?.to_string())
+                                            } else if ichild.kind() == "generic_type" {
+                                                ichild
+                                                    .child(0)
+                                                    .and_then(|n| n.utf8_text(source).ok())
+                                                    .map(|s| s.to_string())
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(t) = target {
+                                                edges.push(Edge {
+                                                    source_fqn: fqn.clone(),
+                                                    target_fqn: t,
+                                                    kind: EdgeKind::Implements,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    "identifier" | "type_identifier" => {
+                                        // JS: parent class identifier is a direct child of class_heritage
+                                        let target = hchild.utf8_text(source)?;
                                         edges.push(Edge {
                                             source_fqn: fqn.clone(),
                                             target_fqn: target.to_string(),
-                                            kind: EdgeKind::Implements,
+                                            kind: EdgeKind::Extends,
                                         });
                                     }
+                                    _ => {}
                                 }
                             }
                         }
                         "class_body" => {
+                            // current_fqn is None inside class body — not yet inside a method
                             extract_nodes(
                                 child,
                                 source,
                                 relative_path,
                                 Some(name),
+                                None,
                                 symbols,
                                 edges,
                             )?;
@@ -155,7 +189,7 @@ fn extract_nodes<'a>(
                     .to_hex()
                     .to_string();
                 symbols.push(Symbol {
-                    fqn,
+                    fqn: fqn.clone(),
                     name: name.to_string(),
                     kind: SymbolKind::Method,
                     start_line: node.start_position().row as u32 + 1,
@@ -164,10 +198,17 @@ fn extract_nodes<'a>(
                     docstring: None,
                     source_hash,
                 });
-                // Do NOT recurse into method body for nested class detection
-                // but DO recurse for best-effort call/type edges
+                // Recurse into method body with this method as the enclosing symbol
                 for child in node.children(&mut node.walk()) {
-                    extract_nodes(child, source, relative_path, parent_class, symbols, edges)?;
+                    extract_nodes(
+                        child,
+                        source,
+                        relative_path,
+                        parent_class,
+                        Some(&fqn),
+                        symbols,
+                        edges,
+                    )?;
                 }
             }
         }
@@ -229,7 +270,7 @@ fn extract_nodes<'a>(
                             .to_hex()
                             .to_string();
                     symbols.push(Symbol {
-                        fqn,
+                        fqn: fqn.clone(),
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         start_line: child.start_position().row as u32 + 1,
@@ -238,12 +279,13 @@ fn extract_nodes<'a>(
                         docstring: None,
                         source_hash,
                     });
-                    // Recurse into arrow function body for calls/types
+                    // Recurse into arrow/function body with this symbol as the enclosing context
                     extract_nodes(
                         value_node,
                         source,
                         relative_path,
                         parent_class,
+                        Some(&fqn),
                         symbols,
                         edges,
                     )?;
@@ -254,13 +296,21 @@ fn extract_nodes<'a>(
         "export_statement" => {
             // Recurse into inner declaration — export itself is not a symbol
             for child in node.children(&mut node.walk()) {
-                extract_nodes(child, source, relative_path, parent_class, symbols, edges)?;
+                extract_nodes(
+                    child,
+                    source,
+                    relative_path,
+                    parent_class,
+                    current_fqn,
+                    symbols,
+                    edges,
+                )?;
             }
         }
 
         "import_statement" => {
-            // source_fqn is the file itself (path reference, not a symbol FQN)
-            // target_fqn is the module specifier — may not exist in symbols table
+            // source_fqn is the file path (permitted exception — see Edge doc in symbols.rs)
+            // target_fqn is the module specifier — may not exist in the symbols table
             if let Some(source_node) = node.child_by_field_name("source") {
                 let module_path = source_node
                     .utf8_text(source)?
@@ -277,59 +327,72 @@ fn extract_nodes<'a>(
 
         "call_expression" => {
             // Best-effort: only simple identifier callees (skip chained/computed)
-            if let Some(function_node) = node.child_by_field_name("function")
+            // Only emit when we know the enclosing symbol FQN
+            if let Some(caller_fqn) = current_fqn
+                && let Some(function_node) = node.child_by_field_name("function")
                 && function_node.kind() == "identifier"
             {
                 let callee = function_node.utf8_text(source)?;
-                // Only emit if there's a known parent context (inside a function/method)
-                if parent_class.is_some() {
-                    let caller_fqn = make_fqn(relative_path, parent_class, "");
-                    // Trim trailing "::" from the caller FQN
-                    let caller_fqn = caller_fqn.trim_end_matches("::").to_string();
-                    edges.push(Edge {
-                        source_fqn: caller_fqn,
-                        target_fqn: callee.to_string(),
-                        kind: EdgeKind::Calls,
-                    });
-                }
+                edges.push(Edge {
+                    source_fqn: caller_fqn.to_string(),
+                    target_fqn: callee.to_string(),
+                    kind: EdgeKind::Calls,
+                });
             }
-            // Always recurse into arguments
+            // Always recurse into arguments with the same enclosing context
             for child in node.children(&mut node.walk()) {
-                extract_nodes(child, source, relative_path, parent_class, symbols, edges)?;
+                extract_nodes(
+                    child,
+                    source,
+                    relative_path,
+                    parent_class,
+                    current_fqn,
+                    symbols,
+                    edges,
+                )?;
             }
         }
 
         "type_annotation" => {
             // Best-effort: capture simple identifier types as UsesType edges
-            for child in node.children(&mut node.walk()) {
-                if child.kind() == "type_identifier" || child.kind() == "predefined_type" {
-                    // Skip primitive types
-                    let type_name = child.utf8_text(source)?;
-                    if !matches!(
-                        type_name,
-                        "string" | "number" | "boolean" | "void" | "any" | "never" | "unknown"
-                    ) {
-                        let source_fqn = if let Some(parent) = parent_class {
-                            make_fqn(relative_path, Some(parent), "")
-                                .trim_end_matches("::")
-                                .to_string()
-                        } else {
-                            relative_path.to_string()
-                        };
-                        edges.push(Edge {
-                            source_fqn,
-                            target_fqn: type_name.to_string(),
-                            kind: EdgeKind::UsesType,
-                        });
+            // Only emit when we know the enclosing symbol FQN
+            if let Some(caller_fqn) = current_fqn {
+                for child in node.children(&mut node.walk()) {
+                    if child.kind() == "type_identifier" || child.kind() == "predefined_type" {
+                        let type_name = child.utf8_text(source)?;
+                        if !matches!(
+                            type_name,
+                            "string"
+                                | "number"
+                                | "boolean"
+                                | "void"
+                                | "any"
+                                | "never"
+                                | "unknown"
+                        ) {
+                            edges.push(Edge {
+                                source_fqn: caller_fqn.to_string(),
+                                target_fqn: type_name.to_string(),
+                                kind: EdgeKind::UsesType,
+                            });
+                        }
                     }
                 }
             }
         }
 
         _ => {
-            // Generic recursion for all unhandled node kinds
+            // Generic recursion — pass both parent_class and current_fqn unchanged
             for child in node.children(&mut node.walk()) {
-                extract_nodes(child, source, relative_path, parent_class, symbols, edges)?;
+                extract_nodes(
+                    child,
+                    source,
+                    relative_path,
+                    parent_class,
+                    current_fqn,
+                    symbols,
+                    edges,
+                )?;
             }
         }
     }
