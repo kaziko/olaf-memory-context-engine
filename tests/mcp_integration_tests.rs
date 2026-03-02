@@ -390,6 +390,104 @@ fn test_non_object_payload_returns_32600() {
     }
 }
 
+// ─── Indexed DB helpers ───────────────────────────────────────────────────────
+
+/// Creates a TempDir with a small Rust project and runs `olaf index`.
+/// Returns the TempDir — caller must keep it alive for the duration of tests using it.
+fn prepare_indexed_tmpdir() -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "/// Adds two numbers.\npub fn add(a: i32, b: i32) -> i32 { a + b }\n\
+         /// A counter.\npub struct Counter { count: u32 }\n",
+    )
+    .expect("write fixture");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(
+        status.status.success(),
+        "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    tmpdir
+}
+
+/// Creates a TempDir with two `lib.rs` files at different paths, so a suffix query for `lib.rs`
+/// returns multiple candidates.
+fn prepare_indexed_tmpdir_multi_lib() -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmpdir.path().join("src");
+    let util_dir = tmpdir.path().join("src").join("util");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::create_dir_all(&util_dir).expect("create src/util/");
+    std::fs::write(src_dir.join("lib.rs"), "/// Root.\npub fn root() {}\n").expect("write src/lib.rs");
+    std::fs::write(util_dir.join("lib.rs"), "/// Util.\npub fn util_fn() {}\n").expect("write src/util/lib.rs");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(
+        status.status.success(),
+        "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    tmpdir
+}
+
+/// Creates a TempDir with a Rust file that has no parseable symbols (comment only).
+fn prepare_indexed_tmpdir_no_symbols() -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::write(src_dir.join("empty.rs"), "// No symbols here.\n").expect("write src/empty.rs");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(
+        status.status.success(),
+        "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    tmpdir
+}
+
+/// Spawns the server with the given working directory, sends requests, collects responses.
+fn run_requests_in(dir: &std::path::Path, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("serve")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn olaf serve");
+    {
+        let stdin = child.stdin.take().unwrap();
+        let mut w = BufWriter::new(stdin);
+        for req in requests {
+            writeln!(w, "{}", serde_json::to_string(req).unwrap()).unwrap();
+        }
+    }
+    let output = child.wait_with_output().expect("server did not exit");
+    assert!(output.status.success(), "server exited non-zero: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("non-JSON: {e}\nLine: {l:?}")))
+        .collect()
+}
+
 // ─── Story 2.2 Tests ──────────────────────────────────────────────────────────
 
 #[test]
@@ -473,4 +571,148 @@ fn test_get_impact_depth_parameter_accepted() {
     for (i, r) in responses.iter().enumerate() {
         assert!(r["result"].is_object(), "depth={} request must return result, not error; got: {}", i+1, r);
     }
+}
+
+// ─── Story 2.3 Tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_tools_list_includes_file_skeleton_and_index_status() {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+    let responses = run_requests(&[req]);
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools must be array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"get_file_skeleton"), "must include get_file_skeleton");
+    assert!(names.contains(&"index_status"), "must include index_status");
+}
+
+#[test]
+fn test_get_file_skeleton_missing_path_returns_32602() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":10,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses[0]["error"]["code"], -32602, "missing file_path must return -32602");
+}
+
+#[test]
+fn test_get_file_skeleton_empty_path_returns_32602() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":"   "}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses[0]["error"]["code"], -32602, "blank file_path must return -32602");
+}
+
+#[test]
+fn test_get_file_skeleton_sensitive_file_blocked() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":12,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":".env"}}
+    });
+    let responses = run_requests(&[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result, not error; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("not permitted"), "must indicate sensitive file blocked; got: {text}");
+}
+
+#[test]
+fn test_get_file_skeleton_not_found_empty_db() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":13,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":"src/main.rs"}}
+    });
+    let responses = run_requests(&[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result, not error; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.contains("No file found matching"),
+        "must include informative not-found message; got: {text}"
+    );
+}
+
+#[test]
+fn test_get_file_skeleton_with_indexed_file() {
+    let tmpdir = prepare_indexed_tmpdir();
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":14,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":"src/lib.rs"}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("add"), "must include function name 'add'; got: {text}");
+    assert!(!text.contains("a + b"), "must not include implementation body; got: {text}");
+}
+
+#[test]
+fn test_index_status_empty_db() {
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":15,"method":"tools/call",
+        "params":{"name":"index_status","arguments":{}}
+    });
+    let responses = run_requests(&[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("not initialized"), "empty DB must say not initialized; got: {text}");
+}
+
+#[test]
+fn test_index_status_after_indexing() {
+    let tmpdir = prepare_indexed_tmpdir();
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":16,"method":"tools/call",
+        "params":{"name":"index_status","arguments":{}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("Files indexed:"), "must include file count; got: {text}");
+    assert!(!text.contains("not initialized"), "indexed DB must not say not initialized; got: {text}");
+}
+
+#[test]
+fn test_get_file_skeleton_disambiguation_returns_multiple_matches() {
+    let tmpdir = prepare_indexed_tmpdir_multi_lib();
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":17,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":"lib.rs"}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result, not error; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.contains("Multiple files match"),
+        "must return disambiguation message; got: {text}"
+    );
+    assert!(
+        text.contains("lib.rs"),
+        "disambiguation list must include matching paths; got: {text}"
+    );
+}
+
+#[test]
+fn test_get_file_skeleton_zero_symbols_returns_informative_message() {
+    let tmpdir = prepare_indexed_tmpdir_no_symbols();
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":18,"method":"tools/call",
+        "params":{"name":"get_file_skeleton","arguments":{"file_path":"src/empty.rs"}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result, not error; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    // Either the file was indexed with zero symbols, or it wasn't indexed at all.
+    // Both are valid outcomes — what must NOT happen is a crash or -32603 error.
+    assert!(
+        text.contains("No symbols found in file") || text.contains("No file found matching"),
+        "must return informative message; got: {text}"
+    );
 }

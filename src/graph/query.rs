@@ -12,6 +12,14 @@ pub(crate) enum QueryError {
     Io(#[from] std::io::Error),
 }
 
+impl From<crate::graph::store::StoreError> for QueryError {
+    fn from(e: crate::graph::store::StoreError) -> Self {
+        match e {
+            crate::graph::store::StoreError::Sqlite(e) => QueryError::Sqlite(e),
+        }
+    }
+}
+
 pub(crate) enum IntentMode {
     Debug,
     BlastRadius,
@@ -237,11 +245,7 @@ pub(crate) fn get_context(
             let Some(row) = load_symbol_row(conn, *id)? else { continue };
             if is_output_sensitive(&row.file_path) { continue; }
 
-            let skeleton = skeletonize(conn, row.id)
-                .map_err(|e| {
-                    let crate::graph::store::StoreError::Sqlite(sq) = e;
-                    QueryError::Sqlite(sq)
-                })?;
+            let skeleton = skeletonize(conn, row.id)?;
             let entry_tokens = estimate_tokens(&skeleton);
             if skeleton_tokens + entry_tokens > skeleton_budget { break; }
             output.push_str(&skeleton);
@@ -250,6 +254,88 @@ pub(crate) fn get_context(
     }
 
     Ok(output)
+}
+
+/// Private helper: query candidate file paths from the files table.
+fn query_file_candidates(
+    conn: &Connection,
+    where_clause: &str,
+    param: &str,
+) -> Result<Vec<String>, QueryError> {
+    let sql = format!("SELECT path FROM files {where_clause} ORDER BY path");
+    let mut stmt = conn.prepare(&sql)?;
+    let paths = stmt.query_map(params![param], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(paths)
+}
+
+pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str) -> Result<String, QueryError> {
+    // Input-level sensitive check — returns "not permitted" to the caller
+    if is_output_sensitive(file_path) {
+        return Ok(format!("Access to sensitive file '{file_path}' is not permitted.\n"));
+    }
+
+    // Stage 1: exact file match
+    let mut candidates = query_file_candidates(conn, "WHERE path = ?1", file_path)?;
+
+    // Stage 2: suffix match only if no exact match
+    if candidates.is_empty() {
+        let suffix = format!("%{file_path}");
+        candidates = query_file_candidates(conn, "WHERE path LIKE ?1", &suffix)?;
+    }
+
+    // Sensitive filter on candidates: silently remove — don't reveal that sensitive paths exist
+    candidates.retain(|p| !is_output_sensitive(p));
+
+    if candidates.is_empty() {
+        return Ok(format!(
+            "No file found matching: {file_path}\n\nEnsure the file is indexed with `olaf index`.\n"
+        ));
+    }
+    if candidates.len() > 1 {
+        return Ok(format!(
+            "Multiple files match '{file_path}':\n{}\nProvide a more specific path.\n",
+            candidates.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    let resolved_path = &candidates[0];
+
+    // Fetch symbols for the single resolved file
+    let mut stmt = conn.prepare(
+        "SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id
+         WHERE f.path = ?1 ORDER BY s.start_line",
+    )?;
+    let symbol_ids: Vec<i64> = stmt
+        .query_map(params![resolved_path], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    if symbol_ids.is_empty() {
+        return Ok(format!(
+            "No symbols found in file: {resolved_path}. The file may not contain indexable symbols.\n"
+        ));
+    }
+
+    let mut output = format!("# File Skeleton: {resolved_path}\n\n");
+    for id in symbol_ids {
+        output.push_str(&crate::graph::skeleton::skeletonize(conn, id)?);
+    }
+    Ok(output)
+}
+
+pub(crate) fn index_status(conn: &Connection) -> Result<String, QueryError> {
+    let stats = crate::graph::store::load_db_stats(conn)?;
+
+    let last_indexed = match stats.last_indexed_at {
+        None => return Ok("Index not initialized. Run `olaf index` first.\n".to_string()),
+        Some(ts) => chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| ts.to_string()),
+    };
+
+    Ok(format!(
+        "Files indexed:  {}\nSymbols:        {}\nEdges:          {}\nObservations:   {}\nLast indexed:   {}\n",
+        stats.files, stats.symbols, stats.edges, stats.observations, last_indexed
+    ))
 }
 
 const MAX_IMPACT_PER_HOP: usize = 100;

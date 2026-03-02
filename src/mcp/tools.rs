@@ -59,6 +59,29 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["symbol_fqn"]
             }
         }),
+        serde_json::json!({
+            "name": "get_file_skeleton",
+            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. Accepts exact or partial file paths.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "File path or partial path, e.g. 'src/auth.ts' or 'auth.ts'"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "index_status",
+            "description": "Get index health: file count, symbol count, edge count, observation count, last indexed timestamp.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
     ]
 }
 
@@ -72,8 +95,10 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, par
 
     let args = params.and_then(|p| p.get("arguments"));
     match tool_name {
-        "get_context" => handle_get_context(conn, project_root, args),
-        "get_impact"  => handle_get_impact(conn, args),
+        "get_context"      => handle_get_context(conn, project_root, args),
+        "get_impact"       => handle_get_impact(conn, args),
+        "get_file_skeleton" => handle_get_file_skeleton(conn, args),
+        "index_status"     => handle_index_status(conn),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -102,5 +127,23 @@ fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>) -> Resul
     let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(3);
 
     crate::graph::query::get_impact(conn, symbol_fqn, depth)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+}
+
+fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+    let file_path = args.get("file_path").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: file_path".to_string()))?;
+    let file_path = file_path.trim();
+    if file_path.is_empty() {
+        return Err(ToolError::InvalidParams("file_path must not be empty".to_string()));
+    }
+    crate::graph::query::get_file_skeleton(conn, file_path)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+}
+
+fn handle_index_status(conn: &rusqlite::Connection) -> Result<String, ToolError> {
+    crate::graph::query::index_status(conn)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
 }
