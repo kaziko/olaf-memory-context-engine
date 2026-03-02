@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use olaf::{db, index};
+use olaf::{db, index, index::run_incremental};
 use tempfile::tempdir;
 
 /// Open an in-memory test DB at a temp path and return the connection.
@@ -349,6 +349,189 @@ fn test_import_edges_not_persisted() {
 
     let imports_count = query_count_where(&conn, "edges", "kind", "imports");
     assert_eq!(imports_count, 0, "Imports edges must not be persisted (AC9)");
+}
+
+// ── Incremental re-index tests (Story 1.5) ──────────────────────────────────
+
+#[test]
+fn test_incremental_unchanged_returns_zero_files() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    assert_eq!(stats.files, 0, "no files changed — incremental must re-parse 0 files");
+}
+
+#[test]
+fn test_incremental_changed_file_reparsed() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    let hash_before: String = conn
+        .query_row("SELECT blake3_hash FROM files WHERE path = 'main.rs'", [], |r| r.get(0))
+        .unwrap();
+
+    // Overwrite with different content (different hash)
+    std::fs::write(dir.path().join("main.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    assert_eq!(stats.files, 1, "changed file must be re-parsed");
+
+    // Assert the stored hash actually changed — not just non-empty (which was true before too)
+    let hash_after: String = conn
+        .query_row("SELECT blake3_hash FROM files WHERE path = 'main.rs'", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(hash_after, hash_before, "blake3_hash must be updated to the new content's hash");
+}
+
+#[test]
+fn test_incremental_new_file_indexed() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    // Add a new file
+    std::fs::write(dir.path().join("new_module.rs"), "pub fn new_fn() {}").unwrap();
+
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    assert_eq!(stats.files, 1, "new file must be indexed");
+
+    let new_in_db: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path = 'new_module.rs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_in_db, 1, "new file must appear in files table");
+}
+
+#[test]
+fn test_incremental_deleted_file_removed() {
+    let dir = tempdir().unwrap();
+    let a_path = dir.path().join("a.rs");
+    let b_path = dir.path().join("b.rs");
+    std::fs::write(&a_path, "fn func_a() {}").unwrap();
+    std::fs::write(&b_path, "fn func_b() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    // Delete b.rs
+    std::fs::remove_file(&b_path).unwrap();
+
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    // Deleted files are NOT counted in files (AC6)
+    assert_eq!(stats.files, 0, "deleted file must not count as re-indexed");
+
+    let b_in_db: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files WHERE path = 'b.rs'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(b_in_db, 0, "deleted file must be removed from files table");
+}
+
+#[test]
+fn test_incremental_preserves_inbound_edges() {
+    let dir = tempdir().unwrap();
+
+    // Use TypeScript — we know from test_calls_edges_persisted_for_intra_project_calls that
+    // the TS parser emits calls edges for function→function calls, guaranteeing edges > 0.
+    //
+    // File A (caller.ts): calls helper() from File B (lib.ts)
+    // File B (lib.ts): defines helper() — this is the target we will incrementally re-index
+    std::fs::write(dir.path().join("lib.ts"), "export function helper() {}").unwrap();
+    std::fs::write(
+        dir.path().join("caller.ts"),
+        "export function caller() { helper(); }",
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    let edges_after_full: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+    assert!(
+        edges_after_full > 0,
+        "full index must produce at least one calls edge (caller → helper)"
+    );
+
+    // Modify B (lib.ts, the target) with a comment change that preserves helper() FQN.
+    // This forces a hash mismatch so incremental re-parses lib.ts, but the FQN is stable
+    // so update_file_symbols must UPDATE in-place (not DELETE+INSERT).
+    std::fs::write(dir.path().join("lib.ts"), "// updated\nexport function helper() {}").unwrap();
+    // Leave caller.ts (A) unchanged
+
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    assert_eq!(stats.files, 1, "only lib.ts (B) should be re-indexed");
+
+    // lib.ts symbols must survive with the same FQN
+    let lib_sym_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE f.path LIKE '%lib.ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(lib_sym_count > 0, "lib.ts symbols must survive incremental re-index");
+
+    // The core regression guard: inbound edges to lib.ts's helper() must not have been
+    // cascade-deleted when update_file_symbols updated the symbol in-place.
+    // If update_file_symbols had used DELETE+INSERT, helper's symbol id would change and
+    // all FK edges pointing to the old id would be wiped by ON DELETE CASCADE.
+    let edges_after_incremental: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        edges_after_incremental, edges_after_full,
+        "incremental re-index of B must not cascade-delete edges from A to B's surviving symbols"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_incremental_performance() {
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+
+    // Generate 499 unchanged + 1 file that will be changed
+    for i in 0..499 {
+        let content = format!("pub fn generated_fn_{i}() {{}}\n");
+        std::fs::write(dir.path().join(format!("file_{i:04}.rs")), content).unwrap();
+    }
+    std::fs::write(dir.path().join("changing.rs"), "pub fn original() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    // Change only one file
+    std::fs::write(dir.path().join("changing.rs"), "pub fn updated() {}").unwrap();
+
+    let start = Instant::now();
+    let stats = run_incremental(&mut conn, dir.path()).expect("incremental failed");
+    let elapsed = start.elapsed();
+
+    assert_eq!(stats.files, 1, "only the changed file should be re-indexed");
+    assert!(
+        elapsed.as_millis() <= 200,
+        "incremental re-index of 1 file in 500-file project must complete in ≤200ms (took {:?})",
+        elapsed
+    );
 }
 
 #[test]

@@ -5,6 +5,9 @@ pub(crate) mod incremental;
 // The `full` module itself stays pub(crate) — only the run entry-point and its
 // return type cross the library/binary boundary.
 pub use full::{IndexStats, run};
+// Expose incremental run for integration tests and the MCP query path (Story 2.2).
+// The module itself stays pub(crate) — callers use olaf::index::run_incremental().
+pub use incremental::run as run_incremental;
 
 use std::path::Path;
 
