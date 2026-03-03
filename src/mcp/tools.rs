@@ -129,6 +129,38 @@ pub(crate) fn list() -> Vec<Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "name": "list_restore_points",
+            "description": "List available pre-edit snapshots for a file, sorted newest-first. Returns snapshot IDs to use with undo_change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Project-relative or absolute path to the file"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "undo_change",
+            "description": "Restore a file to a specific pre-edit snapshot using a snapshot ID from list_restore_points. Writes a decision observation recording the revert.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Project-relative or absolute path to the file to restore"
+                    },
+                    "snapshot_id": {
+                        "type": "string",
+                        "description": "Snapshot ID from list_restore_points output (e.g. '1740000000000-12345-7')"
+                    }
+                },
+                "required": ["file_path", "snapshot_id"]
+            }
+        }),
     ]
 }
 
@@ -148,8 +180,16 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "index_status"     => handle_index_status(conn),
         "save_observation"     => handle_save_observation(conn, session_id, args),
         "get_session_history"  => handle_get_session_history(conn, args),
+        "list_restore_points"  => handle_list_restore_points(project_root, args),
+        "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
+}
+
+/// Normalize a file path for MCP handlers: converts to project-relative and rejects escapes.
+fn mcp_normalize(project_root: &Path, file_path: &str) -> Result<String, ToolError> {
+    crate::restore::normalize_rel_path(project_root, file_path)
+        .map_err(|e| ToolError::InvalidParams(e.to_string()))
 }
 
 fn handle_get_context(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
@@ -347,4 +387,89 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
     }
 
     Ok(output)
+}
+
+fn handle_list_restore_points(project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let file_path = args.get("file_path").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: file_path".into()))?;
+
+    // NFR7: reject sensitive file paths
+    if crate::memory::store::is_sensitive_path(file_path) {
+        return Err(ToolError::InvalidParams("sensitive file path rejected per NFR7".into()));
+    }
+
+    let rel = mcp_normalize(project_root, file_path)?;
+
+    let points = crate::restore::list_restore_points(project_root, &rel)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    if points.is_empty() {
+        return Ok(format!("No restore points available for {rel}"));
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    let mut output = format!("Restore points for {} ({} available):\n", rel, points.len());
+    for point in &points {
+        let age = relative_age_ms(point.millis, now_ms);
+        output.push_str(&format!("  {}  {} bytes  {}\n", point.id, point.size, age));
+    }
+    Ok(output)
+}
+
+fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, session_id: &str, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let file_path = args.get("file_path").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: file_path".into()))?;
+    let snapshot_id = args.get("snapshot_id").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: snapshot_id".into()))?;
+
+    // NFR7: reject sensitive file paths
+    if crate::memory::store::is_sensitive_path(file_path) {
+        return Err(ToolError::InvalidParams("sensitive file path rejected per NFR7".into()));
+    }
+
+    let rel = mcp_normalize(project_root, file_path)?;
+
+    crate::restore::restore_to_snapshot(project_root, &rel, snapshot_id)
+        .map_err(|e| match e {
+            crate::restore::RestoreError::SnapshotNotFound(id, available) =>
+                ToolError::InvalidParams(format!("Snapshot '{id}' not found. Available: {available}")),
+            crate::restore::RestoreError::PathOutsideRoot(p) =>
+                ToolError::InvalidParams(format!("Invalid snapshot_id: {p}")),
+            other => ToolError::Internal(anyhow::anyhow!("{other}")),
+        })?;
+
+    // Write a persistent decision observation (non-auto, survives compression)
+    crate::memory::store::upsert_session(conn, session_id, "claude-code")
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+    crate::memory::store::insert_observation(
+        conn, session_id, "decision",
+        &format!("Reverted {} — restore point {} applied", rel, snapshot_id),
+        None, Some(&rel),
+    ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    Ok(format!("Restored {} to snapshot {}.", rel, snapshot_id))
+}
+
+/// Format a millisecond timestamp as a human-readable relative age string.
+fn relative_age_ms(millis: u128, now_ms: u128) -> String {
+    let diff = now_ms.saturating_sub(millis);
+    if diff < 60_000 {
+        format!("{} seconds ago", diff / 1000)
+    } else if diff < 3_600_000 {
+        format!("{} minutes ago", diff / 60_000)
+    } else if diff < 86_400_000 {
+        format!("{} hours ago", diff / 3_600_000)
+    } else {
+        format!("{} days ago", diff / 86_400_000)
+    }
 }

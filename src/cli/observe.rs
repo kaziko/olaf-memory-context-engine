@@ -109,8 +109,18 @@ fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()>
     if !ran {
         log::debug!("observe session-end: session already compressed, skipping");
     }
-    // FR22 stub: restore-point cleanup deferred to Story 4.4
-    // TODO Story 4.4: olaf::restore::cleanup_old_restore_points(&cwd)?;
+    // FR22: cleanup restore points older than 7 days, protecting current-session snapshots
+    let protect_ms = {
+        // Get session start time from DB to ensure current-session snapshots are never deleted
+        conn.query_row(
+            "SELECT started_at FROM sessions WHERE id = ?1",
+            rusqlite::params![&payload.session_id],
+            |r| r.get::<_, i64>(0),
+        ).ok().map(|secs| (secs as u128) * 1000)
+    };
+    if let Err(e) = olaf::restore::cleanup_old_restore_points(&cwd, protect_ms) {
+        log::debug!("observe session-end: restore cleanup failed: {e}");
+    }
     log::debug!("observe session-end: completed in {:?}", start.elapsed()); // AC8: NFR5 — always logged
     Ok(())
 }

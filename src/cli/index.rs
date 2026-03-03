@@ -12,5 +12,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
         olaf::memory::DEFAULT_COMPRESSION_THRESHOLD_SECS,
     )?;
 
+    // FR22: cleanup restore points older than 7 days (no session context during index)
+    if let Err(e) = olaf::restore::cleanup_old_restore_points(&project_root, None) {
+        log::debug!("index: restore cleanup failed: {e}");
+    }
+
     Ok(())
 }
