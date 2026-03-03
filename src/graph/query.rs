@@ -183,6 +183,23 @@ fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end
     Ok(lines[start..end].join("\n"))
 }
 
+fn format_observation_entry(obs: &crate::memory::store::ObservationRow) -> String {
+    let mut entry = String::new();
+    if obs.is_stale {
+        let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
+        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {}\n", reason, obs.kind, obs.content));
+    } else {
+        entry.push_str(&format!("- [{}] {}\n", obs.kind, obs.content));
+    }
+    if let Some(fqn) = &obs.symbol_fqn {
+        entry.push_str(&format!("  Symbol: {}\n", fqn));
+    }
+    if let Some(fp) = &obs.file_path {
+        entry.push_str(&format!("  File: {}\n", fp));
+    }
+    entry
+}
+
 fn format_pivot_entry(row: &SymbolRow, source: &str) -> String {
     format!(
         "## {} (`{}`)\nFile: `{}` lines {}-{}\n\n```\n{}\n```\n\n",
@@ -215,13 +232,19 @@ pub(crate) fn get_context(
 
     let pivot_budget = token_budget * 70 / 100;
     let skeleton_budget = token_budget * 20 / 100;
+    let memory_budget = token_budget * 10 / 100;
 
     let mut output = format!("# Context Brief: {intent}\n\n## Pivot Symbols\n\n");
     let mut pivot_tokens = 0usize;
+    let mut all_fqns: HashSet<String> = HashSet::new();
+    let mut all_file_paths: HashSet<String> = HashSet::new();
 
     for id in &pivots {
         let Some(row) = load_symbol_row(conn, *id)? else { continue };
         if is_output_sensitive(&row.file_path) { continue; }
+
+        all_fqns.insert(row.fqn.clone());
+        all_file_paths.insert(row.file_path.clone());
 
         let source = match read_symbol_source(project_root, &row.file_path, row.start_line, row.end_line) {
             Ok(s) if !s.is_empty() => s,
@@ -245,11 +268,43 @@ pub(crate) fn get_context(
             let Some(row) = load_symbol_row(conn, *id)? else { continue };
             if is_output_sensitive(&row.file_path) { continue; }
 
+            all_fqns.insert(row.fqn.clone());
+            all_file_paths.insert(row.file_path.clone());
+
             let skeleton = skeletonize(conn, row.id)?;
             let entry_tokens = estimate_tokens(&skeleton);
             if skeleton_tokens + entry_tokens > skeleton_budget { break; }
             output.push_str(&skeleton);
             skeleton_tokens += entry_tokens;
+        }
+    }
+
+    // Memory injection — 10% budget
+    let fqns: Vec<&str> = all_fqns.iter().map(|s| s.as_str()).collect();
+    let file_paths: Vec<&str> = all_file_paths.iter().map(|s| s.as_str()).collect();
+
+    if !fqns.is_empty() || !file_paths.is_empty() {
+        let observations = crate::memory::store::get_observations_for_context(
+            conn, &fqns, &file_paths, 50,
+        )
+        .unwrap_or_default();
+
+        if !observations.is_empty() {
+            let mut mem_section = String::new();
+            let mut mem_tokens = 0usize;
+            for obs in &observations {
+                let entry = format_observation_entry(obs);
+                let entry_tokens = estimate_tokens(&entry);
+                if mem_tokens + entry_tokens > memory_budget {
+                    break;
+                }
+                mem_section.push_str(&entry);
+                mem_tokens += entry_tokens;
+            }
+            if !mem_section.is_empty() {
+                output.push_str("## Session Memory\n\n");
+                output.push_str(&mem_section);
+            }
         }
     }
 

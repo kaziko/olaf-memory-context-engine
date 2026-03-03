@@ -108,6 +108,27 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["content", "kind"]
             }
         }),
+        serde_json::json!({
+            "name": "get_session_history",
+            "description": "Get observations and changes from recent sessions, optionally filtered by file or symbol.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional: filter to observations linked to this file path"
+                    },
+                    "symbol_fqn": {
+                        "type": "string",
+                        "description": "Optional: filter to observations linked to this symbol FQN (e.g. 'src/auth.ts::AuthService::login')"
+                    },
+                    "sessions_back": {
+                        "type": "integer",
+                        "description": "How many recent sessions to include (default: 5, max: 50)"
+                    }
+                }
+            }
+        }),
     ]
 }
 
@@ -125,7 +146,8 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "get_impact"       => handle_get_impact(conn, args),
         "get_file_skeleton" => handle_get_file_skeleton(conn, args),
         "index_status"     => handle_index_status(conn),
-        "save_observation" => handle_save_observation(conn, session_id, args),
+        "save_observation"     => handle_save_observation(conn, session_id, args),
+        "get_session_history"  => handle_get_session_history(conn, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -195,6 +217,23 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, session_id: &str, ar
     let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let file_path  = args.get("file_path").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
 
+    // NFR7: reject observations linked to sensitive files
+    if let Some(fp) = file_path
+        && crate::memory::store::is_sensitive_path(fp)
+    {
+        return Err(ToolError::InvalidParams(
+            "file_path refers to a sensitive file — observation rejected per NFR7".into(),
+        ));
+    }
+    if let Some(fqn) = symbol_fqn
+        && let Some(prefix) = fqn.split("::").next()
+        && crate::memory::store::is_sensitive_path(prefix)
+    {
+        return Err(ToolError::InvalidParams(
+            "symbol_fqn refers to a sensitive file — observation rejected per NFR7".into(),
+        ));
+    }
+
     if symbol_fqn.is_none() && file_path.is_none() {
         return Err(ToolError::InvalidParams(
             "at least one of symbol_fqn or file_path is required".into()
@@ -207,4 +246,105 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, session_id: &str, ar
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     Ok(format!("Observation saved (id={id}, kind={kind})."))
+}
+
+fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let sessions_back = args.get("sessions_back")
+        .and_then(|v| v.as_i64())
+        .map(|v| (v.clamp(1, 50)) as usize)
+        .unwrap_or(5);
+
+    let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+
+    let session_ids = crate::memory::store::get_recent_session_ids(conn, sessions_back)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    if session_ids.is_empty() {
+        return Ok("No sessions found.".into());
+    }
+
+    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    if observations.is_empty() {
+        return Ok("No observations found matching the given filters.".into());
+    }
+
+    let total = observations.len();
+    let capped = total.min(200);
+
+    // Group observations by session_id, preserving order
+    let mut session_order: Vec<String> = Vec::new();
+    let mut by_session: std::collections::HashMap<String, Vec<&crate::memory::store::ObservationRow>> =
+        std::collections::HashMap::new();
+
+    for obs in observations.iter().take(capped) {
+        if !by_session.contains_key(&obs.session_id) {
+            session_order.push(obs.session_id.clone());
+        }
+        by_session.entry(obs.session_id.clone()).or_default().push(obs);
+    }
+
+    // Pre-fetch session start times for accurate headers
+    let session_timestamps: std::collections::HashMap<String, i64> = session_ids.iter().filter_map(|sid| {
+        conn.query_row(
+            "SELECT started_at FROM sessions WHERE id = ?1",
+            rusqlite::params![sid],
+            |r| r.get(0),
+        ).ok().map(|ts: i64| (sid.clone(), ts))
+    }).collect();
+
+    let mut output = format!("# Session History (last {} sessions)\n", session_ids.len());
+    let mut stale_count = 0usize;
+
+    for sid in &session_order {
+        let ts = session_timestamps.get(sid).copied().unwrap_or(0);
+        let dt = chrono::DateTime::from_timestamp(ts, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        output.push_str(&format!("\n## Session {} ({})\n\n", sid, dt));
+
+        let obs_list = &by_session[sid];
+        for obs in obs_list {
+            if obs.is_stale {
+                stale_count += 1;
+                let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
+                output.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {}\n", reason, obs.kind, obs.content));
+            } else {
+                output.push_str(&format!("- [{}] {}\n", obs.kind, obs.content));
+            }
+            if let Some(fqn) = &obs.symbol_fqn {
+                output.push_str(&format!("  Symbol: {}\n", fqn));
+            }
+            if let Some(fp) = &obs.file_path {
+                output.push_str(&format!("  File: {}\n", fp));
+            }
+        }
+    }
+
+    let stale_suffix = if stale_count > 0 {
+        format!(" ({} stale)", stale_count)
+    } else {
+        String::new()
+    };
+    output.push_str(&format!(
+        "\n{} sessions, {} observations{}\n",
+        session_order.len(),
+        capped,
+        stale_suffix
+    ));
+
+    if total > 200 {
+        output.push_str(&format!(
+            "\n(Showing 200 of {} observations. Use filters to narrow results.)\n",
+            total
+        ));
+    }
+
+    Ok(output)
 }
