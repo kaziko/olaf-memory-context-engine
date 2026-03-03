@@ -82,12 +82,38 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": []
             }
         }),
+        serde_json::json!({
+            "name": "save_observation",
+            "description": "Save an observation (insight, decision, error, etc.) linked to a symbol FQN or file path. Persists to session memory for retrieval in future sessions. At least one of symbol_fqn or file_path is required.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Plain English description of the observation"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "One of: insight, decision, error, tool_call, file_change, anti_pattern"
+                    },
+                    "symbol_fqn": {
+                        "type": "string",
+                        "description": "Optional: symbol FQN to link this observation to, e.g. 'src/auth.ts::AuthService::login'"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional: file path to link this observation to, e.g. 'src/auth.ts'"
+                    }
+                },
+                "required": ["content", "kind"]
+            }
+        }),
     ]
 }
 
 /// Dispatches a tools/call request to the appropriate handler.
 /// Returns the tool's text response (server.rs wraps it in MCP content format).
-pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, params: Option<&Value>) -> Result<String, ToolError> {
+pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, session_id: &str, params: Option<&Value>) -> Result<String, ToolError> {
     let tool_name = params
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
@@ -99,6 +125,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, par
         "get_impact"       => handle_get_impact(conn, args),
         "get_file_skeleton" => handle_get_file_skeleton(conn, args),
         "index_status"     => handle_index_status(conn),
+        "save_observation" => handle_save_observation(conn, session_id, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -146,4 +173,38 @@ fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>) -
 fn handle_index_status(conn: &rusqlite::Connection) -> Result<String, ToolError> {
     crate::graph::query::index_status(conn)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+}
+
+const VALID_KINDS: &[&str] = &["insight", "decision", "error", "tool_call", "file_change", "anti_pattern"];
+
+fn handle_save_observation(conn: &mut rusqlite::Connection, session_id: &str, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let content = args.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: content".into()))?;
+    let kind = args.get("kind").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: kind".into()))?;
+
+    if !VALID_KINDS.contains(&kind) {
+        return Err(ToolError::InvalidParams(
+            format!("invalid kind '{kind}'; must be one of: insight, decision, error, tool_call, file_change, anti_pattern")
+        ));
+    }
+
+    let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let file_path  = args.get("file_path").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+
+    if symbol_fqn.is_none() && file_path.is_none() {
+        return Err(ToolError::InvalidParams(
+            "at least one of symbol_fqn or file_path is required".into()
+        ));
+    }
+
+    crate::memory::store::upsert_session(conn, session_id, "claude-code")
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+    let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    Ok(format!("Observation saved (id={id}, kind={kind})."))
 }
