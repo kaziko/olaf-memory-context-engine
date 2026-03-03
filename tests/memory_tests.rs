@@ -886,3 +886,260 @@ fn test_compressed_session_visible_in_get_session_history() {
     let text = extract_text(&responses[0]);
     assert!(text.contains("retained insight"), "compressed session insight must be visible; got: {text}");
 }
+
+// ─── Story 4.1 Tests ──────────────────────────────────────────────────────────
+
+fn make_edit_payload(session_id: &str, cwd: &str, file_path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{cwd}/{file_path}"),
+            "old_string": "hello world",
+            "new_string": "goodbye world"
+        },
+        "tool_response": {},
+        "tool_use_id": "toolu_01test"
+    })
+}
+
+fn make_write_payload(session_id: &str, cwd: &str, file_path: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": format!("{cwd}/{file_path}"),
+            "content": content
+        },
+        "tool_use_id": "toolu_02test"
+    })
+}
+
+fn make_bash_payload(session_id: &str, cwd: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "toolu_03test"
+    })
+}
+
+fn run_observe(tmpdir: &tempfile::TempDir, payload: &serde_json::Value) -> std::process::Output {
+    let json = serde_json::to_string(payload).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "post-tool-use"])
+        .current_dir(tmpdir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(json.as_bytes()).unwrap();
+            child.wait_with_output()
+        })
+        .expect("olaf observe must spawn")
+}
+
+// Task 9.1: Full PostToolUse flow for Edit
+#[test]
+fn test_observe_edit_payload_creates_observation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Initialize DB
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_edit_payload("hook-sess-1", cwd, "src/main.rs");
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "olaf observe must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "stdout must be empty; got: {:?}", String::from_utf8_lossy(&output.stdout));
+
+    // Verify observation in DB
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let row: (String, String, Option<String>, i64) = conn.query_row(
+        "SELECT kind, content, file_path, auto_generated FROM observations WHERE session_id = 'hook-sess-1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!(row.0, "file_change");
+    assert!(row.1.contains("Edited src/main.rs"), "content must mention file; got: {}", row.1);
+    assert_eq!(row.2.as_deref(), Some("src/main.rs"));
+    assert_eq!(row.3, 1, "auto_generated must be 1");
+}
+
+// Task 9.2: Write payload full flow
+#[test]
+fn test_observe_write_payload_creates_file_change_observation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_write_payload("hook-sess-2", cwd, "src/lib.rs", "fn main() {}");
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let kind: String = conn.query_row(
+        "SELECT kind FROM observations WHERE session_id = 'hook-sess-2'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(kind, "file_change");
+}
+
+// Task 9.3: Bash payload full flow
+#[test]
+fn test_observe_bash_payload_creates_tool_call_observation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_bash_payload("hook-sess-3", cwd, "cargo build");
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (kind, file_path): (String, Option<String>) = conn.query_row(
+        "SELECT kind, file_path FROM observations WHERE session_id = 'hook-sess-3'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(kind, "tool_call");
+    assert!(file_path.is_none(), "Bash observations must have no file_path");
+}
+
+// Task 10.1: Valid payload exits 0 with empty stdout
+#[test]
+fn test_observe_valid_payload_exits_0_empty_stdout() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Initialize DB so the observe handler can write
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_edit_payload("hook-sess-10a", cwd, "src/a.rs");
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "stdout must be empty");
+}
+
+// Task 10.2: Malformed JSON exits 0, empty stdout
+#[test]
+fn test_observe_malformed_json_exits_0() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "post-tool-use"])
+        .current_dir(tmpdir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"not valid json {{{").unwrap();
+            child.wait_with_output()
+        })
+        .expect("must spawn");
+
+    assert!(output.status.success(), "malformed JSON must exit 0; got: {:?}", output.status);
+    assert!(output.stdout.is_empty(), "stdout must be empty on malformed input");
+}
+
+// Task 10.3: Sensitive file path → exits 0, no observation
+#[test]
+fn test_observe_sensitive_path_no_observation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    // .env is a sensitive path
+    let payload = serde_json::json!({
+        "session_id": "hook-sensitive",
+        "cwd": cwd,
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{cwd}/.env"),
+            "old_string": "SECRET=old",
+            "new_string": "SECRET=new"
+        }
+    });
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observations WHERE session_id = 'hook-sensitive'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "no observation must be created for sensitive paths");
+}
+
+// Task 10.4: DB open failure → exits 0
+// Use a path inside a file (not a directory) so SQLite cannot create the .olaf subdir,
+// making DB open fail deterministically even in privileged/containerized environments.
+#[test]
+fn test_observe_invalid_cwd_exits_0() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Create a regular file at the path we'll use as "cwd" — SQLite cannot mkdir inside a file
+    let fake_cwd = tmpdir.path().join("not_a_dir");
+    std::fs::write(&fake_cwd, b"not a directory").unwrap();
+    let fake_cwd_str = fake_cwd.to_str().unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "hook-bad-cwd",
+        "cwd": fake_cwd_str,
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{fake_cwd_str}/src/x.rs"),
+            "old_string": "a",
+            "new_string": "b"
+        }
+    });
+    let output = run_observe(&tmpdir, &payload);
+    assert!(output.status.success(), "DB open failure must exit 0; got: {:?}", output.status);
+}
+
+// Task 10.5: file_path outside cwd → exits 0, no observation
+#[test]
+fn test_observe_file_outside_cwd_no_observation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "hook-outside",
+        "cwd": cwd,
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/etc/passwd",
+            "old_string": "root",
+            "new_string": "user"
+        }
+    });
+    let output = run_observe(&tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observations WHERE session_id = 'hook-outside'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "no observation for files outside project root");
+}

@@ -306,6 +306,37 @@ pub(crate) fn collect_fqns_for_unseen_files(
     Ok(fqns)
 }
 
+/// Look up the tightest-enclosing symbol FQN for a given file path and line number.
+///
+/// Returns the FQN of the narrowest symbol whose `start_line <= line <= end_line`.
+/// When multiple symbols span the same line (e.g., a method inside a class), the
+/// narrowest one (smallest line span) is returned via `ORDER BY (end_line - start_line) ASC`.
+///
+/// Returns `Ok(None)` when:
+/// - The file is not in the index
+/// - No symbol spans the given line
+///
+/// NOTE: This function is implemented as infrastructure for Story 4.3 (PreToolUse correlation)
+/// and is NOT called by the PostToolUse handler in Story 4.1.
+pub fn lookup_symbol_at_line(
+    conn: &Connection,
+    rel_path: &str,
+    line: u32,
+) -> Result<Option<String>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.fqn FROM symbols s \
+         JOIN files f ON s.file_id = f.id \
+         WHERE f.path = ?1 AND s.start_line <= ?2 AND s.end_line >= ?2 \
+         ORDER BY (s.end_line - s.start_line) ASC \
+         LIMIT 1",
+    )?;
+    match stmt.query_row(params![rel_path, line], |r| r.get::<_, String>(0)) {
+        Ok(fqn) => Ok(Some(fqn)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sqlite(e)),
+    }
+}
+
 /// Collect `fqn → source_hash` for all symbols belonging to a file.
 ///
 /// Used by `full.rs` to snapshot symbol hashes before `replace_file_symbols`
@@ -360,6 +391,68 @@ mod tests {
     fn open_test_db() -> rusqlite::Connection {
         let dir = tempdir().unwrap();
         db::open(&dir.path().join("index.db")).unwrap()
+    }
+
+    // ─── Story 4.1 Unit Tests ────────────────────────────────────────────────────
+
+    fn insert_test_symbol(conn: &mut rusqlite::Connection, file_path: &str, fqn: &str, name: &str, start: u32, end: u32) {
+        let tx = conn.transaction().unwrap();
+        let file_id = upsert_file(&tx, file_path, "hash", "rust", 1000).unwrap();
+        tx.execute(
+            "INSERT OR IGNORE INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (?1, ?2, ?3, 'function', ?4, ?5, 'h')",
+            params![file_id, fqn, name, start, end],
+        ).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_lookup_symbol_at_line_within_range() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/lib.rs", "src/lib.rs::my_fn", "my_fn", 5, 15);
+
+        let fqn = lookup_symbol_at_line(&conn, "src/lib.rs", 10).unwrap();
+        assert_eq!(fqn.as_deref(), Some("src/lib.rs::my_fn"));
+    }
+
+    #[test]
+    fn test_lookup_symbol_at_line_outside_range_returns_none() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/lib.rs", "src/lib.rs::my_fn", "my_fn", 5, 15);
+
+        let fqn = lookup_symbol_at_line(&conn, "src/lib.rs", 20).unwrap();
+        assert!(fqn.is_none(), "line outside symbol range must return None");
+    }
+
+    #[test]
+    fn test_lookup_symbol_at_line_nested_returns_narrowest() {
+        let mut conn = open_test_db();
+        // class spans 1-50, method spans 10-20 → method is narrower
+        {
+            let tx = conn.transaction().unwrap();
+            let file_id = upsert_file(&tx, "src/a.rs", "h", "rust", 1000).unwrap();
+            tx.execute(
+                "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+                 VALUES (?1, 'src/a.rs::MyClass', 'MyClass', 'class', 1, 50, 'h')",
+                params![file_id],
+            ).unwrap();
+            tx.execute(
+                "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+                 VALUES (?1, 'src/a.rs::MyClass::method', 'method', 'function', 10, 20, 'h')",
+                params![file_id],
+            ).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let fqn = lookup_symbol_at_line(&conn, "src/a.rs", 15).unwrap();
+        assert_eq!(fqn.as_deref(), Some("src/a.rs::MyClass::method"), "narrowest symbol must be returned");
+    }
+
+    #[test]
+    fn test_lookup_symbol_at_line_file_not_indexed_returns_none() {
+        let conn = open_test_db();
+        let fqn = lookup_symbol_at_line(&conn, "nonexistent.rs", 1).unwrap();
+        assert!(fqn.is_none(), "unindexed file must return None");
     }
 
     #[test]

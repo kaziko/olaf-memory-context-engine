@@ -21,7 +21,7 @@ pub struct ObservationRow {
     pub stale_reason: Option<String>,
 }
 
-pub(crate) fn upsert_session(
+pub fn upsert_session(
     conn: &Connection,
     session_id: &str,
     agent: &str,
@@ -50,6 +50,28 @@ pub(crate) fn insert_observation(
     Ok(conn.last_insert_rowid())
 }
 
+/// Insert an automatically-captured observation with `auto_generated = 1`.
+///
+/// Passively-captured observations (from hooks) are marked `auto_generated = 1`
+/// to distinguish them from manually-saved ones (`auto_generated = 0`).
+/// This flag is used by session compression to identify ephemeral observations.
+pub fn insert_auto_observation(
+    conn: &Connection,
+    session_id: &str,
+    kind: &str,
+    content: &str,
+    symbol_fqn: Option<&str>,
+    file_path: Option<&str>,
+) -> Result<i64, StoreError> {
+    conn.execute(
+        "INSERT INTO observations \
+         (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        params![session_id, now_secs(), kind, content, symbol_fqn, file_path],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -59,7 +81,7 @@ fn now_secs() -> i64 {
 
 /// Layer 3 sensitive-file exclusion for observations (defense-in-depth).
 /// KEEP IN SYNC with `graph/query.rs::is_output_sensitive` and `index::is_sensitive`.
-pub(crate) fn is_sensitive_path(path: &str) -> bool {
+pub fn is_sensitive_path(path: &str) -> bool {
     let p = std::path::Path::new(path);
     let file_name = match p.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
@@ -372,6 +394,55 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let conn = crate::db::open(&db_path).expect("open DB");
         (conn, dir)
+    }
+
+    // ─── Story 4.1 Unit Tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_insert_auto_observation_has_auto_generated_1() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "auto-sess", "test-agent").unwrap();
+        let id = insert_auto_observation(
+            &conn,
+            "auto-sess",
+            "file_change",
+            "Edited src/main.rs: replaced 10 chars",
+            None,
+            Some("src/main.rs"),
+        )
+        .unwrap();
+        assert!(id > 0);
+        let auto_generated: i64 = conn
+            .query_row(
+                "SELECT auto_generated FROM observations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_generated, 1, "auto_generated must be 1 for passively-captured observations");
+    }
+
+    #[test]
+    fn test_insert_observation_has_auto_generated_0() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "manual-sess", "test-agent").unwrap();
+        let id = insert_observation(
+            &conn,
+            "manual-sess",
+            "insight",
+            "Manual observation",
+            None,
+            Some("src/a.rs"),
+        )
+        .unwrap();
+        let auto_generated: i64 = conn
+            .query_row(
+                "SELECT auto_generated FROM observations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_generated, 0, "existing insert_observation must still produce auto_generated=0");
     }
 
     #[test]
