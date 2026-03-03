@@ -23,11 +23,32 @@ fn inner(event: &str) -> anyhow::Result<()> {
 
     match event {
         "post-tool-use" => handle_post_tool_use(&payload),
+        "session-end" => handle_session_end(&payload),
         _ => {
             log::debug!("observe: unhandled event: {event}");
             Ok(())
         }
     }
+}
+
+fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let cwd = PathBuf::from(&payload.cwd);
+    let mut conn = olaf::db::open(&cwd.join(".olaf/index.db"))
+        .map_err(|e| { log::debug!("observe session-end: DB open failed: {e}"); e })?;
+    olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
+    olaf::memory::mark_session_ended(&conn, &payload.session_id)?;
+    // AC3/AC7: atomic detect+compress in a single BEGIN IMMEDIATE transaction.
+    // IMMEDIATE acquires the write lock before the compressed check, preventing
+    // concurrent processes from both passing the guard and writing duplicate anti_pattern obs.
+    let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id)?;
+    if !ran {
+        log::debug!("observe session-end: session already compressed, skipping");
+    }
+    // FR22 stub: restore-point cleanup deferred to Story 4.4
+    // TODO Story 4.4: olaf::restore::cleanup_old_restore_points(&cwd)?;
+    log::debug!("observe session-end: completed in {:?}", start.elapsed()); // AC8: NFR5 — always logged
+    Ok(())
 }
 
 fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {

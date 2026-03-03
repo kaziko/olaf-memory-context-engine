@@ -1143,3 +1143,286 @@ fn test_observe_file_outside_cwd_no_observation() {
         .unwrap();
     assert_eq!(count, 0, "no observation for files outside project root");
 }
+
+// ─── Story 4.2: SessionEnd Hook Integration Tests ────────────────────────────
+
+fn run_observe_event(
+    event: &str,
+    tmpdir: &tempfile::TempDir,
+    payload: &serde_json::Value,
+) -> std::process::Output {
+    let json = serde_json::to_string(payload).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", event])
+        .current_dir(tmpdir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(json.as_bytes()).unwrap();
+            child.wait_with_output()
+        })
+        .expect("olaf observe must spawn")
+}
+
+fn make_session_end_payload(session_id: &str, cwd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "SessionEnd"
+    })
+}
+
+fn insert_file_change_at(conn: &rusqlite::Connection, session_id: &str, file_path: &str, created_at: i64) {
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content, file_path, auto_generated) \
+         VALUES (?1, ?2, 'file_change', 'edit', ?3, 1)",
+        rusqlite::params![session_id, created_at, file_path],
+    )
+    .expect("insert file_change");
+}
+
+// Task 5.3: SessionEnd with 4 file_change obs in same bucket → exits 0, anti_pattern written
+#[test]
+fn test_session_end_thrashing_detection_writes_anti_pattern() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "se-sess-1";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    // 4 file_change obs in same 300s bucket
+    for t in [0i64, 60, 120, 180] {
+        insert_file_change_at(&conn, session_id, "src/main.rs", t);
+    }
+    drop(conn);
+
+    let payload = make_session_end_payload(session_id, cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "stdout must be empty");
+
+    let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "anti_pattern observation must be written");
+
+    let content: String = conn2
+        .query_row(
+            "SELECT content FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(content.contains("File thrashing detected: src/main.rs"), "content: {content}");
+}
+
+// Task 5.4: SessionEnd with no thrashing → exits 0, no anti_pattern obs
+#[test]
+fn test_session_end_no_thrashing_no_anti_pattern() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "se-sess-2";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    // Only 2 file_change obs — below threshold
+    for t in [0i64, 60] {
+        insert_file_change_at(&conn, session_id, "src/lib.rs", t);
+    }
+    drop(conn);
+
+    let payload = make_session_end_payload(session_id, cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+
+    let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "no anti_pattern obs when no thrashing");
+}
+
+// Task 5.5: SessionEnd → file_change obs deleted after compression, insight retained
+#[test]
+fn test_session_end_compression_deletes_ephemeral_retains_insight() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "se-sess-3";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    // Insert an insight (should be retained) and a file_change (should be deleted)
+    olaf::memory::insert_auto_observation(&conn, session_id, "insight", "important finding", None, None).unwrap();
+    insert_file_change_at(&conn, session_id, "src/a.rs", 100);
+    drop(conn);
+
+    let payload = make_session_end_payload(session_id, cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+
+    assert!(output.status.success(), "must exit 0");
+
+    let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'file_change'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "file_change obs must be deleted after compression");
+
+    let insight_count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'insight'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(insight_count, 1, "insight obs must be retained after compression");
+}
+
+// Task 5.6: Second SessionEnd call → exits 0, no duplicate anti_pattern obs (idempotency)
+#[test]
+fn test_session_end_idempotent_no_duplicate_anti_patterns() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "se-sess-4";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    for t in [0i64, 60, 120, 180] {
+        insert_file_change_at(&conn, session_id, "src/main.rs", t);
+    }
+    drop(conn);
+
+    let payload = make_session_end_payload(session_id, cwd);
+    // First call
+    let out1 = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(out1.status.success(), "first call must exit 0");
+
+    // Second call — should be no-op
+    let out2 = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(out2.status.success(), "second call must exit 0");
+
+    let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "only 1 anti_pattern obs — no duplicates from second call");
+}
+
+// Task 5.7: SessionEnd with malformed payload → exits 0, stdout empty
+#[test]
+fn test_session_end_malformed_payload_exits_0() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "session-end"])
+        .current_dir(tmpdir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"not json at all {{{").unwrap();
+            child.wait_with_output()
+        })
+        .expect("must spawn");
+
+    assert!(output.status.success(), "malformed JSON must exit 0; status: {:?}", output.status);
+    assert!(output.stdout.is_empty(), "stdout must be empty on malformed input");
+}
+
+// Task 5.8: SessionEnd with invalid cwd → exits 0
+#[test]
+fn test_session_end_invalid_cwd_exits_0() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let payload = make_session_end_payload("se-bad-cwd", "/nonexistent/path/");
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(output.status.success(), "invalid cwd must exit 0; got: {:?}", output.status);
+    assert!(output.stdout.is_empty(), "stdout must be empty");
+}
+
+// Concurrency: two parallel session-end processes for the same session → exactly 1 anti_pattern
+// Verifies BEGIN IMMEDIATE serialization prevents TOCTOU duplicate writes.
+#[test]
+fn test_session_end_concurrent_produces_exactly_one_anti_pattern() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap().to_string();
+    let session_id = "se-concurrent";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    for t in [0i64, 60, 120, 180] {
+        insert_file_change_at(&conn, session_id, "src/hot.rs", t);
+    }
+    drop(conn);
+
+    let payload_str =
+        serde_json::to_string(&make_session_end_payload(session_id, &cwd)).unwrap();
+
+    // Spawn both processes before writing to either stdin so they race on DB acquisition
+    let mut child1 = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "session-end"])
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child1");
+
+    let mut child2 = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "session-end"])
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child2");
+
+    // Feed payload to both (order doesn't matter; both are already running)
+    use std::io::Write;
+    child1.stdin.take().unwrap().write_all(payload_str.as_bytes()).unwrap();
+    child2.stdin.take().unwrap().write_all(payload_str.as_bytes()).unwrap();
+
+    let out1 = child1.wait_with_output().expect("wait child1");
+    let out2 = child2.wait_with_output().expect("wait child2");
+
+    assert!(out1.status.success(), "child1 must exit 0; stderr: {}", String::from_utf8_lossy(&out1.stderr));
+    assert!(out2.status.success(), "child2 must exit 0; stderr: {}", String::from_utf8_lossy(&out2.stderr));
+    assert!(out1.stdout.is_empty(), "child1 stdout must be empty");
+    assert!(out2.stdout.is_empty(), "child2 stdout must be empty");
+
+    let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn2
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "BEGIN IMMEDIATE must serialize: exactly 1 anti_pattern regardless of race outcome");
+}

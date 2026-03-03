@@ -283,6 +283,44 @@ pub(crate) fn compress_session(tx: &Transaction, session_id: &str) -> Result<u64
     Ok(deleted as u64)
 }
 
+/// Mark a session as ended by setting ended_at to now. Idempotent: WHERE clause prevents
+/// overwrite if ended_at is already set.
+pub fn mark_session_ended(conn: &Connection, session_id: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE sessions SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+        params![now_secs(), session_id],
+    )?;
+    Ok(())
+}
+
+/// Check whether a session has already been compressed.
+/// Returns Ok(false) if session row not found (safe default for upsert-before-check flow).
+#[cfg(test)]
+pub(crate) fn is_session_compressed(conn: &Connection, session_id: &str) -> Result<bool, StoreError> {
+    match conn.query_row(
+        "SELECT compressed FROM sessions WHERE id = ?1",
+        params![session_id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => Ok(v != 0),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(StoreError::Sqlite(e)),
+    }
+}
+
+/// Compress a specific session unconditionally (not age-based). Creates a transaction,
+/// calls compress_session, then commits. Returns count of deleted observations.
+#[cfg(test)]
+pub(crate) fn compress_specific_session(
+    conn: &mut Connection,
+    session_id: &str,
+) -> Result<u64, StoreError> {
+    let tx = conn.transaction()?;
+    let deleted = compress_session(&tx, session_id)?;
+    tx.commit()?;
+    Ok(deleted)
+}
+
 /// Find sessions that have ended and are stale beyond the threshold, then compress each.
 /// Returns list of compressed session IDs. Active sessions (ended_at IS NULL) are never compressed.
 pub(crate) fn compress_stale_sessions(
@@ -714,5 +752,85 @@ mod tests {
         let obs = get_session_observations(&conn, "s1").unwrap().unwrap();
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].content, "safe obs");
+    }
+
+    // ─── Story 4.2 Unit Tests ────────────────────────────────────────────────────
+
+    // 2.4: mark_session_ended — calling twice does not error; ended_at set once
+    #[test]
+    fn test_mark_session_ended_idempotent() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+
+        // ended_at should be NULL initially
+        let ended_at_before: Option<i64> = conn
+            .query_row("SELECT ended_at FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ended_at_before.is_none());
+
+        mark_session_ended(&conn, "s1").unwrap();
+
+        let ended_at_first: Option<i64> = conn
+            .query_row("SELECT ended_at FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ended_at_first.is_some(), "ended_at must be set after first call");
+
+        // Second call must not error and must not change ended_at
+        mark_session_ended(&conn, "s1").unwrap();
+        let ended_at_second: Option<i64> = conn
+            .query_row("SELECT ended_at FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            ended_at_first, ended_at_second,
+            "ended_at must not change on second call"
+        );
+    }
+
+    // 2.5: is_session_compressed returns false before compress, true after
+    #[test]
+    fn test_is_session_compressed_before_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        upsert_session(&conn, "s1", "a").unwrap();
+
+        let before = is_session_compressed(&conn, "s1").unwrap();
+        assert!(!before, "new session must not be compressed");
+
+        compress_specific_session(&mut conn, "s1").unwrap();
+
+        let after = is_session_compressed(&conn, "s1").unwrap();
+        assert!(after, "session must be marked compressed after compress_specific_session");
+    }
+
+    // 2.6: compress_specific_session — ephemeral obs deleted, insight retained, compressed=1
+    #[test]
+    fn test_compress_specific_session_deletes_ephemeral_retains_insight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+
+        upsert_session(&conn, "s1", "a").unwrap();
+        insert_observation(&conn, "s1", "insight", "keep me", None, None).unwrap();
+        insert_auto_observation(&conn, "s1", "tool_call", "delete me", None, None).unwrap();
+        insert_auto_observation(&conn, "s1", "file_change", "delete me too", None, Some("src/a.rs")).unwrap();
+
+        let deleted = compress_specific_session(&mut conn, "s1").unwrap();
+        assert_eq!(deleted, 2, "two ephemeral obs must be deleted");
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observations WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only insight must remain");
+
+        let kind: String = conn
+            .query_row("SELECT kind FROM observations WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "insight");
+
+        let compressed: i64 = conn
+            .query_row("SELECT compressed FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(compressed, 1, "session must be marked compressed");
     }
 }
