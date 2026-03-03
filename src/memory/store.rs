@@ -1,13 +1,13 @@
-use rusqlite::{Connection, params, types::ToSql};
+use rusqlite::{Connection, Transaction, params, types::ToSql};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StoreError {
+pub enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
 
 #[derive(Debug)]
-pub(crate) struct ObservationRow {
+pub struct ObservationRow {
     #[allow(dead_code)]
     pub id: i64,
     pub session_id: String,
@@ -228,6 +228,141 @@ pub(crate) fn get_observations_for_context(
         .collect())
 }
 
+#[derive(Debug)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub started_at: i64,
+    pub observation_count: u32,
+    pub compressed: bool,
+}
+
+/// Delete ephemeral observations (tool_call, file_change) from a session within
+/// the caller-provided transaction, then mark session compressed.
+/// Returns count of deleted observations. Idempotent: returns Ok(0) if already compressed.
+pub(crate) fn compress_session(tx: &Transaction, session_id: &str) -> Result<u64, StoreError> {
+    // Guard: if already compressed, no-op
+    let compressed: i64 = tx.query_row(
+        "SELECT compressed FROM sessions WHERE id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    if compressed != 0 {
+        return Ok(0);
+    }
+
+    let deleted = tx.execute(
+        "DELETE FROM observations WHERE session_id = ?1 AND kind IN ('tool_call', 'file_change')",
+        params![session_id],
+    )?;
+    tx.execute(
+        "UPDATE sessions SET compressed = 1 WHERE id = ?1",
+        params![session_id],
+    )?;
+    Ok(deleted as u64)
+}
+
+/// Find sessions that have ended and are stale beyond the threshold, then compress each.
+/// Returns list of compressed session IDs. Active sessions (ended_at IS NULL) are never compressed.
+pub(crate) fn compress_stale_sessions(
+    conn: &mut Connection,
+    threshold_secs: i64,
+) -> Result<Vec<String>, StoreError> {
+    let cutoff = now_secs() - threshold_secs;
+    let session_ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1 AND compressed = 0",
+        )?;
+        stmt.query_map(params![cutoff], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?
+    };
+
+    let mut compressed_ids = Vec::new();
+    for sid in &session_ids {
+        let tx = conn.transaction()?;
+        compress_session(&tx, sid)?;
+        tx.commit()?;
+        compressed_ids.push(sid.clone());
+    }
+    Ok(compressed_ids)
+}
+
+/// List recent sessions with observation counts.
+/// LEFT JOIN ensures zero-observation sessions appear with obs_count = 0.
+pub fn list_sessions(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<SessionSummary>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.started_at, s.compressed, COUNT(o.id) AS obs_count \
+         FROM sessions s LEFT JOIN observations o ON o.session_id = s.id \
+         GROUP BY s.id ORDER BY s.started_at DESC, s.rowid DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(SessionSummary {
+                session_id: r.get(0)?,
+                started_at: r.get(1)?,
+                compressed: r.get::<_, i64>(2)? != 0,
+                observation_count: r.get::<_, i64>(3)? as u32,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Get all observations for a session, filtering sensitive paths.
+/// Returns None if session does not exist, Some(vec) if it does (may be empty for compressed sessions).
+pub fn get_session_observations(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<Vec<ObservationRow>>, StoreError> {
+    // Check session exists — distinguish "no rows" from real DB errors
+    let exists = match conn.query_row(
+        "SELECT 1 FROM sessions WHERE id = ?1",
+        params![session_id],
+        |_| Ok(true),
+    ) {
+        Ok(_) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => return Err(StoreError::Sqlite(e)),
+    };
+    if !exists {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason \
+         FROM observations WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok(ObservationRow {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                created_at: r.get(2)?,
+                kind: r.get(3)?,
+                content: r.get(4)?,
+                symbol_fqn: r.get(5)?,
+                file_path: r.get(6)?,
+                is_stale: r.get::<_, i64>(7)? != 0,
+                stale_reason: r.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(
+        rows.into_iter()
+            .filter(|r| {
+                r.file_path.as_deref().is_none_or(|p| !is_sensitive_path(p))
+                    && r.symbol_fqn.as_deref().is_none_or(|fqn| {
+                        // Extract file component from FQN (e.g., ".env::DB_PASSWORD" → ".env")
+                        fqn.split("::").next().is_none_or(|f| !is_sensitive_path(f))
+                    })
+            })
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +568,80 @@ mod tests {
         assert!(is_sensitive_path("store.p12"));
         assert!(!is_sensitive_path("src/main.rs"));
         assert!(!is_sensitive_path("config.toml"));
+    }
+
+    // ─── Story 3.4 Unit Tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_sessions_returns_correct_counts_and_compressed() {
+        let (conn, _dir) = open_test_db();
+        conn.execute(
+            "INSERT INTO sessions (id, started_at, agent, compressed) VALUES ('s1', 100, 'a', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, started_at, agent, compressed) VALUES ('s2', 200, 'a', 1)",
+            [],
+        ).unwrap();
+        insert_observation(&conn, "s1", "insight", "obs1", Some("f::x"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "obs2", Some("f::y"), None).unwrap();
+        insert_observation(&conn, "s2", "decision", "obs3", None, Some("src/a.rs")).unwrap();
+
+        let sessions = list_sessions(&conn, 10).unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Most recent first (s2 started_at=200)
+        assert_eq!(sessions[0].session_id, "s2");
+        assert_eq!(sessions[0].observation_count, 1);
+        assert!(sessions[0].compressed);
+        assert_eq!(sessions[1].session_id, "s1");
+        assert_eq!(sessions[1].observation_count, 2);
+        assert!(!sessions[1].compressed);
+    }
+
+    #[test]
+    fn test_list_sessions_zero_observation_sessions() {
+        let (conn, _dir) = open_test_db();
+        conn.execute(
+            "INSERT INTO sessions (id, started_at, agent) VALUES ('empty', 100, 'a')",
+            [],
+        ).unwrap();
+
+        let sessions = list_sessions(&conn, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "empty");
+        assert_eq!(sessions[0].observation_count, 0);
+    }
+
+    #[test]
+    fn test_get_session_observations_valid_session() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        insert_observation(&conn, "s1", "insight", "finding", Some("f::x"), None).unwrap();
+        insert_observation(&conn, "s1", "decision", "chose A", None, Some("src/a.rs")).unwrap();
+
+        let obs = get_session_observations(&conn, "s1").unwrap();
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.len(), 2);
+    }
+
+    #[test]
+    fn test_get_session_observations_invalid_session() {
+        let (conn, _dir) = open_test_db();
+        let obs = get_session_observations(&conn, "nonexistent").unwrap();
+        assert!(obs.is_none());
+    }
+
+    #[test]
+    fn test_get_session_observations_filters_sensitive_paths() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        insert_observation(&conn, "s1", "insight", "safe obs", None, Some("src/main.rs")).unwrap();
+        insert_observation(&conn, "s1", "insight", "secret obs", None, Some(".env")).unwrap();
+        insert_observation(&conn, "s1", "insight", "key obs", None, Some("certs/server.pem")).unwrap();
+
+        let obs = get_session_observations(&conn, "s1").unwrap().unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].content, "safe obs");
     }
 }

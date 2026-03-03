@@ -796,3 +796,93 @@ fn test_staleness_full_reindex_symbol_removed() {
         "reason must mention 'no longer exists'; got: {text}"
     );
 }
+
+// ─── Story 3.4 Tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_compression_removes_ephemeral_retains_insights() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let mut conn = olaf::db::open(&db_path).unwrap();
+
+    // Create an ended session (ended 2 hours ago)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ended = now - 7200;
+    conn.execute(
+        "INSERT INTO sessions (id, started_at, ended_at, agent) VALUES ('comp-sess', ?1, ?2, 'test')",
+        rusqlite::params![ended - 3600, ended],
+    ).unwrap();
+
+    // Insert mixed observations
+    for (kind, content) in &[
+        ("tool_call", "read file"),
+        ("file_change", "modified main.rs"),
+        ("insight", "important finding"),
+        ("decision", "chose approach A"),
+    ] {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content) VALUES ('comp-sess', ?1, ?2, ?3)",
+            rusqlite::params![now, kind, content],
+        ).unwrap();
+    }
+
+    // Run compression
+    olaf::memory::run_compression(&mut conn, 3600).unwrap();
+
+    // Verify ephemeral deleted, insights retained
+    let obs_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE session_id = 'comp-sess'", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(obs_count, 2, "only insight and decision should remain");
+
+    let compressed: i64 = conn.query_row(
+        "SELECT compressed FROM sessions WHERE id = 'comp-sess'", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(compressed, 1);
+
+    // Verify via MCP get_session_history that retained observations are still visible
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, None, None, Some(5)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("important finding"), "retained insight must appear in history; got: {text}");
+    assert!(!text.contains("read file"), "ephemeral tool_call must NOT appear after compression; got: {text}");
+}
+
+#[test]
+fn test_compressed_session_visible_in_get_session_history() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let mut conn = olaf::db::open(&db_path).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ended = now - 7200;
+    conn.execute(
+        "INSERT INTO sessions (id, started_at, ended_at, agent) VALUES ('vis-sess', ?1, ?2, 'test')",
+        rusqlite::params![ended - 3600, ended],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn) VALUES ('vis-sess', ?1, 'insight', 'retained insight', 'f::hello')",
+        rusqlite::params![now],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content) VALUES ('vis-sess', ?1, 'tool_call', 'ephemeral call')",
+        rusqlite::params![now],
+    ).unwrap();
+
+    olaf::memory::run_compression(&mut conn, 3600).unwrap();
+
+    // Verify via MCP
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, None, None, Some(5)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("retained insight"), "compressed session insight must be visible; got: {text}");
+}

@@ -6,5 +6,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let stats = olaf::index::run(&mut conn, &project_root)?;
 
     eprintln!("indexed {} files, {} symbols, {} edges", stats.files, stats.symbols, stats.edges);
+
+    olaf::memory::run_compression(
+        &mut conn,
+        olaf::memory::DEFAULT_COMPRESSION_THRESHOLD_SECS,
+    )?;
+
     Ok(())
 }
