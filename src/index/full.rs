@@ -7,6 +7,7 @@ use rusqlite::Connection;
 
 use crate::graph::store;
 use crate::index::is_sensitive;
+use crate::memory::staleness;
 use crate::parser::{self, EdgeKind};
 
 /// Summary statistics returned from a full index run.
@@ -133,11 +134,29 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
             .collect();
         pending_edges.extend(file_edges);
 
-        // 8. Per-file transaction: upsert file + replace symbols
+        // 8. Per-file transaction: upsert file + replace symbols + staleness detection
         let sym_count = symbols.len();
         let tx = conn.transaction()?;
         let file_id = store::upsert_file(&tx, &relative_path, &hash, lang_str, now_ts)?;
+        let old_symbols = store::collect_symbol_hashes_for_file(&tx, file_id)?;
         store::replace_file_symbols(&tx, file_id, &symbols)?;
+
+        // Compute diff: old vs new for staleness detection
+        let new_map: std::collections::HashMap<&str, &str> = symbols
+            .iter()
+            .map(|s| (s.fqn.as_str(), s.source_hash.as_str()))
+            .collect();
+        let mut changed_fqns = Vec::new();
+        let mut removed_fqns = Vec::new();
+        for (fqn, old_hash) in &old_symbols {
+            match new_map.get(fqn.as_str()) {
+                Some(new_hash) if *new_hash != old_hash => changed_fqns.push(fqn.clone()),
+                None => removed_fqns.push(fqn.clone()),
+                _ => {} // unchanged
+            }
+        }
+        staleness::mark_stale_for_changed_fqns(&tx, &changed_fqns)?;
+        staleness::mark_stale_for_removed_symbols(&tx, &removed_fqns)?;
         tx.commit()?;
 
         files_indexed += 1;
@@ -212,6 +231,8 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
     // wrong with the invocation — skip cleanup to preserve the prior index state.
     if project_root.is_dir() {
         let tx = conn.transaction()?;
+        let doomed_fqns = store::collect_fqns_for_unseen_files(&tx, &seen_paths)?;
+        staleness::mark_stale_for_removed_symbols(&tx, &doomed_fqns)?;
         let deleted = if seen_paths.is_empty() {
             // No supported files remain (project empty or only unsupported files).
             // Delete ALL previously indexed rows.

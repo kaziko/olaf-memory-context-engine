@@ -131,6 +131,7 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
         let file_id = store::upsert_file(&tx, &relative_path, &hash_hex, lang_str, now_ts)?;
         let diff = store::update_file_symbols(&tx, file_id, &symbols)?;
         staleness::mark_stale_for_changed_symbols(&tx, &diff.changed)?;
+        staleness::mark_stale_for_removed_symbols(&tx, &diff.removed)?;
         tx.commit()?;
 
         files_reindexed += 1;
@@ -185,6 +186,8 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
     // Guard on project_root.is_dir(), not on file count.
     if project_root.is_dir() {
         let tx = conn.transaction()?;
+        let doomed_fqns = store::collect_fqns_for_unseen_files(&tx, &seen_paths)?;
+        staleness::mark_stale_for_removed_symbols(&tx, &doomed_fqns)?;
         let deleted = if seen_paths.is_empty() {
             tx.execute("DELETE FROM files", [])?
         } else {

@@ -6,13 +6,15 @@ use crate::parser::Symbol;
 
 /// Diff returned by `update_file_symbols()` describing which symbols changed.
 ///
-/// `changed` contains `(symbol_id, old_source_hash, new_source_hash)` for each
-/// symbol that was UPDATE'd in-place. Story 3.3 uses this to mark observations
-/// stale only where `old_source_hash != new_source_hash`.
+/// `changed` contains `(fqn, old_source_hash, new_source_hash)` for each
+/// symbol that was UPDATE'd in-place. Staleness detection uses the FQN to
+/// mark linked observations stale where `old_source_hash != new_source_hash`.
+///
+/// `removed` contains FQNs of symbols no longer present after re-parse.
 pub(crate) struct SymbolDiff {
-    pub changed: Vec<(i64, String, String)>,
+    pub changed: Vec<(String, String, String)>,
     pub added: usize,
-    pub removed: usize,
+    pub removed: Vec<String>,
 }
 
 /// Index statistics as stored in the DB — shared by `olaf status` (CLI)
@@ -116,8 +118,8 @@ pub(crate) fn replace_file_symbols(
 /// - Symbols with a new FQN are INSERT'd.
 /// - Symbols whose FQN is no longer present are DELETE'd (cascade-cleans their edges).
 ///
-/// Returns a `SymbolDiff` with `changed` = `(symbol_id, old_hash, new_hash)` tuples
-/// for every symbol that was UPDATE'd (for Story 3.3 staleness detection).
+/// Returns a `SymbolDiff` with `changed` = `(fqn, old_hash, new_hash)` tuples
+/// for every symbol that was UPDATE'd, and `removed` = FQNs of deleted symbols.
 ///
 /// Caller owns the transaction — this function never calls `conn.transaction()`.
 pub(crate) fn update_file_symbols(
@@ -138,7 +140,7 @@ pub(crate) fn update_file_symbols(
         .collect::<Result<_, _>>()?
     };
 
-    let mut diff = SymbolDiff { changed: Vec::new(), added: 0, removed: 0 };
+    let mut diff = SymbolDiff { changed: Vec::new(), added: 0, removed: Vec::new() };
 
     for sym in new_symbols {
         if let Some((existing_id, old_hash)) = current.remove(&sym.fqn) {
@@ -157,7 +159,7 @@ pub(crate) fn update_file_symbols(
                     existing_id
                 ],
             )?;
-            diff.changed.push((existing_id, old_hash, sym.source_hash.clone()));
+            diff.changed.push((sym.fqn.clone(), old_hash, sym.source_hash.clone()));
         } else {
             // INSERT new symbol
             tx.execute(
@@ -181,9 +183,9 @@ pub(crate) fn update_file_symbols(
     }
 
     // DELETE symbols whose FQN is no longer present (cascade-deletes their outbound edges)
-    for (old_id, _) in current.values() {
+    for (fqn, (old_id, _)) in &current {
         tx.execute("DELETE FROM symbols WHERE id = ?1", [old_id])?;
-        diff.removed += 1;
+        diff.removed.push(fqn.clone());
     }
 
     Ok(diff)
@@ -265,6 +267,58 @@ pub(crate) fn load_name_id_map(
         let (name, id, kind) = row?;
         map.entry(name).or_default().push((id, kind));
     }
+    Ok(map)
+}
+
+/// Collect FQNs for all symbols belonging to files NOT in `seen_paths`.
+///
+/// Used before `delete_unseen_files` to mark observations stale for symbols
+/// that are about to be cascade-deleted. When `seen_paths` is empty, returns
+/// ALL symbol FQNs (all files are about to be deleted).
+pub(crate) fn collect_fqns_for_unseen_files(
+    tx: &Transaction,
+    seen_paths: &HashSet<String>,
+) -> Result<Vec<String>, StoreError> {
+    if seen_paths.is_empty() {
+        let mut stmt = tx.prepare("SELECT fqn FROM symbols")?;
+        let fqns = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(fqns);
+    }
+    let placeholders = seen_paths
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT s.fqn FROM symbols s JOIN files f ON s.file_id = f.id \
+         WHERE f.path NOT IN ({})",
+        placeholders
+    );
+    let params: Vec<&dyn rusqlite::ToSql> =
+        seen_paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut stmt = tx.prepare(&sql)?;
+    let fqns = stmt
+        .query_map(params.as_slice(), |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(fqns)
+}
+
+/// Collect `fqn → source_hash` for all symbols belonging to a file.
+///
+/// Used by `full.rs` to snapshot symbol hashes before `replace_file_symbols`
+/// deletes and re-inserts them, enabling hash-change and removal detection.
+pub(crate) fn collect_symbol_hashes_for_file(
+    tx: &Transaction,
+    file_id: i64,
+) -> Result<HashMap<String, String>, StoreError> {
+    let mut stmt =
+        tx.prepare("SELECT fqn, source_hash FROM symbols WHERE file_id = ?1")?;
+    let map = stmt
+        .query_map([file_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<HashMap<_, _>, _>>()?;
     Ok(map)
 }
 
@@ -493,11 +547,11 @@ mod tests {
 
         assert_eq!(id_before, id_after, "update_file_symbols must preserve symbol id for same FQN");
         assert_eq!(diff.changed.len(), 1, "one symbol should be in changed list");
-        assert_eq!(diff.changed[0].0, id_before, "changed entry must carry correct symbol_id");
+        assert_eq!(diff.changed[0].0, "src/lib.rs::foo", "changed entry must carry correct FQN");
         assert_eq!(diff.changed[0].1, "hash1", "old_hash must be recorded");
         assert_eq!(diff.changed[0].2, "hash2", "new_hash must be recorded");
         assert_eq!(diff.added, 0);
-        assert_eq!(diff.removed, 0);
+        assert_eq!(diff.removed.len(), 0);
     }
 
     #[test]
@@ -556,7 +610,7 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(diff.changed.len(), 1, "helper must be in changed (UPDATE'd in-place)");
-        assert_eq!(tgt_id, diff.changed[0].0, "symbol id must be preserved");
+        assert_eq!("src/b.rs::helper", diff.changed[0].0, "FQN must be recorded");
 
         let edge_count_after: i64 =
             conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();

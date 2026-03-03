@@ -570,3 +570,229 @@ fn test_get_observations_for_context_limit_after_sensitive_filter() {
     assert!(text.contains("safe context obs"), "must include safe obs past sensitive rows; got: {text}");
     assert!(!text.contains("sensitive obs"), "must NOT include sensitive obs; got: {text}");
 }
+
+// ─── Story 3.3 Tests ──────────────────────────────────────────────────────────
+
+/// Helper: create a TypeScript file, run `olaf index`, start server, save observation,
+/// then return tmpdir for further manipulation.
+fn setup_indexed_project_with_observation(
+    ts_content: &str,
+    obs_content: &str,
+    obs_fqn: Option<&str>,
+    obs_file_path: Option<&str>,
+) -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().unwrap();
+    std::fs::write(tmpdir.path().join("test.ts"), ts_content).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("initial index must spawn");
+    assert!(output.status.success(), "initial olaf index failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // Save observation via MCP
+    run_requests_in(
+        tmpdir.path(),
+        &[save_obs_request(1, "insight", obs_content, obs_fqn, obs_file_path)],
+    );
+    tmpdir
+}
+
+fn get_context_request(id: i64, file_hints: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {
+            "name": "get_context",
+            "arguments": {
+                "intent": "understand code",
+                "file_hints": file_hints,
+                "token_budget": 4000
+            }
+        }
+    })
+}
+
+#[test]
+fn test_staleness_incremental_source_changed() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello returns hardcoded 1",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Modify source file (different body → different source_hash)
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 999; }\n").unwrap();
+
+    // get_context triggers incremental re-index, then query history for stale marker
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "observation must be marked STALE; got: {text}");
+    assert!(
+        text.contains("Symbol source changed"),
+        "reason must be 'Symbol source changed'; got: {text}"
+    );
+}
+
+#[test]
+fn test_staleness_incremental_unchanged_not_stale() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello returns 1",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Re-index without changing the file (get_context triggers incremental)
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(!text.contains("STALE"), "unchanged file must NOT mark observation stale; got: {text}");
+}
+
+#[test]
+fn test_staleness_incremental_symbol_deleted() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\nfunction goodbye() { return 2; }\n",
+        "hello is the entry point",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Remove hello from file (only keep goodbye)
+    std::fs::write(tmpdir.path().join("test.ts"), "function goodbye() { return 2; }\n").unwrap();
+
+    // get_context triggers incremental re-index
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "observation must be stale after symbol deletion; got: {text}");
+    assert!(
+        text.contains("no longer exists"),
+        "reason must mention 'no longer exists'; got: {text}"
+    );
+}
+
+#[test]
+fn test_staleness_file_level_observation_not_stale() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "this file handles greetings",
+        None,
+        Some("test.ts"),
+    );
+
+    // Modify the file (source_hash changes)
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 999; }\n").unwrap();
+
+    // get_context triggers incremental re-index
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, None, Some("test.ts"), Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(
+        !text.contains("STALE"),
+        "file-level observation must NOT be stale when symbol changes; got: {text}"
+    );
+}
+
+#[test]
+fn test_staleness_file_deleted_stale_cleanup() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello is important",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Delete the entire file
+    std::fs::remove_file(tmpdir.path().join("test.ts")).unwrap();
+    // Need at least one supported file for seen_paths to be non-empty,
+    // otherwise the stale-file cleanup deletes everything via DELETE FROM files.
+    std::fs::write(tmpdir.path().join("other.ts"), "function other() {}\n").unwrap();
+
+    // get_context triggers incremental re-index (with stale-file cleanup)
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["other.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(
+        text.contains("STALE"),
+        "observation must be stale after file deletion; got: {text}"
+    );
+    assert!(
+        text.contains("no longer exists"),
+        "reason must mention 'no longer exists'; got: {text}"
+    );
+}
+
+#[test]
+fn test_staleness_full_reindex_source_changed() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello returns 1",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Modify source
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 42; }\n").unwrap();
+
+    // Full re-index via CLI (covers full.rs path)
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("full re-index must spawn");
+    assert!(output.status.success(), "full re-index failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("STALE"), "full re-index must mark observation stale; got: {text}");
+    assert!(
+        text.contains("Symbol source changed"),
+        "reason must be 'Symbol source changed'; got: {text}"
+    );
+}
+
+#[test]
+fn test_staleness_full_reindex_symbol_removed() {
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\nfunction goodbye() { return 2; }\n",
+        "hello is primary",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Remove hello from file
+    std::fs::write(tmpdir.path().join("test.ts"), "function goodbye() { return 2; }\n").unwrap();
+
+    // Full re-index via CLI
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("full re-index must spawn");
+    assert!(output.status.success(), "full re-index failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("STALE"), "full re-index must mark removed symbol stale; got: {text}");
+    assert!(
+        text.contains("no longer exists"),
+        "reason must mention 'no longer exists'; got: {text}"
+    );
+}
