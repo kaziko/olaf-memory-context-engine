@@ -22,6 +22,7 @@ fn inner(event: &str) -> anyhow::Result<()> {
     };
 
     match event {
+        "pre-tool-use" => handle_pre_tool_use(&payload),
         "post-tool-use" => handle_post_tool_use(&payload),
         "session-end" => handle_session_end(&payload),
         _ => {
@@ -29,6 +30,69 @@ fn inner(event: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_pre_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
+    // AC5: Only snapshot for Edit/Write tools
+    match payload.tool_name.as_deref() {
+        Some("Edit") | Some("Write") => {}
+        _ => return Ok(()),
+    }
+
+    let tool_input = match &payload.tool_input {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let abs_file_path = match tool_input.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    // AC4: Skip sensitive paths (works on absolute paths via filename/extension check)
+    if olaf::memory::is_sensitive_path(abs_file_path) {
+        log::debug!("observe pre-tool-use: skipping sensitive path: {abs_file_path}");
+        return Ok(());
+    }
+
+    let cwd = PathBuf::from(&payload.cwd);
+
+    // AC8: Enforce project root boundary — reject paths outside cwd.
+    // strip_prefix is lexical; walk components to:
+    //   - reject ParentDir (..) to prevent /project/../outside escape
+    //   - skip CurDir (.) to normalize src/./main.rs → src/main.rs (stable hash bucket)
+    let rel_file_path = match std::path::Path::new(abs_file_path).strip_prefix(&cwd) {
+        Ok(rel) => {
+            let mut normalized = std::path::PathBuf::new();
+            for component in rel.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        log::debug!(
+                            "observe pre-tool-use: rejecting path with .. component: {abs_file_path}"
+                        );
+                        return Ok(());
+                    }
+                    std::path::Component::CurDir => {} // skip '.' — normalizes path for stable hash
+                    c => normalized.push(c),
+                }
+            }
+            normalized.to_string_lossy().into_owned()
+        }
+        Err(_) => {
+            log::debug!(
+                "observe pre-tool-use: skipping path outside project root: {abs_file_path}"
+            );
+            return Ok(());
+        }
+    };
+
+    let start = std::time::Instant::now();
+
+    // AC3: non-existent file handled inside snapshot() via NotFound match
+    olaf::restore::snapshot(&cwd, &rel_file_path)?;
+
+    log::debug!("observe pre-tool-use: snapshot completed in {:?}", start.elapsed());
+    Ok(())
 }
 
 fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
