@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -35,6 +35,14 @@ const INBOUND_BLEND_THRESHOLD: f32 = 0.35;
 /// Use BFS depth 3 only when refactor weight is dominant (>= 50%).
 /// Below this, depth 2 avoids pulling too-distant symbols for focused tasks.
 const REFACTOR_DEPTH_THRESHOLD: f32 = 0.50;
+
+/// Per-keyword candidate cap during the gather phase in find_pivot_symbols.
+///
+/// The gather query uses `ORDER BY id ASC` for test determinism (see dev notes). This means
+/// on very large indexes with >50 matches per keyword, symbols with lower IDs are preferred
+/// during candidate selection regardless of their in-degree — the final sort only ranks
+/// whatever was gathered. Raising this limit trades more queries/memory for broader coverage.
+const CANDIDATE_GATHER_LIMIT: usize = 50;
 
 /// Default pivot candidate pool size (keyword-match branch in find_pivot_symbols).
 const DEFAULT_PIVOT_POOL: usize = 5;
@@ -195,9 +203,21 @@ fn estimate_tokens(s: &str) -> usize {
     s.len().div_ceil(4)
 }
 
+/// Select pivot symbols from the graph for the given intent.
+///
+/// Scoring: `rank = (kw_score DESC, in_degree DESC, id ASC)`
+/// where `kw_score` is the count of distinct, case-normalized intent keywords (> 3 chars)
+/// that match the symbol's `name` or `fqn`, and `in_degree` is the number of edges
+/// pointing to the symbol.
+///
+/// File hints take priority: when `file_hints` is non-empty and at least one hint matches
+/// a symbol, those symbols are returned and keyword ranking is skipped. If hints match
+/// nothing, the function falls through to keyword ranking.
 fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<i64>, QueryError> {
     let mut ids: Vec<i64> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
+
+    // --- File hints branch: UNCHANGED ---
     if !file_hints.is_empty() {
         for hint in file_hints {
             let pattern = format!("%{hint}%");
@@ -214,27 +234,67 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
         if !ids.is_empty() { return Ok(ids); }
     }
 
-    // Keyword match: use words > 3 chars from intent
-    let words: Vec<&str> = intent.split_whitespace().filter(|w| w.len() > 3).collect();
-    for word in &words {
-        let pattern = format!("%{}%", word.to_lowercase());
+    // --- Keyword branch: RANKED ---
+    // Lowercase first, then dedup — prevents case variants ("Build"/"BUILD") from inflating kw_score.
+    let unique_words: HashSet<String> = intent.split_whitespace()
+        .filter(|w| w.len() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+
+    // Scalability note: `lower(col) LIKE '%word%'` forces a full table scan — SQLite cannot
+    // use a B-tree index for leading-wildcard patterns. This is the main latency hotspot as
+    // the symbols table grows. A future hardening story should evaluate adding an FTS5 virtual
+    // table or a generated trigram column to accelerate these lookups.
+    let mut candidates: HashMap<i64, usize> = HashMap::new(); // id → kw_score
+    for word in &unique_words {
+        let pattern = format!("%{word}%"); // word is already lowercased
         let mut stmt = conn.prepare(
-            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 LIMIT ?2"
+            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
+             ORDER BY id ASC LIMIT ?2"
         )?;
-        let rows: Vec<i64> = stmt.query_map(params![pattern, pool_size as i64], |r| r.get(0))?
+        let rows: Vec<i64> = stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
             .collect::<Result<_,_>>()?;
-        for id in rows {
-            if seen.insert(id) { ids.push(id); }
-        }
+        for id in rows { *candidates.entry(id).or_insert(0) += 1; }
     }
 
-    // Fallback: any symbols
-    if ids.is_empty() {
-        let mut stmt = conn.prepare("SELECT id FROM symbols LIMIT ?1")?;
-        ids = stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?;
+    // Fallback: no keyword matches
+    if candidates.is_empty() {
+        let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id ASC LIMIT ?1")?;
+        return Ok(stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?);
     }
 
-    Ok(ids)
+    // Batch in-degree lookup — chunk to stay under SQLite's 999 bind-variable limit.
+    const IN_DEG_CHUNK: usize = 500;
+    let cand_ids: Vec<i64> = candidates.keys().copied().collect();
+    let mut in_degrees: HashMap<i64, i64> = HashMap::new();
+    for chunk in cand_ids.chunks(IN_DEG_CHUNK) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(i64, i64)> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<_,_>>()?;
+        for (id, count) in rows { in_degrees.insert(id, count); }
+    }
+
+    // Score and sort: primary kw_score DESC, secondary in_degree DESC, tertiary id ASC
+    let mut scored: Vec<(i64, usize, i64)> = candidates.into_iter()
+        .map(|(id, kw)| {
+            let in_deg = in_degrees.get(&id).copied().unwrap_or(0);
+            (id, kw, in_deg)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)          // kw_score DESC
+            .then(b.2.cmp(&a.2))   // in_degree DESC
+            .then(a.0.cmp(&b.0))   // id ASC (deterministic)
+    });
+
+    Ok(scored.into_iter().take(pool_size).map(|(id, _, _)| id).collect())
 }
 
 #[allow(clippy::type_complexity)]
@@ -1065,6 +1125,124 @@ mod tests {
             hypothetical_full_chars,
             hypothetical_full_chars * 70 / 100
         );
+    }
+
+    // --- Story 6.4: Hybrid pivot ranking tests ---
+
+    #[test]
+    fn pivot_ranking_kw_score_dominates_in_degree() {
+        // X matches 2 keywords ("context", "build") but has in_degree=0.
+        // Y matches 1 keyword ("pipeline") but has in_degree=5.
+        // X must rank first because kw_score=2 > kw_score=1.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        // Symbol X: name matches "context" and "build" via LIKE "%context%" and "%build%"
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::context_builder','context_builder','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+        // Symbol Y: name matches "pipeline" via LIKE "%pipeline%"; add 5 callers → in_degree=5
+        conn.execute("INSERT INTO symbols VALUES (2,1,'pkg::pipeline_stage','pipeline_stage','fn',11,20,NULL,NULL,NULL)", []).unwrap();
+        for i in 10..15_i64 {
+            conn.execute(
+                &format!("INSERT INTO symbols VALUES ({i},1,'pkg::caller{i}','caller{i}','fn',{},{}+5,NULL,NULL,NULL)", i*100, i*100),
+                [],
+            ).unwrap();
+            conn.execute(&format!("INSERT INTO edges VALUES ({i},{i},2,'calls')"), []).unwrap();
+        }
+
+        let result = find_pivot_symbols(&conn, "build context pipeline", &[], 5).unwrap();
+        assert!(!result.is_empty(), "must return results");
+        assert_eq!(result[0], 1, "X (kw_score=2) must rank before Y (kw_score=1) despite Y having higher in_degree");
+    }
+
+    #[test]
+    fn pivot_ranking_in_degree_tiebreak() {
+        // P and Q both match "processor" → kw_score=1 each.
+        // Q has in_degree=5, P has in_degree=0. Q must rank first.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::processor','processor','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'pkg::processor_v2','processor_v2','fn',11,20,NULL,NULL,NULL)", []).unwrap();
+        // Add 5 callers for processor_v2 (id=2) → in_degree=5
+        for i in 10..15_i64 {
+            conn.execute(
+                &format!("INSERT INTO symbols VALUES ({i},1,'pkg::caller{i}','caller{i}','fn',{},{}+5,NULL,NULL,NULL)", i*100, i*100),
+                [],
+            ).unwrap();
+            conn.execute(&format!("INSERT INTO edges VALUES ({i},{i},2,'calls')"), []).unwrap();
+        }
+
+        // Intent: "processor data" — "processor" (len=9) and "data" (len=4) both qualify.
+        // Only "processor" yields matches; "data" yields none.
+        let result = find_pivot_symbols(&conn, "processor data", &[], 5).unwrap();
+        assert_eq!(result.len(), 2, "both processor symbols must be returned");
+        assert_eq!(result[0], 2, "processor_v2 (in_degree=5) must rank before processor (in_degree=0)");
+    }
+
+    #[test]
+    fn pivot_ranking_fqn_matching() {
+        // Symbol with name="handler" but fqn containing "authenticate" must be returned
+        // when intent includes "authenticate". Current name-only query would miss this.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'auth::authenticate_handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let result = find_pivot_symbols(&conn, "authenticate users", &[], 5).unwrap();
+        assert!(result.contains(&1), "symbol must be found via FQN LIKE match on 'authenticate'");
+    }
+
+    #[test]
+    fn pivot_ranking_file_hints_take_priority() {
+        // File hint must bypass keyword ranking entirely.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'specific_file.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2,'other_file.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::hint_sym','hint_sym','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,2,'pkg::other_sym','other_sym','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let result = find_pivot_symbols(&conn, "other build context", &["specific_file.rs".to_string()], 5).unwrap();
+        assert!(result.contains(&1), "symbol from hinted file must be present");
+        assert!(!result.contains(&2), "symbol from non-hinted file must be absent when file hints are given");
+    }
+
+    #[test]
+    fn pivot_ranking_case_variant_keywords_do_not_inflate_kw_score() {
+        // Intent "Build BUILD build" should deduplicate to unique_words={"build"}.
+        // Symbol A (name="builder") matches "build" → kw_score=1.
+        // Symbol C (name="debug_build", in_degree=2) also matches "build" → kw_score=1, in_degree=2.
+        // With correct dedup: both calls return [C, A] (C wins by in_degree tiebreak).
+        // With broken dedup: second call gives A kw_score=3 → A would appear first.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::builder','builder','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+        // Symbol C: "debug_build" contains "build" as a substring → also matches LIKE "%build%", in_degree=2.
+        conn.execute("INSERT INTO symbols VALUES (3,1,'pkg::debug_build','debug_build','fn',11,20,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (10,1,'pkg::caller1','caller1','fn',100,110,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (11,1,'pkg::caller2','caller2','fn',111,120,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,10,3,'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (2,11,3,'calls')", []).unwrap();
+
+        let result_single = find_pivot_symbols(&conn, "build", &[], 5).unwrap();
+        let result_triple = find_pivot_symbols(&conn, "Build BUILD build", &[], 5).unwrap();
+
+        // Both must return C (id=3) first because in_degree=2 > in_degree=0 at equal kw_score
+        assert_eq!(result_single[0], 3, "debug_build (in_degree=2) must rank first for 'build'");
+        assert_eq!(result_triple[0], 3, "debug_build must still rank first for 'Build BUILD build' (dedup must prevent inflation)");
+        assert_eq!(result_single, result_triple, "both calls must return identical ordering");
+    }
+
+    #[test]
+    fn pivot_ranking_deterministic_id_tiebreak() {
+        // 3 symbols all matching the same single keyword, all in_degree=0.
+        // Must be returned sorted by id ASC.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        // Insert in reverse order to confirm ordering is by id, not insertion order
+        conn.execute("INSERT INTO symbols VALUES (30,1,'pkg::context_c','context_c','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (10,1,'pkg::context_a','context_a','fn',11,20,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (20,1,'pkg::context_b','context_b','fn',21,30,NULL,NULL,NULL)", []).unwrap();
+
+        let result = find_pivot_symbols(&conn, "context data", &[], 10).unwrap();
+        let ctx_ids: Vec<i64> = result.into_iter().filter(|&id| id == 10 || id == 20 || id == 30).collect();
+        assert_eq!(ctx_ids, vec![10, 20, 30], "symbols with equal score must be ordered by id ASC");
     }
 }
 
