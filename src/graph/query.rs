@@ -55,12 +55,11 @@ pub(crate) enum IntentMode {
 }
 
 /// Scored result of intent classification.
-#[allow(dead_code)]
 pub(crate) struct IntentProfile {
-    pub bugfix_score: usize,
-    pub refactor_score: usize,
-    pub impl_score: usize,
-    pub total: usize,
+    #[allow(dead_code)] pub bugfix_score: usize,   // read only in tests; production uses normalized weights
+    #[allow(dead_code)] pub refactor_score: usize,
+    #[allow(dead_code)] pub impl_score: usize,
+    #[allow(dead_code)] pub total: usize,
     pub confidence: f32,              // dominance = top/total (0.0 if total==0)
     pub dominant_mode: IntentMode,    // winning mode by score, BEFORE confidence fallback
     pub execution_mode: IntentMode,   // actual mode used for traversal (Balanced when low-confidence)
@@ -138,11 +137,6 @@ pub(crate) fn detect_intent_profile(intent: &str) -> IntentProfile {
 
     IntentProfile { bugfix_score: b, refactor_score: r, impl_score: i, total,
                     confidence, dominant_mode, execution_mode, w_bugfix, w_refactor, w_impl, matched_signals }
-}
-
-#[allow(dead_code)]
-pub(crate) fn detect_intent(intent: &str) -> IntentMode {
-    detect_intent_profile(intent).dominant_mode
 }
 
 pub(crate) fn derive_traversal_policy(profile: &IntentProfile) -> TraversalPolicy {
@@ -610,6 +604,10 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    fn detect_intent(intent: &str) -> IntentMode {
+        detect_intent_profile(intent).dominant_mode
+    }
+
     /// Minimal in-memory DB for legacy BFS/pivot tests (no kind column on edges).
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -956,6 +954,117 @@ mod tests {
         }
         assert!(output.contains("fn foo()"), "symbol must be present");
         assert!(!output.contains("Why:"), "reason must be absent when budget is tight");
+    }
+
+    // --- Story 6.2 AC tests: skeletonized adjacent nodes ---
+
+    #[test]
+    fn ac1_pivot_symbol_rendered_with_fenced_code_block() {
+        // Use a NamedTempFile so the path is unique per test run (no races in parallel tests).
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"fn my_pivot() {\n    // body\n    let x = 1;\n}\n").unwrap();
+        let tmp_dir = tmp.path().parent().unwrap().to_path_buf();
+        let filename = tmp.path().file_name().unwrap().to_str().unwrap().to_string();
+
+        let conn = build_test_db();
+        conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
+        conn.execute(&format!("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)"), []).unwrap();
+
+        let result = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000).unwrap();
+
+        assert!(result.contains("```"), "AC1: pivot output must contain fenced code block");
+        assert!(result.contains("fn my_pivot"), "AC1: pivot source body must appear in output");
+        // tmp is dropped here, deleting the file automatically
+    }
+
+    #[test]
+    fn ac2_supporting_symbol_renders_signature_and_docstring_no_code_block() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'crate::pivot','pivot','fn',1,5,'fn pivot()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'crate::helper','helper','fn',6,40,'fn helper(x: i32)','Does the helping.',NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
+
+        let root = std::path::Path::new("/nonexistent");
+        let result = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+
+        let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
+        assert!(supporting_section.contains("Signature:"), "AC2: supporting section must contain Signature line");
+        assert!(supporting_section.contains("Does the helping."), "AC2: supporting section must contain docstring text");
+        assert!(!supporting_section.contains("```"), "AC2: supporting section must NOT contain fenced code block");
+    }
+
+    #[test]
+    fn ac3_supporting_no_docstring_emits_no_placeholder() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'crate::pivot','pivot','fn',1,5,'fn pivot()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'crate::helper','helper','fn',6,40,'fn helper()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
+
+        let root = std::path::Path::new("/nonexistent");
+        let result = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+
+        let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
+        assert!(supporting_section.contains("Signature:"), "AC3: Signature line must be present when sig is set");
+        assert!(!supporting_section.contains("No docstring"), "AC3: must not emit 'No docstring' placeholder");
+        assert!(!supporting_section.contains("unavailable"), "AC3: must not emit 'unavailable' placeholder");
+    }
+
+    #[test]
+    fn ac4_pivot_exhausts_budget_zero_supporting_symbols_in_output() {
+        // token_budget=50 → pivot_budget=35, skeleton_budget=10.
+        // Pivot fallback (no real file) uses sig "fn pivot()" → format_pivot_entry output ≈ 70 chars
+        // → ~18 tokens ≤ 35 → pivot IS emitted.
+        // Skeleton for dep (sig "fn dep()", no doc) ≈ 70 chars → ~18 tokens > 10 → dep NOT emitted.
+        // This proves the ordering: pivot fits and appears, supporting doesn't fit and is absent.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'crate::pivot','pivot','fn',1,5,'fn pivot()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'crate::dep','dep','fn',6,40,'fn dep()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
+
+        let root = std::path::Path::new("/nonexistent");
+        let result = get_context(&conn, root, "implement pivot", &[], 50).unwrap();
+
+        // Pivot must be present — proves pivot-first ordering was honoured
+        assert!(result.contains("## pivot"), "AC4: pivot symbol must appear in output");
+        // Supporting dep must be absent — it lost the budget race to the pivot
+        assert!(!result.contains("### dep"), "AC4: supporting symbol must not appear when pivot exhausts skeleton budget");
+    }
+
+    #[test]
+    fn ac5_supporting_section_at_least_30_percent_fewer_chars_than_full_body() {
+        // 1 small pivot + 3 supporting symbols with 30-line bodies (end_line - start_line = 29)
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'crate::pivot','pivot','fn',1,5,'fn pivot()',NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'crate::alpha','alpha','fn',1,30,'fn alpha()','Alpha docstring.',NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (3,1,'crate::beta','beta','fn',31,60,'fn beta()','Beta docstring.',NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (4,1,'crate::gamma','gamma','fn',61,90,'fn gamma()','Gamma docstring.',NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (2,1,3,'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (3,1,4,'calls')", []).unwrap();
+
+        let root = std::path::Path::new("/nonexistent");
+        let result = get_context(&conn, root, "implement pivot", &[], 50000).unwrap();
+
+        let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
+
+        // Guard: all 3 supporting symbols must be present (prevents false-pass on empty output)
+        assert!(supporting_section.contains("### alpha"), "AC5: alpha must appear in supporting section");
+        assert!(supporting_section.contains("### beta"), "AC5: beta must appear in supporting section");
+        assert!(supporting_section.contains("### gamma"), "AC5: gamma must appear in supporting section");
+
+        // Hypothetical full-body: 3 symbols × 30 lines × 60 chars/line
+        let hypothetical_full_chars = 3 * 30 * 60_usize;
+        assert!(
+            supporting_section.len() <= hypothetical_full_chars * 70 / 100,
+            "AC5: supporting section ({} chars) must be ≥30% fewer than hypothetical full bodies ({} chars, threshold={})",
+            supporting_section.len(),
+            hypothetical_full_chars,
+            hypothetical_full_chars * 70 / 100
+        );
     }
 }
 
