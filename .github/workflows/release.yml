@@ -82,7 +82,14 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: publish  # publish must succeed before we create the public release
+    needs: [build, publish]
+    # On push (tag): both build and publish must succeed.
+    # On workflow_dispatch re-run: publish may fail with "already uploaded" if the version was
+    # already published in a previous run. Allow release to proceed as long as builds succeeded.
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
