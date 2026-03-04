@@ -7,7 +7,19 @@ title: Getting Started
 
 # Getting Started with Olaf
 
-Olaf is a codebase context engine for Claude Code. It indexes your project's symbols and dependencies, then exposes them through an MCP server so Claude can instantly retrieve focused, token-budgeted context for any task — no manual file pasting required. Install it once per project and Claude automatically gets the context it needs.
+Olaf is a codebase context engine for Claude Code. It indexes your project's symbols and dependencies, then exposes them through an MCP server so Claude can instantly retrieve focused, token-budgeted context for any task. Install it once per project and Claude automatically gets the context it needs.
+
+## Why Olaf
+
+Claude Code reads files. A lot of them. On every request it may scan dozens of source files to understand your codebase — burning tokens, slowing responses, and often still missing the right context. Olaf replaces that with a pre-built symbol and dependency graph. Claude asks Olaf, Olaf returns exactly what's relevant, and the rest of your codebase stays out of the way.
+
+**Free with no limits.** No node cap, no subscription, no tier that breaks your workflow when your project grows past 2,000 symbols. Olaf is open source and runs entirely on your machine.
+
+**Built specifically for Claude Code.** `olaf init` wires everything up in one command — MCP server registration, hooks, initial index. No manual config files, no agent-specific workarounds.
+
+**Undo any AI edit instantly.** Before every file change, Olaf creates a shadow snapshot. If Claude makes a mess, `undo_change` restores the file to exactly how it was — no git required, no lost work.
+
+**Your code never leaves your machine.** The index lives in `.olaf/index.db` in your project. No cloud sync, no telemetry.
 
 ## Installation
 
