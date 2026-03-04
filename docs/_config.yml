@@ -1,0 +1,5 @@
+theme: minima
+title: Olaf -- Codebase Context Engine
+description: MCP server for Claude Code. Install, configure, and start getting AI context in minutes.
+baseurl: "/olaf-memory-context-engine"
+url: "https://kaziko.github.io"
