@@ -518,6 +518,27 @@ fn test_get_context_empty_db() {
 }
 
 #[test]
+fn test_get_context_response_header_format() {
+    // Verify the intent metadata header fields introduced in Story 6.1b are present and well-formed.
+    // Intent signals come from the prompt text, not DB contents, so "fix the crash" produces
+    // a high-confidence bugfix profile regardless of whether any symbols are indexed.
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":20,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"intent":"fix the crash"}}
+    });
+    let responses = run_requests(&[req]);
+    assert_eq!(responses.len(), 1);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result; got: {}", r);
+    let content = r["result"]["content"].as_array().expect("content must be array");
+    assert!(!content.is_empty(), "content must not be empty");
+    let text = content[0]["text"].as_str().expect("first content item must have text");
+    assert!(text.contains("intent_mode:"), "header must contain intent_mode");
+    assert!(text.contains("intent_confidence:"), "header must contain intent_confidence");
+    assert!(text.contains("intent_signals:"), "header must contain intent_signals");
+}
+
+#[test]
 fn test_get_context_missing_intent_returns_32602() {
     let req = serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",

@@ -20,6 +20,33 @@ impl From<crate::graph::store::StoreError> for QueryError {
     }
 }
 
+// --- Intent classification tuning ---
+
+/// Confidence (= dominance = top/total) below this triggers balanced fallback + wider pivot pool.
+/// At 0.60, mixed intents like "refactor and fix" (dominance=0.50) correctly fall back;
+/// single-category intents like "fix" or "fix crash" (dominance=1.00) use their mode.
+const LOW_CONFIDENCE_THRESHOLD: f32 = 0.60;
+
+/// Include inbound edges when inbound-oriented signal weight reaches this.
+/// 0.35 means: if 35%+ of matched signals point toward bug-fix or refactor,
+/// callers/dependents are relevant enough to include.
+const INBOUND_BLEND_THRESHOLD: f32 = 0.35;
+
+/// Use BFS depth 3 only when refactor weight is dominant (>= 50%).
+/// Below this, depth 2 avoids pulling too-distant symbols for focused tasks.
+const REFACTOR_DEPTH_THRESHOLD: f32 = 0.50;
+
+/// Default pivot candidate pool size (keyword-match branch in find_pivot_symbols).
+const DEFAULT_PIVOT_POOL: usize = 5;
+
+/// Wider pivot pool under low confidence to reduce pivot miss risk.
+/// Applies only to the keyword-match branch; file-hints branch uses LIMIT 10 regardless.
+const LOW_CONFIDENCE_PIVOT_POOL: usize = 8;
+
+/// Emit intent_mix only when 2nd-highest mode weight exceeds this AND confidence >= threshold.
+/// Avoids cluttering output for unambiguous single-mode queries or low-confidence noise.
+const NON_TRIVIAL_MIX_THRESHOLD: f32 = 0.20;
+
 pub(crate) enum IntentMode {
     BugFix,
     Refactor,
@@ -27,31 +54,120 @@ pub(crate) enum IntentMode {
     Balanced,
 }
 
+/// Scored result of intent classification.
+#[allow(dead_code)]
+pub(crate) struct IntentProfile {
+    pub bugfix_score: usize,
+    pub refactor_score: usize,
+    pub impl_score: usize,
+    pub total: usize,
+    pub confidence: f32,              // dominance = top/total (0.0 if total==0)
+    pub dominant_mode: IntentMode,    // winning mode by score, BEFORE confidence fallback
+    pub execution_mode: IntentMode,   // actual mode used for traversal (Balanced when low-confidence)
+    pub w_bugfix: f32,                // normalized weight
+    pub w_refactor: f32,
+    pub w_impl: f32,
+    pub matched_signals: Vec<String>, // canonical keywords, category order then alpha: bugfix first, then refactor, then impl
+}
+
+/// Derived traversal parameters from IntentProfile.
+pub(crate) struct TraversalPolicy {
+    pub depth: usize,
+    pub include_inbound: bool,
+    pub inbound_first: bool,   // true = BugFix-style (inbound before outbound)
+    pub pivot_pool_size: usize,
+}
+
 fn contains_word(text: &str, word: &str) -> bool {
     text.split(|c: char| !c.is_alphanumeric())
         .any(|w| w.eq_ignore_ascii_case(word))
 }
 
-pub(crate) fn detect_intent(intent: &str) -> IntentMode {
+pub(crate) fn detect_intent_profile(intent: &str) -> IntentProfile {
     let lower = intent.to_lowercase();
-    let bugfix_keywords = ["fix", "debug", "error", "crash", "bug"];
-    let refactor_keywords = ["refactor", "rename", "restructure", "extract"];
-    let impl_keywords = ["add", "implement", "create", "build"];
 
-    let bugfix_score = bugfix_keywords.iter().filter(|&&w| contains_word(&lower, w)).count();
-    let refactor_score = refactor_keywords.iter().filter(|&&w| contains_word(&lower, w)).count();
-    let impl_score = impl_keywords.iter().filter(|&&w| contains_word(&lower, w)).count();
+    let bugfix_keywords   = ["bug", "crash", "debug", "error", "fix"];   // alphabetical within category
+    let refactor_keywords = ["extract", "refactor", "rename", "restructure"];
+    let impl_keywords     = ["add", "build", "create", "implement"];
 
-    let max_score = bugfix_score.max(refactor_score).max(impl_score);
-    if max_score == 0 {
-        return IntentMode::Balanced;
-    }
-    if bugfix_score == max_score {
+    // Collect per-category: extend matched_signals in category order (bugfix, refactor, impl)
+    let mut matched_signals: Vec<String> = Vec::new();
+    let b_matches: Vec<&str> = bugfix_keywords.iter().copied().filter(|&w| contains_word(&lower, w)).collect();
+    let r_matches: Vec<&str> = refactor_keywords.iter().copied().filter(|&w| contains_word(&lower, w)).collect();
+    let i_matches: Vec<&str> = impl_keywords.iter().copied().filter(|&w| contains_word(&lower, w)).collect();
+    matched_signals.extend(b_matches.iter().map(|&w| w.to_string()));
+    matched_signals.extend(r_matches.iter().map(|&w| w.to_string()));
+    matched_signals.extend(i_matches.iter().map(|&w| w.to_string()));
+
+    let b = b_matches.len();
+    let r = r_matches.len();
+    let i = i_matches.len();
+    let total = b + r + i;
+    let top = b.max(r).max(i);
+
+    let (w_bugfix, w_refactor, w_impl, confidence) = if total == 0 {
+        (0.0f32, 0.0, 0.0, 0.0)
+    } else {
+        let t = total as f32;
+        (b as f32 / t, r as f32 / t, i as f32 / t, top as f32 / t)
+    };
+
+    // dominant_mode: winning mode by score only (before confidence threshold)
+    // Tie-breaking: BugFix > Refactor > Implementation > Balanced
+    let dominant_mode = if total == 0 {
+        IntentMode::Balanced
+    } else if b >= r && b >= i {
         IntentMode::BugFix
-    } else if refactor_score == max_score {
+    } else if r >= i {
         IntentMode::Refactor
     } else {
         IntentMode::Implementation
+    };
+
+    // execution_mode: falls back to Balanced when confidence is too low
+    let execution_mode = if confidence < LOW_CONFIDENCE_THRESHOLD {
+        IntentMode::Balanced
+    } else {
+        match &dominant_mode {
+            IntentMode::BugFix => IntentMode::BugFix,
+            IntentMode::Refactor => IntentMode::Refactor,
+            IntentMode::Implementation => IntentMode::Implementation,
+            IntentMode::Balanced => IntentMode::Balanced,
+        }
+    };
+
+    IntentProfile { bugfix_score: b, refactor_score: r, impl_score: i, total,
+                    confidence, dominant_mode, execution_mode, w_bugfix, w_refactor, w_impl, matched_signals }
+}
+
+#[allow(dead_code)]
+pub(crate) fn detect_intent(intent: &str) -> IntentMode {
+    detect_intent_profile(intent).dominant_mode
+}
+
+pub(crate) fn derive_traversal_policy(profile: &IntentProfile) -> TraversalPolicy {
+    // Low confidence or no signals → balanced fallback; short-circuits AC#3 and AC#4.
+    if profile.confidence < LOW_CONFIDENCE_THRESHOLD || profile.total == 0 {
+        return TraversalPolicy {
+            depth: 2,
+            include_inbound: false,
+            inbound_first: false,
+            pivot_pool_size: LOW_CONFIDENCE_PIVOT_POOL,
+        };
+    }
+
+    // AC#3: depth 3 only when refactor is dominant
+    let depth = if profile.w_refactor >= REFACTOR_DEPTH_THRESHOLD { 3 } else { 2 };
+
+    // AC#4: include inbound when inbound-oriented weight is material
+    let include_inbound = (profile.w_bugfix + profile.w_refactor) >= INBOUND_BLEND_THRESHOLD;
+    let inbound_first = include_inbound && profile.w_bugfix >= profile.w_refactor;
+
+    TraversalPolicy {
+        depth,
+        include_inbound,
+        inbound_first,
+        pivot_pool_size: DEFAULT_PIVOT_POOL,
     }
 }
 
@@ -85,8 +201,9 @@ fn estimate_tokens(s: &str) -> usize {
     s.len().div_ceil(4)
 }
 
-fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String]) -> Result<Vec<i64>, QueryError> {
+fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<i64>, QueryError> {
     let mut ids: Vec<i64> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
     if !file_hints.is_empty() {
         for hint in file_hints {
             let pattern = format!("%{hint}%");
@@ -97,7 +214,7 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String]) ->
             let rows: Vec<i64> = stmt.query_map(params![pattern], |r| r.get(0))?
                 .collect::<Result<_,_>>()?;
             for id in rows {
-                if !ids.contains(&id) { ids.push(id); }
+                if seen.insert(id) { ids.push(id); }
             }
         }
         if !ids.is_empty() { return Ok(ids); }
@@ -108,42 +225,39 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String]) ->
     for word in &words {
         let pattern = format!("%{}%", word.to_lowercase());
         let mut stmt = conn.prepare(
-            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 LIMIT 5"
+            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 LIMIT ?2"
         )?;
-        let rows: Vec<i64> = stmt.query_map(params![pattern], |r| r.get(0))?
+        let rows: Vec<i64> = stmt.query_map(params![pattern, pool_size as i64], |r| r.get(0))?
             .collect::<Result<_,_>>()?;
         for id in rows {
-            if !ids.contains(&id) { ids.push(id); }
+            if seen.insert(id) { ids.push(id); }
         }
     }
 
     // Fallback: any symbols
     if ids.is_empty() {
-        let mut stmt = conn.prepare("SELECT id FROM symbols LIMIT 5")?;
-        ids = stmt.query_map([], |r| r.get(0))?.collect::<Result<_,_>>()?;
+        let mut stmt = conn.prepare("SELECT id FROM symbols LIMIT ?1")?;
+        ids = stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?;
     }
 
     Ok(ids)
 }
 
+#[allow(clippy::type_complexity)]
 fn traverse_bfs(
     conn: &Connection,
     pivot_ids: &[i64],
-    mode: &IntentMode,
-    depth: usize,
-) -> Result<(Vec<i64>, Vec<i64>), QueryError> {
+    policy: &TraversalPolicy,
+) -> Result<(Vec<i64>, Vec<(i64, String)>), QueryError> {
     let pivot_set: HashSet<i64> = pivot_ids.iter().copied().collect();
     let mut visited: HashSet<i64> = pivot_set.clone();
     let mut queue: VecDeque<(i64, usize)> = pivot_ids.iter().map(|&id| (id, 0)).collect();
-    let mut supporting: Vec<i64> = Vec::new();
+    let mut supporting: Vec<(i64, String)> = Vec::new();
 
     while let Some((current_id, current_depth)) = queue.pop_front() {
-        if current_depth >= depth { continue; }
+        if current_depth >= policy.depth { continue; }
 
-        let include_inbound = matches!(mode, IntentMode::BugFix | IntentMode::Refactor);
-        let inbound_first = matches!(mode, IntentMode::BugFix);
-
-        if inbound_first {
+        if policy.inbound_first {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT source_id FROM edges WHERE target_id=?1 ORDER BY source_id LIMIT 20"
             )?;
@@ -152,7 +266,14 @@ fn traverse_bfs(
             for id in inbound {
                 if visited.insert(id) {
                     queue.push_back((id, current_depth + 1));
-                    if !pivot_set.contains(&id) { supporting.push(id); }
+                    if !pivot_set.contains(&id) {
+                        let reason = if current_depth == 0 {
+                            "inbound caller of pivot".to_string()
+                        } else {
+                            format!("inbound caller (depth {})", current_depth + 1)
+                        };
+                        supporting.push((id, reason));
+                    }
                 }
             }
         }
@@ -166,11 +287,18 @@ fn traverse_bfs(
         for id in outbound {
             if visited.insert(id) {
                 queue.push_back((id, current_depth + 1));
-                if !pivot_set.contains(&id) { supporting.push(id); }
+                if !pivot_set.contains(&id) {
+                    let reason = if current_depth == 0 {
+                        "outbound dependency of pivot".to_string()
+                    } else {
+                        format!("outbound dependency (depth {})", current_depth + 1)
+                    };
+                    supporting.push((id, reason));
+                }
             }
         }
 
-        if include_inbound && !inbound_first {
+        if policy.include_inbound && !policy.inbound_first {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT source_id FROM edges WHERE target_id=?1 ORDER BY source_id LIMIT 20"
             )?;
@@ -179,7 +307,14 @@ fn traverse_bfs(
             for id in inbound {
                 if visited.insert(id) {
                     queue.push_back((id, current_depth + 1));
-                    if !pivot_set.contains(&id) { supporting.push(id); }
+                    if !pivot_set.contains(&id) {
+                        let reason = if current_depth == 0 {
+                            "inbound caller of pivot".to_string()
+                        } else {
+                            format!("inbound caller (depth {})", current_depth + 1)
+                        };
+                        supporting.push((id, reason));
+                    }
                 }
             }
         }
@@ -247,33 +382,60 @@ pub(crate) fn get_context(
     file_hints: &[String],
     token_budget: usize,
 ) -> Result<String, QueryError> {
-    let pivot_ids = find_pivot_symbols(conn, intent, file_hints)?;
+    let profile = detect_intent_profile(intent);
+    let policy = derive_traversal_policy(&profile);
 
-    if pivot_ids.is_empty() {
-        return Ok(format!(
-            "No symbols found for intent: {intent}\n\nRun `olaf index` first."
-        ));
-    }
-
-    let mode = detect_intent(intent);
-    let bfs_depth = match mode {
-        IntentMode::Refactor => 3,
-        _ => 2,
-    };
-
-    let (pivots, supporting) = traverse_bfs(conn, &pivot_ids, &mode, bfs_depth)?;
-
-    let pivot_budget = token_budget * 70 / 100;
-    let skeleton_budget = token_budget * 20 / 100;
-    let memory_budget = token_budget * 10 / 100;
-
-    let intent_label = match mode {
+    // Build the intent metadata header — always emitted so callers see detected intent even on empty index.
+    let intent_label = match &profile.execution_mode {
         IntentMode::BugFix => "bug-fix",
         IntentMode::Refactor => "refactor",
         IntentMode::Implementation => "implementation",
         IntentMode::Balanced => "balanced",
     };
-    let mut output = format!("# Context Brief: {intent}\nintent_mode: {intent_label}\n\n## Pivot Symbols\n\n");
+    let signals_str = if profile.matched_signals.is_empty() {
+        "none".to_string()
+    } else {
+        profile.matched_signals.join(", ")
+    };
+    let mut output = format!(
+        "# Context Brief: {intent}\nintent_mode: {intent_label}\nintent_confidence: {:.2}\nintent_signals: {signals_str}\n",
+        profile.confidence
+    );
+    // Conditional: emit intent_mix only when confident AND 2nd-highest weight is material
+    let mut weights = [
+        ("bug-fix", profile.w_bugfix),
+        ("refactor", profile.w_refactor),
+        ("implementation", profile.w_impl),
+    ];
+    weights.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if profile.confidence >= LOW_CONFIDENCE_THRESHOLD && weights[1].1 > NON_TRIVIAL_MIX_THRESHOLD {
+        output.push_str(&format!(
+            "intent_mix: bug-fix={:.2},refactor={:.2},implementation={:.2}\n",
+            profile.w_bugfix, profile.w_refactor, profile.w_impl
+        ));
+    }
+    // Emit fallback reason when a mode was detected but confidence was too low to use it
+    if matches!(profile.execution_mode, IntentMode::Balanced)
+        && !matches!(profile.dominant_mode, IntentMode::Balanced)
+    {
+        output.push_str("intent_fallback_reason: low confidence\n");
+    }
+
+    let pivot_ids = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+
+    if pivot_ids.is_empty() {
+        output.push_str("\nNo symbols found. Run `olaf index` first.\n");
+        return Ok(output);
+    }
+
+    let (pivots, supporting_with_reasons) = traverse_bfs(conn, &pivot_ids, &policy)?;
+
+    let pivot_budget = token_budget * 70 / 100;
+    let skeleton_budget = token_budget * 20 / 100;
+    let memory_budget = token_budget * 10 / 100;
+
+    output.push_str("\n## Pivot Symbols\n\n");
+
     let mut pivot_tokens = 0usize;
     let mut all_fqns: HashSet<String> = HashSet::new();
     let mut all_file_paths: HashSet<String> = HashSet::new();
@@ -300,10 +462,10 @@ pub(crate) fn get_context(
         pivot_tokens += entry_tokens;
     }
 
-    if !supporting.is_empty() {
+    if !supporting_with_reasons.is_empty() {
         output.push_str("## Supporting Symbols\n\n");
         let mut skeleton_tokens = 0usize;
-        for id in &supporting {
+        for (id, reason) in &supporting_with_reasons {
             let Some(row) = load_symbol_row(conn, *id)? else { continue };
             if is_output_sensitive(&row.file_path) { continue; }
 
@@ -311,10 +473,21 @@ pub(crate) fn get_context(
             all_file_paths.insert(row.file_path.clone());
 
             let skeleton = skeletonize(conn, row.id)?;
-            let entry_tokens = estimate_tokens(&skeleton);
-            if skeleton_tokens + entry_tokens > skeleton_budget { break; }
+            let reason_line = format!("Why: {reason}\n");
+            let skeleton_tokens_needed = estimate_tokens(&skeleton);
+            let reason_tokens_needed = estimate_tokens(&reason_line);
+
+            if skeleton_tokens + skeleton_tokens_needed > skeleton_budget { break; }
+
             output.push_str(&skeleton);
-            skeleton_tokens += entry_tokens;
+            skeleton_tokens += skeleton_tokens_needed;
+
+            // Per-entry: include reason only if it fits; if not, drop just this reason (not the symbol).
+            // This allows later shorter reasons to still fit rather than killing all remaining reasons.
+            if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
+                output.push_str(&reason_line);
+                skeleton_tokens += reason_tokens_needed;
+            }
         }
     }
 
@@ -437,6 +610,7 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// Minimal in-memory DB for legacy BFS/pivot tests (no kind column on edges).
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -447,6 +621,21 @@ mod tests {
                  end_line INTEGER NOT NULL, signature TEXT
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL);",
+        ).unwrap();
+        conn
+    }
+
+    /// Full-schema in-memory DB matching the real migration schema.
+    fn build_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL, hash TEXT);
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
+                 name TEXT NOT NULL, kind TEXT, start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+             );
+             CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);",
         ).unwrap();
         conn
     }
@@ -515,11 +704,12 @@ mod tests {
         conn.execute("INSERT INTO edges (source_id, target_id) VALUES (2, 1)", []).unwrap(); // caller→pivot (inbound)
         conn.execute("INSERT INTO edges (source_id, target_id) VALUES (1, 3)", []).unwrap(); // pivot→dep (outbound)
 
-        let (_, supporting) = traverse_bfs(&conn, &[1], &IntentMode::BugFix, 2).unwrap();
-        assert!(supporting.contains(&2), "BugFix must include inbound caller");
-        assert!(supporting.contains(&3), "BugFix must include outbound dep");
-        let caller_pos = supporting.iter().position(|&id| id == 2).unwrap();
-        let dep_pos = supporting.iter().position(|&id| id == 3).unwrap();
+        let policy = TraversalPolicy { depth: 2, include_inbound: true, inbound_first: true, pivot_pool_size: 5 };
+        let (_, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert!(supporting.iter().any(|(id, _)| *id == 2), "BugFix must include inbound caller");
+        assert!(supporting.iter().any(|(id, _)| *id == 3), "BugFix must include outbound dep");
+        let caller_pos = supporting.iter().position(|(id, _)| *id == 2).unwrap();
+        let dep_pos = supporting.iter().position(|(id, _)| *id == 3).unwrap();
         assert!(caller_pos < dep_pos, "inbound caller must rank before outbound dependency in BugFix mode");
     }
 
@@ -534,9 +724,10 @@ mod tests {
         conn.execute("INSERT INTO edges (source_id, target_id) VALUES (2, 1)", []).unwrap(); // inbound
         conn.execute("INSERT INTO edges (source_id, target_id) VALUES (1, 3)", []).unwrap(); // outbound
 
-        let (_, supporting) = traverse_bfs(&conn, &[1], &IntentMode::Refactor, 3).unwrap();
-        assert!(supporting.contains(&2), "Refactor must include inbound callers");
-        assert!(supporting.contains(&3), "Refactor must include outbound deps");
+        let policy = TraversalPolicy { depth: 3, include_inbound: true, inbound_first: false, pivot_pool_size: 5 };
+        let (_, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert!(supporting.iter().any(|(id, _)| *id == 2), "Refactor must include inbound callers");
+        assert!(supporting.iter().any(|(id, _)| *id == 3), "Refactor must include outbound deps");
     }
 
     #[test]
@@ -547,8 +738,9 @@ mod tests {
         insert_symbol(&conn, 2, "lib::caller", "caller", 1);
         conn.execute("INSERT INTO edges (source_id, target_id) VALUES (2, 1)", []).unwrap(); // inbound
 
-        let (_, supporting) = traverse_bfs(&conn, &[1], &IntentMode::Implementation, 2).unwrap();
-        assert!(!supporting.contains(&2), "Implementation mode should exclude inbound callers");
+        let policy = TraversalPolicy { depth: 2, include_inbound: false, inbound_first: false, pivot_pool_size: 5 };
+        let (_, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert!(!supporting.iter().any(|(id, _)| *id == 2), "Implementation mode should exclude inbound callers");
     }
 
     #[test]
@@ -564,6 +756,206 @@ mod tests {
         let root = std::path::Path::new("/nonexistent");
         let result = get_context(&conn, root, "fix the crash", &[], 4000).unwrap();
         assert!(result.contains("intent_mode: bug-fix\n"), "get_context output must include intent_mode header line");
+        assert!(result.contains("intent_confidence:"), "get_context output must include intent_confidence");
+        assert!(result.contains("intent_signals:"), "get_context output must include intent_signals");
+    }
+
+    // --- IntentProfile scoring tests ---
+
+    #[test]
+    fn profile_single_category_high_confidence() {
+        let p = detect_intent_profile("fix crash");
+        assert_eq!(p.bugfix_score, 2); // "fix" + "crash"
+        assert_eq!(p.total, 2);
+        assert!((p.confidence - 1.00).abs() < 0.01, "confidence={}", p.confidence);
+        assert!(matches!(p.dominant_mode, IntentMode::BugFix));
+        assert!(matches!(p.execution_mode, IntentMode::BugFix));
+        assert!(p.matched_signals.contains(&"fix".to_string()));
+        assert!(p.matched_signals.contains(&"crash".to_string()));
+    }
+
+    #[test]
+    fn profile_single_signal_no_regression() {
+        // Regression guard: a single clear signal must NOT fall back to Balanced.
+        let p = detect_intent_profile("fix the null pointer");
+        assert_eq!(p.bugfix_score, 1);
+        assert_eq!(p.total, 1);
+        assert!((p.confidence - 1.00).abs() < 0.01, "confidence={}", p.confidence);
+        assert!(matches!(p.execution_mode, IntentMode::BugFix));
+    }
+
+    #[test]
+    fn profile_mixed_two_categories_low_confidence() {
+        let p = detect_intent_profile("refactor and fix");
+        assert_eq!(p.bugfix_score, 1);
+        assert_eq!(p.refactor_score, 1);
+        assert_eq!(p.total, 2);
+        assert!((p.confidence - 0.50).abs() < 0.01, "confidence={}", p.confidence);
+        // dominant_mode: BugFix (tie-break); execution_mode: Balanced (confidence=0.50 < 0.60)
+        assert!(matches!(p.dominant_mode, IntentMode::BugFix));
+        assert!(matches!(p.execution_mode, IntentMode::Balanced));
+    }
+
+    #[test]
+    fn fallback_reason_emitted_when_mode_detected_but_low_confidence() {
+        let profile = detect_intent_profile("refactor and fix"); // dominant=BugFix, execution=Balanced
+        let intent_label = match &profile.execution_mode {
+            IntentMode::BugFix => "bug-fix",
+            IntentMode::Refactor => "refactor",
+            IntentMode::Implementation => "implementation",
+            IntentMode::Balanced => "balanced",
+        };
+        let mut header = format!("# Context Brief: test\nintent_mode: {intent_label}\n");
+        if matches!(profile.execution_mode, IntentMode::Balanced)
+            && !matches!(profile.dominant_mode, IntentMode::Balanced)
+        {
+            header.push_str("intent_fallback_reason: low confidence\n");
+        }
+        assert!(header.contains("intent_fallback_reason: low confidence"),
+            "must emit fallback reason when dominant_mode != Balanced but execution_mode == Balanced");
+    }
+
+    #[test]
+    fn fallback_reason_absent_when_genuinely_balanced() {
+        let profile = detect_intent_profile("show me the auth module"); // total=0, both modes Balanced
+        let mut header = "# Context Brief: test\n".to_string();
+        if matches!(profile.execution_mode, IntentMode::Balanced)
+            && !matches!(profile.dominant_mode, IntentMode::Balanced)
+        {
+            header.push_str("intent_fallback_reason: low confidence\n");
+        }
+        assert!(!header.contains("intent_fallback_reason"),
+            "must NOT emit fallback reason when no signals were detected");
+    }
+
+    #[test]
+    fn profile_three_categories_even_split() {
+        let p = detect_intent_profile("refactor fix add");
+        assert_eq!(p.total, 3);
+        assert!((p.confidence - 0.33).abs() < 0.01);
+        assert!(matches!(p.execution_mode, IntentMode::Balanced));
+    }
+
+    #[test]
+    fn profile_no_signals_zero_confidence() {
+        let p = detect_intent_profile("show me the auth module");
+        assert_eq!(p.total, 0);
+        assert_eq!(p.confidence, 0.0);
+        assert!(matches!(p.dominant_mode, IntentMode::Balanced));
+        assert!(matches!(p.execution_mode, IntentMode::Balanced));
+        assert_eq!(p.matched_signals, Vec::<String>::new());
+    }
+
+    #[test]
+    fn profile_signals_are_canonical_keywords_not_raw_input() {
+        // Input token "debugging" does NOT match keyword "debug" (exact match only)
+        let p = detect_intent_profile("debugging the session");
+        assert_eq!(p.total, 0, "partial stem 'debugging' must not match 'debug'");
+    }
+
+    // --- TraversalPolicy derivation tests ---
+
+    #[test]
+    fn policy_high_bugfix_confidence_inbound_first() {
+        let p = detect_intent_profile("fix the crash");
+        let policy = derive_traversal_policy(&p);
+        assert_eq!(policy.depth, 2);
+        assert!(policy.include_inbound);
+        assert!(policy.inbound_first);
+        assert_eq!(policy.pivot_pool_size, DEFAULT_PIVOT_POOL);
+    }
+
+    #[test]
+    fn policy_dominant_refactor_depth_three() {
+        let p = detect_intent_profile("refactor restructure");
+        let policy = derive_traversal_policy(&p);
+        assert_eq!(policy.depth, 3);
+        assert!(policy.include_inbound);
+        assert!(!policy.inbound_first); // refactor >= bugfix → outbound first
+    }
+
+    #[test]
+    fn policy_implementation_outbound_only() {
+        let p = detect_intent_profile("implement the cache layer");
+        let policy = derive_traversal_policy(&p);
+        assert_eq!(policy.depth, 2);
+        assert!(!policy.include_inbound);
+    }
+
+    #[test]
+    fn policy_low_confidence_fallback_widens_pool() {
+        let p = detect_intent_profile("refactor and fix"); // confidence ≈ 0.50 < 0.60
+        let policy = derive_traversal_policy(&p);
+        assert!(!policy.include_inbound, "low confidence must use balanced (outbound only)");
+        assert_eq!(policy.pivot_pool_size, LOW_CONFIDENCE_PIVOT_POOL);
+    }
+
+    // --- BFS direction tests (use build_test_db for full-schema inserts) ---
+
+    #[test]
+    fn traverse_policy_bugfix_inbound_before_outbound() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pivot','pivot','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'caller','caller','fn',6,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (3,1,'dep','dep','fn',11,15,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2,1,'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (2,1,3,'calls')", []).unwrap();
+
+        let policy = TraversalPolicy { depth: 2, include_inbound: true, inbound_first: true, pivot_pool_size: 5 };
+        let (_pivots, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert_eq!(supporting[0].0, 2, "caller must rank before dependency for BugFix");
+        assert_eq!(supporting[0].1, "inbound caller of pivot");
+        let dep_entry = supporting.iter().find(|(id, _)| *id == 3).unwrap();
+        assert_eq!(dep_entry.1, "outbound dependency of pivot");
+    }
+
+    #[test]
+    fn traverse_policy_implementation_no_inbound() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pivot','pivot','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,1,'caller','caller','fn',6,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (3,1,'dep','dep','fn',11,15,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2,1,'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (2,1,3,'calls')", []).unwrap();
+
+        let policy = TraversalPolicy { depth: 2, include_inbound: false, inbound_first: false, pivot_pool_size: 5 };
+        let (_pivots, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert!(supporting.iter().all(|(id, _)| *id != 2), "caller must be absent in Implementation mode");
+        assert!(supporting.iter().any(|(id, _)| *id == 3));
+    }
+
+    // --- Budget rule: reasons dropped before symbols ---
+
+    #[test]
+    fn reason_dropped_before_symbol_when_budget_tight() {
+        // Simulate the budget loop directly.
+        // Budget is just enough for the skeleton but not the reason.
+        let skeleton = "fn foo() {}\n";
+        let reason = "outbound dependency of pivot";
+        let reason_line = format!("Why: {reason}\n");
+        let skeleton_tokens = estimate_tokens(skeleton);
+        let reason_tokens = estimate_tokens(&reason_line);
+        // Budget = exactly skeleton_tokens; reason must NOT fit.
+        let budget = skeleton_tokens;
+        assert!(skeleton_tokens <= budget, "skeleton must fit");
+        assert!(
+            skeleton_tokens + reason_tokens > budget,
+            "reason must not fit given this budget"
+        );
+        // Verify per-entry logic: symbol included, reason excluded
+        let mut output = String::new();
+        let mut used = 0usize;
+        if used + skeleton_tokens <= budget {
+            output.push_str(skeleton);
+            used += skeleton_tokens;
+        }
+        if used + reason_tokens <= budget {
+            output.push_str(&reason_line);
+        }
+        assert!(output.contains("fn foo()"), "symbol must be present");
+        assert!(!output.contains("Why:"), "reason must be absent when budget is tight");
     }
 }
 
