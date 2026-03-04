@@ -737,3 +737,87 @@ fn test_get_file_skeleton_zero_symbols_returns_informative_message() {
         "must return informative message; got: {text}"
     );
 }
+
+// ─── Story 6.3 Tests ──────────────────────────────────────────────────────────
+
+// 3.1 — happy-path sections: context header, separator, no-symbol fallback, no error
+#[test]
+fn test_run_pipeline_sections_present() {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "run_pipeline", "arguments": { "intent": "test" } }
+    });
+    let responses = run_requests(&[req]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("# Context Brief:"), "missing context header");
+    assert!(text.contains("---"), "missing section separator");
+    assert!(text.contains("No primary symbol specified"), "missing no-symbol message");
+}
+
+// 3.2 — AC2 empty index graceful: no error, separator present, no-symbol fallback present
+#[test]
+fn test_run_pipeline_empty_index_no_error() {
+    // run_requests uses an empty tmpdir — no index, no sessions
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "run_pipeline", "arguments": { "intent": "test" } }
+        // no symbol_fqn
+    });
+    let responses = run_requests(&[req]);
+    assert!(responses[0].get("error").is_none(), "must not have error on empty index; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    // Do NOT assert "## Impact Analysis" — that heading does not exist in the output format
+    assert!(text.contains("---"), "separator must be present");
+    assert!(text.contains("No primary symbol specified"), "fallback message must be present");
+}
+
+// 3.3 — AC3 budget compliance: token_budget=200, output must not exceed it
+#[test]
+fn test_run_pipeline_respects_token_budget() {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "run_pipeline", "arguments": { "intent": "test", "token_budget": 200 } }
+    });
+    let responses = run_requests(&[req]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.len() / 4 <= 200,
+        "token budget exceeded: {} chars ({} est tokens)",
+        text.len(), text.len() / 4
+    );
+}
+
+// 3.4b — symbol_fqn branch: passes fqn+depth, get_impact path exercised, no error returned
+#[test]
+fn test_run_pipeline_with_symbol_fqn() {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {
+            "name": "run_pipeline",
+            "arguments": {
+                "intent": "test",
+                "symbol_fqn": "src/lib.rs::some_fn",
+                "depth": 2
+            }
+        }
+    });
+    let responses = run_requests(&[req]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("# Context Brief:"), "missing context header");
+    assert!(text.contains("---"), "missing section separator");
+    // get_impact on empty DB returns "Symbol not found" — no "No primary symbol specified" fallback
+    assert!(!text.contains("No primary symbol specified"), "symbol_fqn was provided, fallback must not appear");
+}
+
+// 3.4 — tools/list includes run_pipeline
+#[test]
+fn test_tools_list_includes_run_pipeline() {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}});
+    let responses = run_requests(&[req]);
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools must be array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"run_pipeline"), "tools/list must include run_pipeline");
+}

@@ -161,6 +161,37 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["file_path", "snapshot_id"]
             }
         }),
+        serde_json::json!({
+            "name": "run_pipeline",
+            "description": "Run context retrieval and impact analysis in one call. Returns a unified brief for a given intent. Faster than orchestrating get_context + get_impact separately.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "Natural language description of the task, e.g. 'fix bug in auth module'"
+                    },
+                    "file_hints": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths or partial paths to prioritize as pivot symbols"
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Maximum tokens for the combined response (default: 4000)"
+                    },
+                    "symbol_fqn": {
+                        "type": "string",
+                        "description": "Optional: FQN of primary symbol for impact analysis (e.g. 'src/auth.rs::authenticate'). Omit to skip impact graph."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Impact traversal depth (default: 3, max: 10)"
+                    }
+                },
+                "required": ["intent"]
+            }
+        }),
     ]
 }
 
@@ -182,6 +213,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "get_session_history"  => handle_get_session_history(conn, args),
         "list_restore_points"  => handle_list_restore_points(project_root, args),
         "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
+        "run_pipeline"         => handle_run_pipeline(conn, project_root, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -460,6 +492,76 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
     Ok(format!("Restored {} to snapshot {}.", rel, snapshot_id))
 }
 
+/// Maximum token budget accepted from callers. Prevents u64→usize cast overflow and
+/// keeps `max_bytes = budget * 4` well within usize range on 32-bit targets (4 GB limit).
+const MAX_TOKEN_BUDGET: u64 = 1_000_000;
+
+fn handle_run_pipeline(
+    conn: &mut rusqlite::Connection,
+    project_root: &Path,
+    args: Option<&Value>,
+) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    // 2.1 Parse args
+    let intent = args.get("intent").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: intent".to_string()))?;
+    let file_hints: Vec<String> = args.get("file_hints").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64())
+        .map(|v| v.min(MAX_TOKEN_BUDGET) as usize)
+        .unwrap_or(4000)
+        .max(100);
+    let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str());
+    let depth = args.get("depth").and_then(|v| v.as_u64())
+        .map(|v| (v as usize).clamp(1, 10))
+        .unwrap_or(3);
+
+    // 2.2 Trigger incremental re-index
+    crate::index::run_incremental(conn, project_root)?;
+
+    // 2.3 Compute context budget and call get_context
+    let ctx_budget = token_budget * 80 / 100;
+    let context_output = crate::graph::query::get_context(conn, project_root, intent, &file_hints, ctx_budget)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    // 2.4 Build impact section
+    let impact_output = if let Some(fqn) = symbol_fqn {
+        crate::graph::query::get_impact(conn, fqn, depth)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+    } else {
+        "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
+    };
+
+    // 2.5 Assemble output (both sections already have #-level headings; use only --- as separator)
+    let mut output = format!("{context_output}\n---\n{impact_output}");
+
+    // 2.6 Hard-truncate to enforce token budget
+    truncate_to_budget(&mut output, token_budget);
+
+    // 2.7 Return
+    Ok(output)
+}
+
+/// Truncates `s` so that `s.len().div_ceil(4) <= token_budget` after appending the note.
+/// Finds the nearest valid UTF-8 char boundary to avoid panics on multibyte chars.
+fn truncate_to_budget(s: &mut String, token_budget: usize) {
+    const NOTE: &str = "\n(response truncated to fit token_budget)\n";
+    let max_bytes = token_budget.saturating_mul(4);
+    if s.len().div_ceil(4) <= token_budget {
+        return;
+    }
+    // Reserve space for the note so the final output stays within budget.
+    let cutoff = max_bytes.saturating_sub(NOTE.len());
+    // Walk back to a valid UTF-8 char boundary (s.is_char_boundary(0) is always true).
+    let boundary = (0..=cutoff).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+    s.truncate(boundary);
+    s.push_str(NOTE);
+    // Postcondition: s.len().div_ceil(4) <= token_budget (NOTE.len() reserved above).
+}
+
 /// Format a millisecond timestamp as a human-readable relative age string.
 fn relative_age_ms(millis: u128, now_ms: u128) -> String {
     let diff = now_ms.saturating_sub(millis);
@@ -471,5 +573,43 @@ fn relative_age_ms(millis: u128, now_ms: u128) -> String {
         format!("{} hours ago", diff / 3_600_000)
     } else {
         format!("{} days ago", diff / 86_400_000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 3.5 — list() contains exactly one entry with name "run_pipeline"
+    #[test]
+    fn test_list_contains_run_pipeline() {
+        let tools = list();
+        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "run_pipeline").collect();
+        assert_eq!(matches.len(), 1, "list() must contain exactly one run_pipeline entry");
+    }
+
+    // 3.6 — truncation logic: 2000 ASCII chars (500 est-tokens), budget 100
+    #[test]
+    fn test_truncate_to_budget_basic() {
+        let mut s = "a".repeat(2000);
+        truncate_to_budget(&mut s, 100);
+        assert!(s.len().div_ceil(4) <= 100, "truncated div_ceil(len/4)={} must be <= 100", s.len().div_ceil(4));
+        assert!(
+            s.ends_with("(response truncated to fit token_budget)\n"),
+            "must end with truncation note; got: {:?}", &s[s.len().saturating_sub(50)..]
+        );
+    }
+
+    // 3.7 — Unicode safety: string with multibyte chars, no panic
+    #[test]
+    fn test_truncate_to_budget_unicode_safety() {
+        // "—" (U+2014 EM DASH) is 3 bytes in UTF-8
+        let em_dash = "\u{2014}";
+        // Build a string long enough to require truncation. Use budget=20 (max_bytes=80)
+        // so the NOTE (42 bytes) fits. handle_run_pipeline always clamps to max(100) anyway.
+        let mut s = em_dash.repeat(200); // 600 bytes = 150 est-tokens
+        let budget = 20;
+        truncate_to_budget(&mut s, budget);
+        assert!(s.len().div_ceil(4) <= budget, "truncated div_ceil(len/4)={} must be <= {budget}", s.len().div_ceil(4));
     }
 }
