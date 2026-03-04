@@ -9,6 +9,10 @@ on:
       tag:
         description: 'Release tag (e.g., v0.1.0) — must already exist in the repository'
         required: true
+      skip_publish:
+        description: 'Skip crates.io publish (use when version is already published)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -66,6 +70,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: build  # all 4 platform builds must succeed first
+    if: github.event.inputs.skip_publish != 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,12 +89,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, publish]
     # On push (tag): both build and publish must succeed.
-    # On workflow_dispatch re-run: publish may fail with "already uploaded" if the version was
-    # already published in a previous run. Allow release to proceed as long as builds succeeded.
+    # On workflow_dispatch with skip_publish=true: publish is skipped (result == 'skipped'),
+    # so gate on build success only in that case.
     if: |
       always() &&
       needs.build.result == 'success' &&
-      (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
