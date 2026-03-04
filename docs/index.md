@@ -138,6 +138,53 @@ Download the latest release from the [GitHub Releases page](https://github.com/k
 
 ---
 
+## How Claude Uses Olaf
+
+Once Olaf is connected, Claude can see all 8 tools and decides on its own whether to call them — you don't need to mention them in every prompt.
+
+**The short version:** task-oriented prompts trigger Olaf automatically; vague prompts may not.
+
+### Prompts that work well (Claude will reach for Olaf)
+
+```
+Help me fix the bug in the authentication flow
+Refactor the session compression module
+What does the payment service depend on?
+```
+
+Claude recognizes these as codebase tasks and will call `get_context` or `get_impact` to gather context before answering.
+
+### Prompts that may not (too vague)
+
+```
+Help me with my code
+What's in this project?
+```
+
+Vague prompts don't give Claude enough signal. It may fall back to reading files directly instead.
+
+### When you want to be certain
+
+Add an explicit instruction:
+
+```
+Use get_context to understand the authentication module, then help me fix the login bug
+```
+
+This guarantees Olaf is used and Claude starts with a full picture of the relevant code.
+
+### What runs automatically (no prompting needed)
+
+Three hooks run silently in the background during every Claude Code session:
+
+- **PostToolUse** — records every file edit and shell command as an observation
+- **PreToolUse** — creates a snapshot before every AI edit (enables `undo_change`)
+- **SessionEnd** — compresses session history to retain key insights
+
+You never need to ask for these — they fire on their own.
+
+---
+
 ## Available MCP Tools
 
 Once connected, Claude can use these tools:
