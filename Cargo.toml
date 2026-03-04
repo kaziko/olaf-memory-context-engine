@@ -6,6 +6,7 @@ description = "Codebase context engine for Claude Code"
 license = "MIT"
 repository = "https://github.com/kaziko/olaf-memory-context-engine"
 readme = "README.md"
+exclude = ["docs/"]
 keywords = ["context", "mcp", "claude", "codebase", "developer-tools"]
 categories = ["development-tools", "command-line-utilities"]
 

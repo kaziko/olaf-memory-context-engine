@@ -3,7 +3,7 @@ layout: default
 title: Getting Started
 ---
 
-![Olaf]({{ site.baseurl }}/hero.png)
+![Olaf]({{ "/hero.png" | relative_url }})
 
 # Getting Started with Olaf
 
