@@ -62,6 +62,7 @@ olaf init
 - `get_context` — retrieve indexed summaries for files relevant to your task
 - `get_impact` — find files that reference a given symbol or path
 - `get_file_skeleton` — get the structure (functions, classes, exports) of a file
+- `run_pipeline` — run context retrieval and impact analysis in one call
 - `index_status` — check indexing coverage and freshness
 - `save_observation` — store a session note for future recall
 - `get_session_history` — retrieve observations and changes from recent sessions
@@ -75,3 +76,7 @@ Full documentation: [https://kaziko.github.io/olaf-memory-context-engine](https:
 ## License
 
 MIT
+
+## Keywords
+
+mcp, model-context-protocol, claude-code, codebase-indexing, context-engine, code-intelligence, session-memory, claude-memory, automatic memory, symbol-indexing, ai-tools, llm-context, undo-snapshots

@@ -82,10 +82,12 @@ Claude Code reads `.mcp.json` on startup and connects to the Olaf MCP server aut
 In Claude Code, try:
 
 ```
-Use get_context to understand the authentication module
+Use run_pipeline to understand the authentication module
 ```
 
-Claude calls the `get_context` MCP tool, which retrieves a token-budgeted context brief covering the relevant symbols, their dependencies, and any saved observations for that area of the codebase.
+Claude calls the `run_pipeline` MCP tool, which retrieves a token-budgeted context brief and impact analysis in one call — covering relevant symbols, their dependencies, and any saved observations for that area of the codebase.
+
+You can also use individual tools for targeted queries: `get_context` for context only, `get_impact` for impact analysis only.
 
 ## Verify It's Working
 
@@ -164,7 +166,20 @@ Refactor the session compression module
 What does the payment service depend on?
 ```
 
-Claude recognizes these as codebase tasks and will call `get_context` or `get_impact` to gather context before answering.
+Claude recognizes these as codebase tasks and will call `run_pipeline` or `get_context` to gather context before answering.
+
+### How Olaf reads your intent
+
+Olaf automatically classifies the intent behind your task description and adjusts how it retrieves context:
+
+| Mode | Triggered by | What changes |
+|-|-|-|
+| **bug-fix** | "fix", "debug", "crash", "error" | Deeper inbound traversal — traces callers and error paths |
+| **refactor** | "refactor", "rename", "restructure" | Wide outbound traversal — surfaces everything that would break |
+| **implementation** | "add", "implement", "create", "extend" | Focuses on integration points and adjacent surfaces |
+| **balanced** | Vague or mixed signals | Even traversal, wider pivot pool |
+
+The detected mode, confidence score, and matched signals are included in every context brief so Claude understands how the context was shaped. If the intent is ambiguous (e.g. "refactor and fix"), confidence falls below the threshold and Olaf falls back to balanced mode automatically.
 
 ### Prompts that may not (too vague)
 
@@ -180,10 +195,34 @@ Vague prompts don't give Claude enough signal. It may fall back to reading files
 Add an explicit instruction:
 
 ```
-Use get_context to understand the authentication module, then help me fix the login bug
+Use run_pipeline to understand the authentication module, then help me fix the login bug
 ```
 
 This guarantees Olaf is used and Claude starts with a full picture of the relevant code.
+
+### Undoing AI edits
+
+Before every file change, Olaf automatically saves a snapshot. If Claude makes a mess, you can restore any file to exactly how it was.
+
+**To undo the last edit to a file:**
+
+```
+Use undo_change to restore src/auth.rs to its previous state
+```
+
+**To see all available snapshots for a file first:**
+
+```
+Use list_restore_points for src/auth.rs
+```
+
+Claude will list the snapshots with timestamps, then you can pick one:
+
+```
+Restore src/auth.rs to snapshot 1741234567890-12345-3
+```
+
+Snapshots are created automatically — no git required, no manual setup.
 
 ### What runs automatically (no prompting needed)
 
@@ -206,8 +245,26 @@ Once connected, Claude can use these tools:
 | `get_context` | Token-budgeted context brief for a task; triggers incremental re-index |
 | `get_impact` | Find symbols that call, extend, or implement a given symbol FQN |
 | `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies) |
+| `run_pipeline` | Run context retrieval and impact analysis in one call; faster than orchestrating `get_context` + `get_impact` separately |
 | `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
 | `save_observation` | Store an insight or decision linked to a symbol FQN or file path |
 | `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol |
 | `list_restore_points` | Pre-edit snapshots for a file, sorted newest-first |
 | `undo_change` | Restore a file to a specific snapshot; records a decision observation |
+
+---
+
+## CLI Reference
+
+All commands run from your project root.
+
+| Command | Description |
+|-|-|
+| `olaf init` | Initialize Olaf: creates `.olaf/`, registers MCP server, installs hooks, runs initial index. Safe to re-run — idempotent. |
+| `olaf index` | Re-index the project manually. Only changed files are re-parsed (incremental). |
+| `olaf status` | Show index health: file count, symbol count, edges, observations, MCP registration status, hook status. |
+| `olaf sessions list` | List recent sessions with observation counts and timestamps. |
+| `olaf sessions show <id>` | Show all observations from a specific session. |
+| `olaf restore list <file>` | List available pre-edit snapshots for a file, newest first. |
+| `olaf restore <file> <timestamp>` | Restore a file to a specific snapshot by timestamp. |
+| `olaf completions <shell>` | Print shell completion script for `bash`, `zsh`, `fish`, or `powershell`. |
