@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn, make_symbol};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -53,7 +53,7 @@ fn extract_nodes(
                     kind: SymbolKind::Namespace,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
                         .to_hex()

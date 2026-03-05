@@ -89,6 +89,47 @@ pub enum ParserError {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
+/// Extract the signature portion of a symbol's source — everything up to the body start.
+///
+/// Two-step: prefer tree-sitter body child (exact, immune to `{` in default values),
+/// then fall back to byte scanning for `{` or `:\n`.
+/// Returns `None` for expression-bodied symbols (arrow fns, type aliases) where no
+/// body delimiter exists — these produce body_only diffs, not signature_changed.
+pub(crate) fn extract_signature(source: &[u8], node: tree_sitter::Node) -> Option<String> {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte();
+
+    // Step 1: find named body child — exact body start, avoids `{` in defaults
+    let sig_end: Option<usize> = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .find(|c| {
+            matches!(c.kind(), "block" | "statement_block" | "compound_statement" | "body")
+        })
+        .map(|body| body.start_byte())
+        // Step 2: fallback byte scan if no body child found
+        .or_else(|| {
+            let node_src = &source[node_start..node_end];
+            let brace = node_src.iter().position(|&b| b == b'{').map(|i| node_start + i);
+            let colon_nl = node_src
+                .windows(2)
+                .position(|w| w[0] == b':' && w[1] == b'\n')
+                .map(|i| node_start + i + 1); // include ':'
+            match (brace, colon_nl) {
+                (Some(b), Some(c)) => Some(b.min(c)),
+                (Some(b), None) => Some(b),
+                (None, Some(c)) => Some(c),
+                // No body delimiter: expression-bodied nodes → signature = None
+                (None, None) => None,
+            }
+        });
+
+    let sig_end = sig_end?;
+    std::str::from_utf8(&source[node_start..sig_end])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Convenience constructor — avoids duplicating hash/line-number logic in every parser.
 pub(crate) fn make_symbol(
     relative_path: &str,
@@ -104,7 +145,7 @@ pub(crate) fn make_symbol(
         kind,
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
-        signature: None,
+        signature: extract_signature(source, node),
         docstring: None,
         source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
             .to_hex()

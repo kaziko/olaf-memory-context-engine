@@ -3,12 +3,29 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::graph::store;
-use crate::index::{is_sensitive, IndexStats};
+use crate::index::{diff, is_sensitive, IndexStats};
 use crate::memory::staleness;
 use crate::parser::{self, EdgeKind};
+
+/// Reason a single-file reindex could not produce a structural diff.
+pub enum SoftFailureReason {
+    IoError,
+    UnsupportedLanguage,
+    ParseError,
+}
+
+/// Outcome of reindexing a single file.
+pub enum ReindexOutcome {
+    /// File hash matched stored hash — no changes.
+    Unchanged,
+    /// File was re-parsed; structural diff is available.
+    Changed(diff::StructuralDiff),
+    /// Could not produce a structural diff; hook should fall back to basic observation.
+    SoftFailure(SoftFailureReason),
+}
 
 // KNOWN LIMITATION: edges for relationships that no longer exist in changed files
 // remain in the DB until a forced full re-index (`olaf index`). Only cross-file
@@ -129,9 +146,10 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
         let sym_count = symbols.len();
         let tx = conn.transaction()?;
         let file_id = store::upsert_file(&tx, &relative_path, &hash_hex, lang_str, now_ts)?;
-        let diff = store::update_file_symbols(&tx, file_id, &symbols)?;
-        staleness::mark_stale_for_changed_symbols(&tx, &diff.changed)?;
-        staleness::mark_stale_for_removed_symbols(&tx, &diff.removed)?;
+        let old_syms = diff::load_file_symbols(&tx, file_id)?;
+        store::update_file_symbols(&tx, file_id, &symbols)?;
+        let structural_diff = diff::compute(&relative_path, &old_syms, &symbols);
+        staleness::mark_stale_for_structural_diff(&tx, &structural_diff)?;
         tx.commit()?;
 
         files_reindexed += 1;
@@ -205,4 +223,105 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
     }
 
     Ok(IndexStats { files: files_reindexed, symbols: symbols_changed, edges: edges_inserted })
+}
+
+/// Re-index a single file and return a structural diff outcome.
+///
+/// Used by the PostToolUse hook to produce structural observations immediately after a file edit.
+/// Resolves and inserts edges for this file using INSERT OR IGNORE (idempotent). Pre-existing
+/// edges from the old version that no longer exist are NOT removed — consistent with the KNOWN
+/// LIMITATION comment above. Use `olaf index` to restore full edge consistency.
+pub fn reindex_single_file(
+    conn: &mut Connection,
+    project_root: &Path,
+    rel_path: &str,
+) -> anyhow::Result<ReindexOutcome> {
+    let abs_path = project_root.join(rel_path);
+    let bytes = match std::fs::read(&abs_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(ReindexOutcome::SoftFailure(SoftFailureReason::IoError)),
+    };
+
+    let hash_hex = blake3::hash(&bytes).to_hex().to_string();
+
+    // Check against stored hash — if unchanged, skip expensive parse
+    let stored_hash: Option<String> = conn
+        .query_row(
+            "SELECT blake3_hash FROM files WHERE path = ?1",
+            rusqlite::params![rel_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if stored_hash.as_deref() == Some(hash_hex.as_str()) {
+        return Ok(ReindexOutcome::Unchanged);
+    }
+
+    let lang_str = match parser::detect_language(rel_path) {
+        Some(parser::Language::TypeScript | parser::Language::Tsx) => "typescript",
+        Some(parser::Language::JavaScript | parser::Language::Jsx) => "javascript",
+        Some(parser::Language::Python) => "python",
+        Some(parser::Language::Rust) => "rust",
+        Some(parser::Language::Php) => "php",
+        None => return Ok(ReindexOutcome::SoftFailure(SoftFailureReason::UnsupportedLanguage)),
+    };
+
+    let (symbols, edges) = match parser::parse_file(rel_path, &bytes) {
+        Ok(r) => r,
+        Err(_) => return Ok(ReindexOutcome::SoftFailure(SoftFailureReason::ParseError)),
+    };
+
+    let now_ts =
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let tx = conn.transaction()?;
+    let file_id = store::upsert_file(&tx, rel_path, &hash_hex, lang_str, now_ts)?;
+    let old_syms = diff::load_file_symbols(&tx, file_id)?;
+    store::update_file_symbols(&tx, file_id, &symbols)?;
+    let structural_diff = diff::compute(rel_path, &old_syms, &symbols);
+    staleness::mark_stale_for_structural_diff(&tx, &structural_diff)?;
+    tx.commit()?;
+
+    // Resolve and insert edges for this file — same two-pass resolution as run().
+    // Must happen after the symbol transaction so the FQN map includes this file's symbols.
+    let file_edges: Vec<(String, String, String)> = edges
+        .iter()
+        .filter(|e| e.kind != EdgeKind::Imports)
+        .map(|e| (e.source_fqn.clone(), e.target_fqn.clone(), e.kind.as_str().to_string()))
+        .collect();
+    if !file_edges.is_empty() {
+        let fqn_map = store::load_fqn_id_map(conn)?;
+        let name_map = store::load_name_id_map(conn)?;
+        let mut resolved: Vec<(i64, i64, String)> = Vec::with_capacity(file_edges.len());
+        for (src_fqn, tgt_fqn, kind) in &file_edges {
+            let Some(&src_id) = fqn_map.get(src_fqn) else { continue };
+            let tgt_id = fqn_map.get(tgt_fqn).copied().or_else(|| {
+                let valid_kinds: &[&str] = match kind.as_str() {
+                    "calls" => &["function", "method"],
+                    "uses_type" => &["class", "interface", "type_alias"],
+                    "extends" => &["class", "interface"],
+                    "implements" => &["interface"],
+                    "hooks_into" | "fires_hook" => &["function", "method"],
+                    "uses_trait" => &["class"],
+                    _ => return None,
+                };
+                let candidates = name_map.get(tgt_fqn)?;
+                let filtered: Vec<i64> = candidates
+                    .iter()
+                    .filter(|(_, sym_kind)| valid_kinds.contains(&sym_kind.as_str()))
+                    .map(|(id, _)| *id)
+                    .collect();
+                if filtered.len() == 1 { Some(filtered[0]) } else { None }
+            });
+            let Some(tgt_id) = tgt_id else { continue };
+            resolved.push((src_id, tgt_id, kind.clone()));
+        }
+        if !resolved.is_empty() {
+            let edge_refs: Vec<(i64, i64, &str)> =
+                resolved.iter().map(|(s, t, k)| (*s, *t, k.as_str())).collect();
+            let tx = conn.transaction()?;
+            store::insert_edges_bulk(&tx, &edge_refs)?;
+            tx.commit()?;
+        }
+    }
+
+    Ok(ReindexOutcome::Changed(structural_diff))
 }

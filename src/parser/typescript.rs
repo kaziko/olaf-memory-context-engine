@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_fqn};
 
 pub(crate) enum TsDialect {
     TypeScript,
@@ -74,7 +74,7 @@ fn extract_nodes(
                     kind: SymbolKind::Function,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
                 });
@@ -106,7 +106,7 @@ fn extract_nodes(
                     kind: SymbolKind::Class,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
                 });
@@ -202,7 +202,7 @@ fn extract_nodes(
                     kind: SymbolKind::Method,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
                 });
@@ -234,7 +234,7 @@ fn extract_nodes(
                     kind: SymbolKind::Interface,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
                 });
@@ -254,7 +254,7 @@ fn extract_nodes(
                     kind: SymbolKind::TypeAlias,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: None,
+                    signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
                 });
@@ -282,7 +282,7 @@ fn extract_nodes(
                         kind: SymbolKind::Function,
                         start_line: child.start_position().row as u32 + 1,
                         end_line: child.end_position().row as u32 + 1,
-                        signature: None,
+                        signature: extract_signature(source, value_node),
                         docstring: None,
                         source_hash,
                     });

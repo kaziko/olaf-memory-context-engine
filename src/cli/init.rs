@@ -57,15 +57,15 @@ pub(crate) fn run() -> anyhow::Result<()> {
 /// hooks and MCP config survive future `brew upgrade` calls.
 fn stable_binary_path(binary: std::path::PathBuf) -> std::path::PathBuf {
     let s = binary.to_string_lossy();
-    if let Some(cellar_pos) = s.find("/Cellar/") {
-        if let Some(bin_name) = binary.file_name() {
-            let prefix = &s[..cellar_pos];
-            return std::path::PathBuf::from(format!(
-                "{}/bin/{}",
-                prefix,
-                bin_name.to_string_lossy()
-            ));
-        }
+    if let Some(cellar_pos) = s.find("/Cellar/")
+        && let Some(bin_name) = binary.file_name()
+    {
+        let prefix = &s[..cellar_pos];
+        return std::path::PathBuf::from(format!(
+            "{}/bin/{}",
+            prefix,
+            bin_name.to_string_lossy()
+        ));
     }
     binary
 }

@@ -1,11 +1,14 @@
 use rusqlite::Transaction;
 
+use crate::index::diff::StructuralDiff;
+
 const CHUNK_SIZE: usize = 500;
 
 /// Mark observations stale for symbols whose source_hash changed.
 ///
 /// Filters to entries where `old_hash != new_hash`, then delegates to
 /// `mark_stale_for_changed_fqns` for the actual batch UPDATE.
+#[allow(dead_code)] // replaced by mark_stale_for_structural_diff in incremental.rs; kept for potential callers
 pub(crate) fn mark_stale_for_changed_symbols(
     tx: &Transaction,
     changed_symbols: &[(String, String, String)],
@@ -43,6 +46,27 @@ pub(crate) fn mark_stale_for_removed_symbols(
     }
     let reason = "Symbol no longer exists in index";
     batch_mark_stale(tx, removed_fqns, reason)
+}
+
+/// Mark observations stale based on a structural diff result.
+///
+/// - `signature_changed`: uses specific reason naming the changed symbol.
+/// - `removed`: delegates to `mark_stale_for_removed_symbols` ("Symbol no longer exists in index").
+/// - `body_only` and `added`: no staleness change.
+pub(crate) fn mark_stale_for_structural_diff(
+    tx: &Transaction,
+    diff: &StructuralDiff,
+) -> Result<(), rusqlite::Error> {
+    for (fqn, _, _) in &diff.signature_changed {
+        let reason = format!("Signature of symbol '{}' changed", short_name(fqn));
+        batch_mark_stale(tx, std::slice::from_ref(fqn), &reason)?;
+    }
+    mark_stale_for_removed_symbols(tx, &diff.removed)?;
+    Ok(())
+}
+
+fn short_name(fqn: &str) -> &str {
+    fqn.rsplit("::").next().unwrap_or(fqn)
 }
 
 /// Shared batch UPDATE logic: mark observations stale in chunks of `CHUNK_SIZE`.
@@ -274,5 +298,76 @@ mod tests {
             let (stale, _) = get_stale_info(&conn, *obs_id);
             assert!(stale, "observation {} must be stale across chunk boundary", obs_id);
         }
+    }
+
+    #[test]
+    fn structural_diff_signature_changed_uses_specific_reason() {
+        use crate::index::diff::StructuralDiff;
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let obs_id = insert_observation(&conn, "s1", Some("f.rs::foo"), None);
+
+        let diff = StructuralDiff {
+            file_path: "f.rs".into(),
+            added: vec![],
+            removed: vec![],
+            signature_changed: vec![("f.rs::foo".into(), "fn foo()".into(), "fn foo(x: i32)".into())],
+            body_only: vec![],
+        };
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
+        tx.commit().unwrap();
+
+        let (stale, reason) = get_stale_info(&conn, obs_id);
+        assert!(stale);
+        assert_eq!(reason.unwrap(), "Signature of symbol 'foo' changed");
+    }
+
+    #[test]
+    fn structural_diff_body_only_does_not_mark_stale() {
+        use crate::index::diff::StructuralDiff;
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let obs_id = insert_observation(&conn, "s1", Some("f.rs::foo"), None);
+
+        let diff = StructuralDiff {
+            file_path: "f.rs".into(),
+            added: vec![],
+            removed: vec![],
+            signature_changed: vec![],
+            body_only: vec!["f.rs::foo".into()],
+        };
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
+        tx.commit().unwrap();
+
+        let (stale, _) = get_stale_info(&conn, obs_id);
+        assert!(!stale);
+    }
+
+    #[test]
+    fn structural_diff_removed_uses_generic_reason() {
+        use crate::index::diff::StructuralDiff;
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let obs_id = insert_observation(&conn, "s1", Some("f.rs::bar"), None);
+
+        let diff = StructuralDiff {
+            file_path: "f.rs".into(),
+            added: vec![],
+            removed: vec!["f.rs::bar".into()],
+            signature_changed: vec![],
+            body_only: vec![],
+        };
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
+        tx.commit().unwrap();
+
+        let (stale, reason) = get_stale_info(&conn, obs_id);
+        assert!(stale);
+        assert_eq!(reason.unwrap(), "Symbol no longer exists in index");
     }
 }

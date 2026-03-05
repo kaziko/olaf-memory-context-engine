@@ -341,6 +341,8 @@ pub fn lookup_symbol_at_line(
 ///
 /// Used by `full.rs` to snapshot symbol hashes before `replace_file_symbols`
 /// deletes and re-inserts them, enabling hash-change and removal detection.
+/// Superseded by `diff::load_file_symbols` in Story 7.1; kept for potential callers.
+#[allow(dead_code)]
 pub(crate) fn collect_symbol_hashes_for_file(
     tx: &Transaction,
     file_id: i64,

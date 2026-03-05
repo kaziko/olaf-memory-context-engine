@@ -614,6 +614,7 @@ fn get_context_request(id: i64, file_hints: &[&str]) -> serde_json::Value {
 
 #[test]
 fn test_staleness_incremental_source_changed() {
+    // Story 7.1: signature change → observation marked stale
     let tmpdir = setup_indexed_project_with_observation(
         "function hello() { return 1; }\n",
         "hello returns hardcoded 1",
@@ -621,8 +622,8 @@ fn test_staleness_incremental_source_changed() {
         None,
     );
 
-    // Modify source file (different body → different source_hash)
-    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 999; }\n").unwrap();
+    // Change the signature (add parameter) → structural change → stale
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello(x: number) { return x; }\n").unwrap();
 
     // get_context triggers incremental re-index, then query history for stale marker
     let responses = run_requests_in(tmpdir.path(), &[
@@ -630,11 +631,32 @@ fn test_staleness_incremental_source_changed() {
         get_history_request(2, Some("test.ts::hello"), None, Some(2)),
     ]);
     let text = extract_text(&responses[1]);
-    assert!(text.contains("STALE"), "observation must be marked STALE; got: {text}");
+    assert!(text.contains("STALE"), "observation must be marked STALE after signature change; got: {text}");
     assert!(
-        text.contains("Symbol source changed"),
-        "reason must be 'Symbol source changed'; got: {text}"
+        text.contains("Signature of symbol"),
+        "reason must mention 'Signature of symbol'; got: {text}"
     );
+}
+
+#[test]
+fn test_staleness_incremental_body_only_not_stale() {
+    // Story 7.1: body-only change (same signature) → observation NOT stale
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello returns hardcoded 1",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Change only the body, keep signature unchanged
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 999; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(!text.contains("STALE"), "body-only change must NOT mark observation stale; got: {text}");
 }
 
 #[test]
@@ -737,6 +759,7 @@ fn test_staleness_file_deleted_stale_cleanup() {
 
 #[test]
 fn test_staleness_full_reindex_source_changed() {
+    // Story 7.1: full re-index with signature change → observation marked stale
     let tmpdir = setup_indexed_project_with_observation(
         "function hello() { return 1; }\n",
         "hello returns 1",
@@ -744,8 +767,8 @@ fn test_staleness_full_reindex_source_changed() {
         None,
     );
 
-    // Modify source
-    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 42; }\n").unwrap();
+    // Change signature (add parameter) — structural change
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello(n: number) { return n; }\n").unwrap();
 
     // Full re-index via CLI (covers full.rs path)
     let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
@@ -759,10 +782,10 @@ fn test_staleness_full_reindex_source_changed() {
         get_history_request(1, Some("test.ts::hello"), None, Some(2)),
     ]);
     let text = extract_text(&responses[0]);
-    assert!(text.contains("STALE"), "full re-index must mark observation stale; got: {text}");
+    assert!(text.contains("STALE"), "full re-index must mark observation stale after signature change; got: {text}");
     assert!(
-        text.contains("Symbol source changed"),
-        "reason must be 'Symbol source changed'; got: {text}"
+        text.contains("Signature of symbol"),
+        "reason must mention 'Signature of symbol'; got: {text}"
     );
 }
 
@@ -1142,6 +1165,146 @@ fn test_observe_file_outside_cwd_no_observation() {
         .query_row("SELECT COUNT(*) FROM observations WHERE session_id = 'hook-outside'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0, "no observation for files outside project root");
+}
+
+// ─── Story 7.1: Structural Observation Integration Tests ─────────────────────
+
+// Signature change on an indexed TS file → structural observation with diff message
+#[test]
+fn test_observe_structural_signature_changed() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let ts_path = src_dir.join("auth.ts");
+    std::fs::write(&ts_path, "function authenticate() { return true; }\n").unwrap();
+
+    // Index the file so DB has its signature
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+
+    // Write signature-changing edit to disk
+    std::fs::write(&ts_path, "function authenticate(user: string) { return user.length > 0; }\n").unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let abs_path = ts_path.to_str().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "struct-sig-test",
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": abs_path,
+            "old_string": "function authenticate() { return true; }",
+            "new_string": "function authenticate(user: string) { return user.length > 0; }"
+        },
+        "tool_use_id": "toolu_sig_test"
+    });
+    let output = run_observe(&tmpdir, &payload);
+    assert!(output.status.success(), "observe must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = tmpdir.path().join(".olaf/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (content, file_path): (String, Option<String>) = conn
+        .query_row(
+            "SELECT content, file_path FROM observations WHERE session_id = 'struct-sig-test'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("structural observation must be written");
+    assert!(
+        content.contains("signature of `authenticate` changed"),
+        "expected structural obs; got: {content}"
+    );
+    assert_eq!(file_path.as_deref(), Some("src/auth.ts"));
+}
+
+// Body-only change on indexed TS file → no observation written (AC3)
+#[test]
+fn test_observe_structural_body_only_no_obs() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let ts_path = src_dir.join("helper.ts");
+    std::fs::write(&ts_path, "function compute() { return 1; }\n").unwrap();
+
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+
+    // Body-only change — same signature
+    std::fs::write(&ts_path, "function compute() { return 999; }\n").unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let abs_path = ts_path.to_str().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "struct-body-test",
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": abs_path,
+            "old_string": "return 1;",
+            "new_string": "return 999;"
+        },
+        "tool_use_id": "toolu_body_test"
+    });
+    let output = run_observe(&tmpdir, &payload);
+    assert!(output.status.success());
+
+    let db_path = tmpdir.path().join(".olaf/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = 'struct-body-test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "body-only change must NOT create an observation");
+}
+
+// Unsupported file type (e.g. .md) → SoftFailure path → basic fallback observation written
+#[test]
+fn test_observe_structural_unsupported_file_fallback() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf/index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let md_path = tmpdir.path().join("README.md");
+    std::fs::write(&md_path, "# Hello\n").unwrap();
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let abs_path = md_path.to_str().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "struct-fallback-test",
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": abs_path,
+            "old_string": "Hello",
+            "new_string": "Goodbye"
+        },
+        "tool_use_id": "toolu_fallback_test"
+    });
+    let output = run_observe(&tmpdir, &payload);
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM observations WHERE session_id = 'struct-fallback-test'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("fallback observation must be written for unsupported file type");
+    assert!(content.contains("Edited README.md"), "expected fallback obs; got: {content}");
 }
 
 // ─── Story 4.2: SessionEnd Hook Integration Tests ────────────────────────────

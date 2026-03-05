@@ -126,44 +126,157 @@ fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()>
 }
 
 fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
-    let result = match olaf::memory::parse_post_tool_use(payload) {
-        Some(r) => r,
+    let tool_name = match payload.tool_name.as_deref() {
+        Some(t) => t,
         None => return Ok(()),
     };
 
-    // AC6: Skip sensitive paths
-    if result.file_path.as_deref().is_some_and(olaf::memory::is_sensitive_path) {
-        log::debug!("observe: skipping sensitive path: {:?}", result.file_path);
-        return Ok(());
+    let cwd = PathBuf::from(&payload.cwd);
+
+    match tool_name {
+        "Bash" => {
+            // Bash path: unchanged — use parse_post_tool_use, non-mut DB
+            let result = match olaf::memory::parse_post_tool_use(payload) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
+
+            let start = std::time::Instant::now();
+            let conn = match olaf::db::open(&cwd.join(".olaf/index.db")) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::debug!("observe: DB open failed: {e}");
+                    return Ok(());
+                }
+            };
+            olaf::memory::upsert_session(&conn, &result.session_id, "claude-code")?;
+            olaf::memory::insert_auto_observation(
+                &conn,
+                &result.session_id,
+                result.kind,
+                &result.content,
+                None,
+                result.file_path.as_deref(),
+            )?;
+            log::debug!("observe: handler completed in {:?}", start.elapsed());
+        }
+
+        "Edit" | "Write" => {
+            let tool_input = match &payload.tool_input {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let abs_path = match tool_input.get("file_path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+
+            // Same path normalization as handle_pre_tool_use (lines 64–87)
+            let rel_path = match std::path::Path::new(abs_path).strip_prefix(&cwd) {
+                Ok(rel) => {
+                    let mut normalized = std::path::PathBuf::new();
+                    for component in rel.components() {
+                        match component {
+                            std::path::Component::ParentDir => return Ok(()),
+                            std::path::Component::CurDir => {}
+                            c => normalized.push(c),
+                        }
+                    }
+                    normalized.to_string_lossy().into_owned()
+                }
+                Err(_) => return Ok(()),
+            };
+
+            if olaf::memory::is_sensitive_path(&rel_path) {
+                log::debug!("observe: skipping sensitive path: {rel_path}");
+                return Ok(());
+            }
+
+            let start = std::time::Instant::now();
+            let mut conn = match olaf::db::open(&cwd.join(".olaf/index.db")) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::debug!("observe: DB open failed: {e}");
+                    return Ok(());
+                }
+            };
+
+            olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
+
+            match olaf::index::reindex_single_file(&mut conn, &cwd, &rel_path) {
+                Ok(olaf::index::ReindexOutcome::Changed(diff)) => {
+                    if let Some(content) = olaf::memory::format_structural_observation(&diff) {
+                        olaf::memory::insert_auto_observation(
+                            &conn,
+                            &payload.session_id,
+                            "file_change",
+                            &content,
+                            None,
+                            Some(&rel_path),
+                        )?;
+                    }
+                    // body-only diff → no observation
+                }
+                Ok(olaf::index::ReindexOutcome::Unchanged) => {
+                    // hash matched — no observation
+                }
+                Ok(olaf::index::ReindexOutcome::SoftFailure(_)) => {
+                    log::debug!("observe: structural diff soft failure, using basic obs");
+                    let (content, kind) = make_fallback_obs(tool_name, tool_input, &rel_path);
+                    olaf::memory::insert_auto_observation(
+                        &conn,
+                        &payload.session_id,
+                        kind,
+                        &content,
+                        None,
+                        Some(&rel_path),
+                    )?;
+                }
+                Err(e) => {
+                    log::debug!("observe: reindex_single_file hard error: {e}, using basic obs");
+                    let (content, kind) = make_fallback_obs(tool_name, tool_input, &rel_path);
+                    olaf::memory::insert_auto_observation(
+                        &conn,
+                        &payload.session_id,
+                        kind,
+                        &content,
+                        None,
+                        Some(&rel_path),
+                    )?;
+                }
+            }
+
+            log::debug!("observe: handler completed in {:?}", start.elapsed());
+        }
+
+        _ => {}
     }
 
-    // NFR5: timer starts here — measures internal handler time (DB open → observation write)
-    let start = std::time::Instant::now();
-
-    // AC7: Open DB using cwd from payload — if fails, log and return Ok(())
-    let cwd = PathBuf::from(&payload.cwd);
-    let conn = match olaf::db::open(&cwd.join(".olaf/index.db")) {
-        Ok(c) => c,
-        Err(e) => {
-            log::debug!("observe: DB open failed: {e}");
-            return Ok(());
-        }
-    };
-
-    // Ensure session record exists
-    olaf::memory::upsert_session(&conn, &result.session_id, "claude-code")?;
-
-    // Write observation — symbol_fqn always None in Story 4.1 (AC3)
-    olaf::memory::insert_auto_observation(
-        &conn,
-        &result.session_id,
-        result.kind,
-        &result.content,
-        None,
-        result.file_path.as_deref(),
-    )?;
-
-    // NFR5: debug-level timing for internal handler performance measurement
-    log::debug!("observe: handler completed in {:?}", start.elapsed());
     Ok(())
+}
+
+fn make_fallback_obs<'a>(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    rel_path: &str,
+) -> (String, &'a str) {
+    match tool_name {
+        "Edit" => {
+            let old_len = tool_input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            (format!("Edited {rel_path}: replaced {old_len} chars"), "file_change")
+        }
+        "Write" => {
+            let byte_count = tool_input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            (format!("Wrote {rel_path}: {byte_count} bytes"), "file_change")
+        }
+        _ => unreachable!(),
+    }
 }
