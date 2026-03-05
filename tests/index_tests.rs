@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use olaf::{db, index, index::run_incremental};
+use olaf::{db, index, index::reindex_single_file, index::run_incremental};
 use tempfile::tempdir;
 
 /// Open an in-memory test DB at a temp path and return the connection.
@@ -498,6 +498,45 @@ fn test_incremental_preserves_inbound_edges() {
     assert_eq!(
         edges_after_incremental, edges_after_full,
         "incremental re-index of B must not cascade-delete edges from A to B's surviving symbols"
+    );
+}
+
+/// Regression: `reindex_single_file` must resolve and insert new calls edges when a file gains
+/// new function-to-function calls — the shared `resolve_and_insert_file_edges` helper path.
+#[test]
+fn test_reindex_single_file_inserts_new_edges() {
+    let dir = tempdir().unwrap();
+
+    // Initial state: helper exists but main does not yet call it
+    std::fs::write(dir.path().join("app.ts"), "export function helper() {}").unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("full index failed");
+
+    let edges_before: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges WHERE kind = 'calls'", [], |r| r.get(0)).unwrap();
+    assert_eq!(edges_before, 0, "no calls edges before edit");
+
+    // Edit: add main() which calls helper() — new calls edge should appear
+    std::fs::write(
+        dir.path().join("app.ts"),
+        "export function helper() {}\nexport function main() { helper(); }",
+    )
+    .unwrap();
+
+    let outcome = reindex_single_file(&mut conn, dir.path(), "app.ts")
+        .expect("reindex_single_file must not error");
+    assert!(
+        matches!(outcome, index::ReindexOutcome::Changed(_)),
+        "modified file must produce Changed outcome"
+    );
+
+    let edges_after: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges WHERE kind = 'calls'", [], |r| r.get(0)).unwrap();
+    assert!(
+        edges_after >= 1,
+        "reindex_single_file must insert the new main→helper calls edge; got {edges_after}"
     );
 }
 
