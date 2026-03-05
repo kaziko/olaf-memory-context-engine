@@ -821,3 +821,70 @@ fn test_tools_list_includes_run_pipeline() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"run_pipeline"), "tools/list must include run_pipeline");
 }
+
+// ─── Story 7.2 Tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_trace_flow_missing_source_fqn_returns_32602() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "target_fqn": "src/b.rs::bar"
+        }}
+    })]);
+    assert_eq!(responses[0]["error"]["code"], -32602, "missing source_fqn must return -32602");
+}
+
+#[test]
+fn test_trace_flow_symbol_not_found_empty_db() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "src/a.rs::foo",
+            "target_fqn": "src/b.rs::bar"
+        }}
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Symbol not found"), "expected not-found message, got: {text}");
+}
+
+#[test]
+fn test_tools_list_includes_trace_flow() {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+    let responses = run_requests(&[req]);
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools must be array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"trace_flow"), "tools/list must include trace_flow");
+}
+
+#[test]
+fn test_trace_flow_returns_path_for_connected_symbols() {
+    // Create a TypeScript file where main() calls helper() — produces a calls edge.
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmpdir.path().join("app.ts"),
+        "export function helper() {}\nexport function main() { helper(); }",
+    ).expect("write app.ts");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(status.status.success(), "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr));
+
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::main",
+            "target_fqn": "app.ts::helper"
+        }}
+    })]);
+
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("path(s) found"), "must show found path(s); got: {text}");
+    assert!(text.contains("app.ts::main"), "path must include source; got: {text}");
+    assert!(text.contains("app.ts::helper"), "path must include target; got: {text}");
+}

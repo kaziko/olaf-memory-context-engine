@@ -1,4 +1,5 @@
 use std::path::Path;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 /// Error types for tool dispatch — maps to MCP error codes in server.rs.
@@ -162,6 +163,19 @@ pub(crate) fn list() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "trace_flow",
+            "description": "Find execution paths between two symbols in the call graph. Traverses calls/extends/implements edges. Returns shortest paths up to max_paths.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_fqn": { "type": "string", "description": "FQN of the starting symbol, e.g. 'src/auth.rs::login'" },
+                    "target_fqn": { "type": "string", "description": "FQN of the destination symbol, e.g. 'src/db.rs::query'" },
+                    "max_paths":  { "type": "integer", "description": "Maximum paths to return (default: 5, max: 20)" }
+                },
+                "required": ["source_fqn", "target_fqn"]
+            }
+        }),
+        serde_json::json!({
             "name": "run_pipeline",
             "description": "Run context retrieval and impact analysis in one call. Returns a unified brief for a given intent. Faster than orchestrating get_context + get_impact separately.",
             "inputSchema": {
@@ -214,6 +228,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "list_restore_points"  => handle_list_restore_points(project_root, args),
         "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
         "run_pipeline"         => handle_run_pipeline(conn, project_root, args),
+        "trace_flow"           => handle_trace_flow(conn, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -545,6 +560,46 @@ fn handle_run_pipeline(
     Ok(output)
 }
 
+fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let source_fqn = args.get("source_fqn").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: source_fqn".to_string()))?;
+    let target_fqn = args.get("target_fqn").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: target_fqn".to_string()))?;
+    let max_paths = args.get("max_paths").and_then(|v| v.as_u64())
+        .map(|v| (v as usize).clamp(1, crate::graph::trace::MAX_PATHS_LIMIT))
+        .unwrap_or(crate::graph::trace::MAX_PATHS_DEFAULT);
+
+    let source_id: Option<i64> = conn.query_row(
+        "SELECT id FROM symbols WHERE fqn = ?1",
+        rusqlite::params![source_fqn],
+        |r| r.get(0),
+    ).optional().map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let source_id = match source_id {
+        Some(id) => id,
+        None => return Ok(format!("Symbol not found: {source_fqn}\n\nRun 'olaf index' first.")),
+    };
+
+    let target_id: Option<i64> = conn.query_row(
+        "SELECT id FROM symbols WHERE fqn = ?1",
+        rusqlite::params![target_fqn],
+        |r| r.get(0),
+    ).optional().map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return Ok(format!("Symbol not found: {target_fqn}\n\nRun 'olaf index' first.")),
+    };
+
+    let result = crate::graph::trace::trace_flow(conn, source_id, target_id, max_paths)
+        .map_err(anyhow::Error::from)?;
+
+    Ok(crate::graph::trace::format_trace_result(source_fqn, target_fqn, &result))
+}
+
 /// Truncates `s` so that `s.len().div_ceil(4) <= token_budget` after appending the note.
 /// Finds the nearest valid UTF-8 char boundary to avoid panics on multibyte chars.
 fn truncate_to_budget(s: &mut String, token_budget: usize) {
@@ -579,6 +634,29 @@ fn relative_age_ms(millis: u128, now_ms: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_list_contains_trace_flow() {
+        let tools = list();
+        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "trace_flow").collect();
+        assert_eq!(matches.len(), 1, "list() must contain exactly one trace_flow entry");
+    }
+
+    #[test]
+    fn test_trace_flow_missing_source_fqn() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let args = serde_json::json!({ "target_fqn": "src/b.rs::bar" });
+        let result = handle_trace_flow(&conn, Some(&args));
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn test_trace_flow_missing_target_fqn() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let args = serde_json::json!({ "source_fqn": "src/a.rs::foo" });
+        let result = handle_trace_flow(&conn, Some(&args));
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))));
+    }
 
     // 3.5 — list() contains exactly one entry with name "run_pipeline"
     #[test]
