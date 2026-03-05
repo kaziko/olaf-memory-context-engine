@@ -156,49 +156,9 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
         symbols_changed += sym_count;
     }
 
-    // Two-pass edge resolution — copied exactly from full.rs to avoid regressions.
-    //
-    // Pass 1: FQN map lookup (full FQN e.g. "src/file.ts::callee")
-    // Pass 2: short-name fallback with kind-specific valid-symbol-kinds filtering.
-    //
     // INSERT OR IGNORE handles idempotency for edges that already exist from
     // unchanged files — they are preserved, not duplicated.
-    let fqn_map = store::load_fqn_id_map(conn)?;
-    let name_map = store::load_name_id_map(conn)?;
-    let mut resolved: Vec<(i64, i64, String)> = Vec::with_capacity(pending_edges.len());
-    for (src_fqn, tgt_fqn, kind) in &pending_edges {
-        let Some(&src_id) = fqn_map.get(src_fqn) else {
-            continue;
-        };
-        let tgt_id = fqn_map.get(tgt_fqn).copied().or_else(|| {
-            let valid_kinds: &[&str] = match kind.as_str() {
-                "calls" => &["function", "method"],
-                "uses_type" => &["class", "interface", "type_alias"],
-                "extends" => &["class", "interface"],
-                "implements" => &["interface"],
-                "hooks_into" | "fires_hook" => &["function", "method"],
-                "uses_trait" => &["class"],
-                _ => return None,
-            };
-            let candidates = name_map.get(tgt_fqn)?;
-            let filtered: Vec<i64> = candidates
-                .iter()
-                .filter(|(_, sym_kind)| valid_kinds.contains(&sym_kind.as_str()))
-                .map(|(id, _)| *id)
-                .collect();
-            if filtered.len() == 1 { Some(filtered[0]) } else { None }
-        });
-        let Some(tgt_id) = tgt_id else {
-            continue;
-        };
-        resolved.push((src_id, tgt_id, kind.clone()));
-    }
-
-    let edge_refs: Vec<(i64, i64, &str)> =
-        resolved.iter().map(|(s, t, k)| (*s, *t, k.as_str())).collect();
-    let tx = conn.transaction()?;
-    let edges_inserted = store::insert_edges_bulk(&tx, &edge_refs)?;
-    tx.commit()?;
+    let edges_inserted = resolve_and_insert_file_edges(conn, &pending_edges)?;
 
     // Stale file cleanup — must match full.rs semantics exactly.
     // Guard on project_root.is_dir(), not on file count.
@@ -280,48 +240,65 @@ pub fn reindex_single_file(
     staleness::mark_stale_for_structural_diff(&tx, &structural_diff)?;
     tx.commit()?;
 
-    // Resolve and insert edges for this file — same two-pass resolution as run().
-    // Must happen after the symbol transaction so the FQN map includes this file's symbols.
+    // Resolve and insert edges for this file — must happen after the symbol transaction
+    // so the FQN map includes this file's symbols.
     let file_edges: Vec<(String, String, String)> = edges
         .iter()
         .filter(|e| e.kind != EdgeKind::Imports)
         .map(|e| (e.source_fqn.clone(), e.target_fqn.clone(), e.kind.as_str().to_string()))
         .collect();
-    if !file_edges.is_empty() {
-        let fqn_map = store::load_fqn_id_map(conn)?;
-        let name_map = store::load_name_id_map(conn)?;
-        let mut resolved: Vec<(i64, i64, String)> = Vec::with_capacity(file_edges.len());
-        for (src_fqn, tgt_fqn, kind) in &file_edges {
-            let Some(&src_id) = fqn_map.get(src_fqn) else { continue };
-            let tgt_id = fqn_map.get(tgt_fqn).copied().or_else(|| {
-                let valid_kinds: &[&str] = match kind.as_str() {
-                    "calls" => &["function", "method"],
-                    "uses_type" => &["class", "interface", "type_alias"],
-                    "extends" => &["class", "interface"],
-                    "implements" => &["interface"],
-                    "hooks_into" | "fires_hook" => &["function", "method"],
-                    "uses_trait" => &["class"],
-                    _ => return None,
-                };
-                let candidates = name_map.get(tgt_fqn)?;
-                let filtered: Vec<i64> = candidates
-                    .iter()
-                    .filter(|(_, sym_kind)| valid_kinds.contains(&sym_kind.as_str()))
-                    .map(|(id, _)| *id)
-                    .collect();
-                if filtered.len() == 1 { Some(filtered[0]) } else { None }
-            });
-            let Some(tgt_id) = tgt_id else { continue };
-            resolved.push((src_id, tgt_id, kind.clone()));
-        }
-        if !resolved.is_empty() {
-            let edge_refs: Vec<(i64, i64, &str)> =
-                resolved.iter().map(|(s, t, k)| (*s, *t, k.as_str())).collect();
-            let tx = conn.transaction()?;
-            store::insert_edges_bulk(&tx, &edge_refs)?;
-            tx.commit()?;
-        }
-    }
+    resolve_and_insert_file_edges(conn, &file_edges)?;
 
     Ok(ReindexOutcome::Changed(structural_diff))
+}
+
+/// Two-pass edge resolution and insertion shared between `run()` and `reindex_single_file()`.
+///
+/// Pass 1: exact FQN map lookup.
+/// Pass 2: short-name fallback with kind-specific symbol-kind filtering (unambiguous only).
+/// INSERT OR IGNORE is used by `insert_edges_bulk` — idempotent for pre-existing edges.
+///
+/// Returns the number of edges inserted.
+fn resolve_and_insert_file_edges(
+    conn: &mut Connection,
+    raw_edges: &[(String, String, String)],
+) -> anyhow::Result<usize> {
+    if raw_edges.is_empty() {
+        return Ok(0);
+    }
+    let fqn_map = store::load_fqn_id_map(conn)?;
+    let name_map = store::load_name_id_map(conn)?;
+    let mut resolved: Vec<(i64, i64, String)> = Vec::with_capacity(raw_edges.len());
+    for (src_fqn, tgt_fqn, kind) in raw_edges {
+        let Some(&src_id) = fqn_map.get(src_fqn.as_str()) else { continue };
+        let tgt_id = fqn_map.get(tgt_fqn.as_str()).copied().or_else(|| {
+            let valid_kinds: &[&str] = match kind.as_str() {
+                "calls" => &["function", "method"],
+                "uses_type" => &["class", "interface", "type_alias"],
+                "extends" => &["class", "interface"],
+                "implements" => &["interface"],
+                "hooks_into" | "fires_hook" => &["function", "method"],
+                "uses_trait" => &["class"],
+                _ => return None,
+            };
+            let candidates = name_map.get(tgt_fqn.as_str())?;
+            let filtered: Vec<i64> = candidates
+                .iter()
+                .filter(|(_, sym_kind)| valid_kinds.contains(&sym_kind.as_str()))
+                .map(|(id, _)| *id)
+                .collect();
+            if filtered.len() == 1 { Some(filtered[0]) } else { None }
+        });
+        let Some(tgt_id) = tgt_id else { continue };
+        resolved.push((src_id, tgt_id, kind.clone()));
+    }
+    if resolved.is_empty() {
+        return Ok(0);
+    }
+    let edge_refs: Vec<(i64, i64, &str)> =
+        resolved.iter().map(|(s, t, k)| (*s, *t, k.as_str())).collect();
+    let tx = conn.transaction()?;
+    let count = store::insert_edges_bulk(&tx, &edge_refs)?;
+    tx.commit()?;
+    Ok(count)
 }

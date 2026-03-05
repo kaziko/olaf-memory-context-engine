@@ -89,6 +89,11 @@ pub enum ParserError {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
+/// Return the short name (after the last `::`) from a fully-qualified symbol name.
+pub(crate) fn fqn_short_name(fqn: &str) -> &str {
+    fqn.rsplit("::").next().unwrap_or(fqn)
+}
+
 /// Extract the signature portion of a symbol's source — everything up to the body start.
 ///
 /// Two-step: prefer tree-sitter body child (exact, immune to `{` in default values),

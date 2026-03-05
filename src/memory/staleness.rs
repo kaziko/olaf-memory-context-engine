@@ -1,30 +1,12 @@
 use rusqlite::Transaction;
 
 use crate::index::diff::StructuralDiff;
+use crate::parser::symbols::fqn_short_name;
 
 const CHUNK_SIZE: usize = 500;
 
-/// Mark observations stale for symbols whose source_hash changed.
-///
-/// Filters to entries where `old_hash != new_hash`, then delegates to
-/// `mark_stale_for_changed_fqns` for the actual batch UPDATE.
-#[allow(dead_code)] // replaced by mark_stale_for_structural_diff in incremental.rs; kept for potential callers
-pub(crate) fn mark_stale_for_changed_symbols(
-    tx: &Transaction,
-    changed_symbols: &[(String, String, String)],
-) -> Result<(), rusqlite::Error> {
-    let fqns: Vec<String> = changed_symbols
-        .iter()
-        .filter(|(_, old, new)| old != new)
-        .map(|(fqn, _, _)| fqn.clone())
-        .collect();
-    mark_stale_for_changed_fqns(tx, &fqns)
-}
-
 /// Mark observations stale for the given FQNs (already filtered as actually changed).
-///
-/// Used by both the incremental path (via `mark_stale_for_changed_symbols`) and
-/// the full re-index path (which computes its own FQN diff).
+#[cfg(test)]
 pub(crate) fn mark_stale_for_changed_fqns(
     tx: &Transaction,
     fqns: &[String],
@@ -58,15 +40,11 @@ pub(crate) fn mark_stale_for_structural_diff(
     diff: &StructuralDiff,
 ) -> Result<(), rusqlite::Error> {
     for (fqn, _, _) in &diff.signature_changed {
-        let reason = format!("Signature of symbol '{}' changed", short_name(fqn));
+        let reason = format!("Signature of symbol '{}' changed", fqn_short_name(fqn));
         batch_mark_stale(tx, std::slice::from_ref(fqn), &reason)?;
     }
     mark_stale_for_removed_symbols(tx, &diff.removed)?;
     Ok(())
-}
-
-fn short_name(fqn: &str) -> &str {
-    fqn.rsplit("::").next().unwrap_or(fqn)
 }
 
 /// Shared batch UPDATE logic: mark observations stale in chunks of `CHUNK_SIZE`.
@@ -140,44 +118,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_symbol_different_hashes_marks_stale() {
-        let mut conn = open_test_db();
-        insert_session(&conn, "s1");
-        let obs_id = insert_observation(&conn, "s1", Some("src/lib.rs::foo"), None);
-
-        let tx = conn.transaction().unwrap();
-        mark_stale_for_changed_symbols(
-            &tx,
-            &[("src/lib.rs::foo".into(), "hash1".into(), "hash2".into())],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let (stale, reason) = get_stale_info(&conn, obs_id);
-        assert!(stale);
-        assert_eq!(reason.unwrap(), "Symbol source changed since observation was recorded");
-    }
-
-    #[test]
-    fn changed_symbol_same_hash_not_marked_stale() {
-        let mut conn = open_test_db();
-        insert_session(&conn, "s1");
-        let obs_id = insert_observation(&conn, "s1", Some("src/lib.rs::foo"), None);
-
-        let tx = conn.transaction().unwrap();
-        mark_stale_for_changed_symbols(
-            &tx,
-            &[("src/lib.rs::foo".into(), "hash1".into(), "hash1".into())],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let (stale, reason) = get_stale_info(&conn, obs_id);
-        assert!(!stale);
-        assert!(reason.is_none());
-    }
-
-    #[test]
     fn removed_symbol_marks_stale() {
         let mut conn = open_test_db();
         insert_session(&conn, "s1");
@@ -194,18 +134,21 @@ mod tests {
 
     #[test]
     fn file_level_observation_not_marked_stale() {
+        use crate::index::diff::StructuralDiff;
         let mut conn = open_test_db();
         insert_session(&conn, "s1");
-        // File-level observation: symbol_fqn = NULL
+        // File-level observation: symbol_fqn = NULL — must not be affected by symbol staleness
         let obs_id = insert_observation(&conn, "s1", None, Some("src/lib.rs"));
 
+        let diff = StructuralDiff {
+            file_path: "src/lib.rs".into(),
+            added: vec![],
+            removed: vec!["src/lib.rs::foo".into()],
+            signature_changed: vec![("src/lib.rs::foo".into(), "fn foo()".into(), "fn foo(x: i32)".into())],
+            body_only: vec![],
+        };
         let tx = conn.transaction().unwrap();
-        mark_stale_for_changed_symbols(
-            &tx,
-            &[("src/lib.rs::foo".into(), "h1".into(), "h2".into())],
-        )
-        .unwrap();
-        mark_stale_for_removed_symbols(&tx, &["src/lib.rs::foo".into()]).unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
         tx.commit().unwrap();
 
         let (stale, _) = get_stale_info(&conn, obs_id);

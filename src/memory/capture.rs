@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::index::diff::StructuralDiff;
+use crate::parser::symbols::fqn_short_name;
 
 /// Parsed representation of a Claude Code PostToolUse hook payload.
 ///
@@ -49,35 +50,30 @@ pub fn format_structural_observation(diff: &StructuralDiff) -> Option<String> {
         return None;
     }
 
-    let total = diff.added.len() + diff.signature_changed.len() + diff.removed.len();
     let mut parts: Vec<String> = Vec::new();
 
     for fqn in &diff.added {
-        parts.push(format!("added `{}`", short_name(fqn)));
+        parts.push(format!("added `{}`", fqn_short_name(fqn)));
     }
     for (fqn, old_sig, new_sig) in &diff.signature_changed {
         parts.push(format!(
             "signature of `{}` changed from `{}` to `{}`",
-            short_name(fqn),
+            fqn_short_name(fqn),
             old_sig,
             new_sig
         ));
     }
     for fqn in &diff.removed {
-        parts.push(format!("removed `{}`", short_name(fqn)));
+        parts.push(format!("removed `{}`", fqn_short_name(fqn)));
     }
 
     if parts.len() > 5 {
-        let excess = total - 5;
+        let excess = parts.len() - 5;
         parts.truncate(5);
         parts.push(format!("and {} more", excess));
     }
 
     Some(format!("Modified `{}`: {}", diff.file_path, parts.join(", ")))
-}
-
-fn short_name(fqn: &str) -> &str {
-    fqn.rsplit("::").next().unwrap_or(fqn)
 }
 
 /// Parse a PostToolUse hook payload into an observation result.

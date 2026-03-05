@@ -157,8 +157,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_null_old_sig_becomes_body_only() {
-        // Conservative: old sig=None → body-only (no noise on migration from legacy null rows)
+    fn null_old_sig_is_conservative_body_only() {
+        // Conservative design: old sig=None with hash change → body-only to avoid noise
         let old = vec![make_snap("f.rs::foo", None, "h1")];
         let new = vec![make_sym("f.rs::foo", Some("fn foo()"), "h2")];
         let diff = compute("f.rs", &old, &new);

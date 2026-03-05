@@ -337,24 +337,6 @@ pub fn lookup_symbol_at_line(
     }
 }
 
-/// Collect `fqn → source_hash` for all symbols belonging to a file.
-///
-/// Used by `full.rs` to snapshot symbol hashes before `replace_file_symbols`
-/// deletes and re-inserts them, enabling hash-change and removal detection.
-/// Superseded by `diff::load_file_symbols` in Story 7.1; kept for potential callers.
-#[allow(dead_code)]
-pub(crate) fn collect_symbol_hashes_for_file(
-    tx: &Transaction,
-    file_id: i64,
-) -> Result<HashMap<String, String>, StoreError> {
-    let mut stmt =
-        tx.prepare("SELECT fqn, source_hash FROM symbols WHERE file_id = ?1")?;
-    let map = stmt
-        .query_map([file_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    Ok(map)
-}
-
 /// Delete all `files` rows whose `path` is NOT in `seen_paths`.
 ///
 /// The `ON DELETE CASCADE` on `symbols(file_id)` and `edges(source_id/target_id)`
