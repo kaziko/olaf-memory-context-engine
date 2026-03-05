@@ -137,7 +137,7 @@ If `olaf status` prints `Index not initialized. Run olaf index to build the inde
 ### Homebrew
 
 ```sh
-brew upgrade olaf
+brew update && brew upgrade olaf
 ```
 
 ### cargo

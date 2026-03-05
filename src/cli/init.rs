@@ -5,7 +5,7 @@ use crate::cli::setup::{
 
 pub(crate) fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let binary = std::env::current_exe()?.canonicalize()?;
+    let binary = stable_binary_path(std::env::current_exe()?.canonicalize()?);
 
     // --- Setup steps ---
     let olaf_dir_created = ensure_olaf_dir(&cwd)?;
@@ -49,6 +49,25 @@ pub(crate) fn run() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// If the binary lives inside a versioned Homebrew Cellar path
+/// (e.g. `/opt/homebrew/Cellar/olaf/0.2.0/bin/olaf`), return the
+/// stable prefix symlink (`/opt/homebrew/bin/olaf`) instead so that
+/// hooks and MCP config survive future `brew upgrade` calls.
+fn stable_binary_path(binary: std::path::PathBuf) -> std::path::PathBuf {
+    let s = binary.to_string_lossy();
+    if let Some(cellar_pos) = s.find("/Cellar/") {
+        if let Some(bin_name) = binary.file_name() {
+            let prefix = &s[..cellar_pos];
+            return std::path::PathBuf::from(format!(
+                "{}/bin/{}",
+                prefix,
+                bin_name.to_string_lossy()
+            ));
+        }
+    }
+    binary
 }
 
 fn action_label(action: &ReconcileAction) -> &'static str {
