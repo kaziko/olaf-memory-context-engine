@@ -168,7 +168,7 @@ Download the latest release from the [GitHub Releases page](https://github.com/k
 
 ## How Claude Uses Olaf
 
-Once Olaf is connected, Claude can see all 8 tools and decides on its own whether to call them — you don't need to mention them in every prompt.
+Once Olaf is connected, Claude can see all 9 tools and decides on its own whether to call them — you don't need to mention them in every prompt.
 
 **The short version:** task-oriented prompts trigger Olaf automatically; vague prompts may not.
 
@@ -262,7 +262,8 @@ Once connected, Claude can use these tools:
 | `run_pipeline` | Run context retrieval and impact analysis in one call; faster than orchestrating `get_context` + `get_impact` separately |
 | `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
 | `save_observation` | Store an insight or decision linked to a symbol FQN or file path |
-| `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol |
+| `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol; supports `sort_mode` for relevance-ranked retrieval |
+| `trace_flow` | Trace execution paths between two symbols through the dependency graph |
 | `list_restore_points` | Pre-edit snapshots for a file, sorted newest-first |
 | `undo_change` | Restore a file to a specific snapshot; records a decision observation |
 
