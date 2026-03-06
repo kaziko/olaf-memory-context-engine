@@ -20,8 +20,39 @@ pub(crate) enum ToolError {
 pub(crate) fn list() -> Vec<Value> {
     vec![
         serde_json::json!({
+            "name": "get_brief",
+            "description": "Get a context brief for any task. Runs context retrieval automatically; includes impact analysis when symbol_fqn is provided. Start here — use get_context or get_impact only when you need fine-grained control.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "Natural language description of the task, e.g. 'fix bug in auth module'"
+                    },
+                    "file_hints": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths or partial paths to prioritize as pivot symbols"
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Maximum tokens for the combined response (default: 4000)"
+                    },
+                    "symbol_fqn": {
+                        "type": "string",
+                        "description": "Optional: FQN of primary symbol for impact analysis (e.g. 'src/auth.rs::authenticate'). Omit to skip impact graph."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Impact traversal depth (default: 3, max: 10)"
+                    }
+                },
+                "required": ["intent"]
+            }
+        }),
+        serde_json::json!({
             "name": "get_context",
-            "description": "Get a token-budgeted context brief for a given intent. Triggers incremental re-index before building the response.",
+            "description": "Token-budgeted context brief for a given intent. For most tasks, prefer get_brief which wraps this with optional impact analysis. Use get_context when you need context-only retrieval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -44,7 +75,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_impact",
-            "description": "Find symbols that call, extend, or implement a given symbol FQN. Note: import relationships are not tracked in the index.",
+            "description": "Find symbols that call, extend, or implement a given symbol FQN. Note: import relationships are not tracked. For combined context+impact, use get_brief with symbol_fqn. Use get_impact when you already have a specific symbol and want only its dependents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -72,6 +103,19 @@ pub(crate) fn list() -> Vec<Value> {
                     }
                 },
                 "required": ["file_path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "trace_flow",
+            "description": "Find execution paths between two symbols in the call graph. Traverses calls/extends/implements edges. Returns shortest paths up to max_paths.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_fqn": { "type": "string", "description": "FQN of the starting symbol, e.g. 'src/auth.rs::login'" },
+                    "target_fqn": { "type": "string", "description": "FQN of the destination symbol, e.g. 'src/db.rs::query'" },
+                    "max_paths":  { "type": "integer", "description": "Maximum paths to return (default: 5, max: 20)" }
+                },
+                "required": ["source_fqn", "target_fqn"]
             }
         }),
         serde_json::json!({
@@ -167,50 +211,6 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["file_path", "snapshot_id"]
             }
         }),
-        serde_json::json!({
-            "name": "trace_flow",
-            "description": "Find execution paths between two symbols in the call graph. Traverses calls/extends/implements edges. Returns shortest paths up to max_paths.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "source_fqn": { "type": "string", "description": "FQN of the starting symbol, e.g. 'src/auth.rs::login'" },
-                    "target_fqn": { "type": "string", "description": "FQN of the destination symbol, e.g. 'src/db.rs::query'" },
-                    "max_paths":  { "type": "integer", "description": "Maximum paths to return (default: 5, max: 20)" }
-                },
-                "required": ["source_fqn", "target_fqn"]
-            }
-        }),
-        serde_json::json!({
-            "name": "run_pipeline",
-            "description": "Run context retrieval and impact analysis in one call. Returns a unified brief for a given intent. Faster than orchestrating get_context + get_impact separately.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "description": "Natural language description of the task, e.g. 'fix bug in auth module'"
-                    },
-                    "file_hints": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional file paths or partial paths to prioritize as pivot symbols"
-                    },
-                    "token_budget": {
-                        "type": "integer",
-                        "description": "Maximum tokens for the combined response (default: 4000)"
-                    },
-                    "symbol_fqn": {
-                        "type": "string",
-                        "description": "Optional: FQN of primary symbol for impact analysis (e.g. 'src/auth.rs::authenticate'). Omit to skip impact graph."
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "description": "Impact traversal depth (default: 3, max: 10)"
-                    }
-                },
-                "required": ["intent"]
-            }
-        }),
     ]
 }
 
@@ -232,7 +232,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "get_session_history"  => handle_get_session_history(conn, args),
         "list_restore_points"  => handle_list_restore_points(project_root, args),
         "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
-        "run_pipeline"         => handle_run_pipeline(conn, project_root, args),
+        "get_brief"            => handle_get_brief(conn, project_root, args),
         "trace_flow"           => handle_trace_flow(conn, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
@@ -620,7 +620,7 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
 /// keeps `max_bytes = budget * 4` well within usize range on 32-bit targets (4 GB limit).
 const MAX_TOKEN_BUDGET: u64 = 1_000_000;
 
-fn handle_run_pipeline(
+fn handle_get_brief(
     conn: &mut rusqlite::Connection,
     project_root: &Path,
     args: Option<&Value>,
@@ -767,12 +767,30 @@ mod tests {
         assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
-    // 3.5 — list() contains exactly one entry with name "run_pipeline"
+    // 3.5 — list() contains exactly one entry with name "get_brief" and it is first
     #[test]
-    fn test_list_contains_run_pipeline() {
+    fn test_list_contains_get_brief() {
         let tools = list();
-        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "run_pipeline").collect();
-        assert_eq!(matches.len(), 1, "list() must contain exactly one run_pipeline entry");
+        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "get_brief").collect();
+        assert_eq!(matches.len(), 1, "list() must contain exactly one get_brief entry");
+        assert_eq!(tools[0]["name"], "get_brief", "get_brief must be the first tool in list()");
+    }
+
+    // 3.5b — descriptions contain expected hierarchy language
+    #[test]
+    fn test_tool_description_hierarchy() {
+        let tools = list();
+        let get_brief = tools.iter().find(|t| t["name"] == "get_brief").expect("get_brief missing");
+        let get_context = tools.iter().find(|t| t["name"] == "get_context").expect("get_context missing");
+        let get_impact = tools.iter().find(|t| t["name"] == "get_impact").expect("get_impact missing");
+
+        let brief_desc = get_brief["description"].as_str().unwrap();
+        let ctx_desc = get_context["description"].as_str().unwrap();
+        let impact_desc = get_impact["description"].as_str().unwrap();
+
+        assert!(brief_desc.contains("Start here"), "get_brief description must contain 'Start here'");
+        assert!(ctx_desc.contains("prefer get_brief"), "get_context description must contain 'prefer get_brief'");
+        assert!(impact_desc.contains("use get_brief with symbol_fqn"), "get_impact description must reference 'use get_brief with symbol_fqn'");
     }
 
     // 3.6 — truncation logic: 2000 ASCII chars (500 est-tokens), budget 100
@@ -793,7 +811,7 @@ mod tests {
         // "—" (U+2014 EM DASH) is 3 bytes in UTF-8
         let em_dash = "\u{2014}";
         // Build a string long enough to require truncation. Use budget=20 (max_bytes=80)
-        // so the NOTE (42 bytes) fits. handle_run_pipeline always clamps to max(100) anyway.
+        // so the NOTE (42 bytes) fits. handle_get_brief always clamps to max(100) anyway.
         let mut s = em_dash.repeat(200); // 600 bytes = 150 est-tokens
         let budget = 20;
         truncate_to_budget(&mut s, budget);

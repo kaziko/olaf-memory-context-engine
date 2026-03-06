@@ -96,10 +96,10 @@ Claude Code reads `.mcp.json` on startup and connects to the Olaf MCP server aut
 In Claude Code, try:
 
 ```
-Use run_pipeline to understand the authentication module
+Use get_brief to understand the authentication module
 ```
 
-Claude calls the `run_pipeline` MCP tool, which retrieves a token-budgeted context brief and impact analysis in one call — covering relevant symbols, their dependencies, and any saved observations for that area of the codebase.
+Claude calls the `get_brief` MCP tool, which retrieves a token-budgeted context brief with optional impact analysis — covering relevant symbols, their dependencies, and any saved observations for that area of the codebase.
 
 You can also use individual tools for targeted queries: `get_context` for context only, `get_impact` for impact analysis only.
 
@@ -180,7 +180,7 @@ Refactor the session compression module
 What does the payment service depend on?
 ```
 
-Claude recognizes these as codebase tasks and will call `run_pipeline` or `get_context` to gather context before answering.
+Claude recognizes these as codebase tasks and will call `get_brief` to gather context before answering.
 
 ### How Olaf reads your intent
 
@@ -209,7 +209,7 @@ Vague prompts don't give Claude enough signal. It may fall back to reading files
 Add an explicit instruction:
 
 ```
-Use run_pipeline to understand the authentication module, then help me fix the login bug
+Use get_brief to understand the authentication module, then help me fix the login bug
 ```
 
 This guarantees Olaf is used and Claude starts with a full picture of the relevant code.
@@ -259,7 +259,7 @@ Once connected, Claude can use these tools:
 | `get_context` | Token-budgeted context brief for a task; triggers incremental re-index |
 | `get_impact` | Find symbols that call, extend, or implement a given symbol FQN |
 | `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies) |
-| `run_pipeline` | Run context retrieval and impact analysis in one call; faster than orchestrating `get_context` + `get_impact` separately |
+| `get_brief` | Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Start here — use `get_context` or `get_impact` for fine-grained control |
 | `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
 | `save_observation` | Store an insight or decision linked to a symbol FQN or file path |
 | `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol; supports `sort_mode` for relevance-ranked retrieval |

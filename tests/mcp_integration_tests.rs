@@ -742,10 +742,10 @@ fn test_get_file_skeleton_zero_symbols_returns_informative_message() {
 
 // 3.1 — happy-path sections: context header, separator, no-symbol fallback, no error
 #[test]
-fn test_run_pipeline_sections_present() {
+fn test_get_brief_sections_present() {
     let req = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": "run_pipeline", "arguments": { "intent": "test" } }
+        "params": { "name": "get_brief", "arguments": { "intent": "test" } }
     });
     let responses = run_requests(&[req]);
     assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
@@ -757,11 +757,11 @@ fn test_run_pipeline_sections_present() {
 
 // 3.2 — AC2 empty index graceful: no error, separator present, no-symbol fallback present
 #[test]
-fn test_run_pipeline_empty_index_no_error() {
+fn test_get_brief_empty_index_no_error() {
     // run_requests uses an empty tmpdir — no index, no sessions
     let req = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": { "name": "run_pipeline", "arguments": { "intent": "test" } }
+        "params": { "name": "get_brief", "arguments": { "intent": "test" } }
         // no symbol_fqn
     });
     let responses = run_requests(&[req]);
@@ -774,10 +774,10 @@ fn test_run_pipeline_empty_index_no_error() {
 
 // 3.3 — AC3 budget compliance: token_budget=200, output must not exceed it
 #[test]
-fn test_run_pipeline_respects_token_budget() {
+fn test_get_brief_respects_token_budget() {
     let req = serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": { "name": "run_pipeline", "arguments": { "intent": "test", "token_budget": 200 } }
+        "params": { "name": "get_brief", "arguments": { "intent": "test", "token_budget": 200 } }
     });
     let responses = run_requests(&[req]);
     assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
@@ -791,11 +791,11 @@ fn test_run_pipeline_respects_token_budget() {
 
 // 3.4b — symbol_fqn branch: passes fqn+depth, get_impact path exercised, no error returned
 #[test]
-fn test_run_pipeline_with_symbol_fqn() {
+fn test_get_brief_with_symbol_fqn() {
     let req = serde_json::json!({
         "jsonrpc": "2.0", "id": 10, "method": "tools/call",
         "params": {
-            "name": "run_pipeline",
+            "name": "get_brief",
             "arguments": {
                 "intent": "test",
                 "symbol_fqn": "src/lib.rs::some_fn",
@@ -812,14 +812,37 @@ fn test_run_pipeline_with_symbol_fqn() {
     assert!(!text.contains("No primary symbol specified"), "symbol_fqn was provided, fallback must not appear");
 }
 
-// 3.4 — tools/list includes run_pipeline
+// 3.4 — tools/list includes get_brief as first tool (AC: #2, #3)
 #[test]
-fn test_tools_list_includes_run_pipeline() {
+fn test_tools_list_includes_get_brief() {
     let req = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}});
     let responses = run_requests(&[req]);
     let tools = responses[0]["result"]["tools"].as_array().expect("tools must be array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.contains(&"run_pipeline"), "tools/list must include run_pipeline");
+    assert!(names.contains(&"get_brief"), "tools/list must include get_brief");
+    assert_eq!(tools[0]["name"], "get_brief", "get_brief must be the first tool in tools/list response");
+}
+
+// 5.2 — regression: run_pipeline returns -32601 UnknownTool after rename (AC: #2)
+#[test]
+fn test_run_pipeline_returns_unknown_tool_error() {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": { "name": "run_pipeline", "arguments": { "intent": "test" } }
+    });
+    let responses = run_requests(&[req]);
+    let error = responses[0].get("error").expect("run_pipeline must return an error after rename");
+    assert_eq!(
+        error["code"].as_i64().unwrap_or(0),
+        -32601,
+        "error code must be -32601 (method not found / unknown tool); got: {}",
+        error
+    );
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("run_pipeline"),
+        "error message must mention the tool name 'run_pipeline'; got: {msg}"
+    );
 }
 
 // ─── Story 7.2 Tests ──────────────────────────────────────────────────────────

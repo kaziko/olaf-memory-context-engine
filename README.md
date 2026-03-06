@@ -62,7 +62,7 @@ olaf init
 - `get_context` — retrieve indexed summaries for files relevant to your task
 - `get_impact` — find files that reference a given symbol or path
 - `get_file_skeleton` — get the structure (functions, classes, exports) of a file
-- `run_pipeline` — run context retrieval and impact analysis in one call
+- `get_brief` — get a context brief for any task; includes impact analysis when `symbol_fqn` is provided
 - `index_status` — check indexing coverage and freshness
 - `save_observation` — store a session note for future recall
 - `get_session_history` — retrieve observations and changes from recent sessions; supports relevance-ranked sorting
