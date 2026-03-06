@@ -1,4 +1,4 @@
-use olaf::parser::{EdgeKind, Language, detect_language, parse_file};
+use olaf::parser::{EdgeKind, Language, SymbolKind, detect_language, parse_file};
 
 #[test]
 fn test_detect_language_extensions() {
@@ -642,4 +642,98 @@ fn test_php_unbraced_namespace_applies_to_subsequent_declarations() {
         "Y must also be in namespace A — unbraced namespace continues for all siblings; got: {:?}",
         fqns
     );
+}
+
+// ──── Story 9.2: Go parser ────
+
+#[test]
+fn test_detect_language_go() {
+    assert!(matches!(detect_language("foo.go"), Some(Language::Go)));
+    assert!(matches!(detect_language("cmd/main.go"), Some(Language::Go)));
+}
+
+#[test]
+fn test_parse_go_exact_symbol_set() {
+    let source = std::fs::read("tests/fixtures/go/sample.go").unwrap();
+    let (symbols, _) = parse_file("tests/fixtures/go/sample.go", &source).unwrap();
+
+    let mut fqns: Vec<String> = symbols.iter().map(|s| s.fqn.clone()).collect();
+    fqns.sort();
+    assert_eq!(
+        fqns,
+        vec![
+            "tests/fixtures/go/sample.go::Config",
+            "tests/fixtures/go/sample.go::Config::String",
+            "tests/fixtures/go/sample.go::Config::Validate",
+            "tests/fixtures/go/sample.go::DefaultTimeout",
+            "tests/fixtures/go/sample.go::Env",
+            "tests/fixtures/go/sample.go::MaxRetries",
+            "tests/fixtures/go/sample.go::NewConfig",
+            "tests/fixtures/go/sample.go::StringAlias",
+            "tests/fixtures/go/sample.go::Stringer",
+            "tests/fixtures/go/sample.go::Version",
+        ],
+        "exact Go symbol set mismatch"
+    );
+}
+
+#[test]
+fn test_parse_go_symbol_kinds() {
+    let source = std::fs::read("tests/fixtures/go/sample.go").unwrap();
+    let (symbols, _) = parse_file("tests/fixtures/go/sample.go", &source).unwrap();
+    let find_kind = |fqn: &str| {
+        symbols
+            .iter()
+            .find(|s| s.fqn == fqn)
+            .map(|s| s.kind.clone())
+            .unwrap_or_else(|| panic!("symbol not found: {fqn}"))
+    };
+
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::MaxRetries"),
+        SymbolKind::Variable
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::DefaultTimeout"),
+        SymbolKind::Variable,
+        "multi-name const must produce Variable for each name"
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::Config"),
+        SymbolKind::Class
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::Stringer"),
+        SymbolKind::Interface
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::StringAlias"),
+        SymbolKind::TypeAlias
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::NewConfig"),
+        SymbolKind::Function
+    );
+    assert_eq!(
+        find_kind("tests/fixtures/go/sample.go::Config::Validate"),
+        SymbolKind::Method
+    );
+}
+
+#[test]
+fn test_parse_go_import_edges() {
+    let source = std::fs::read("tests/fixtures/go/sample.go").unwrap();
+    let (_, edges) = parse_file("tests/fixtures/go/sample.go", &source).unwrap();
+
+    let import_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Imports).collect();
+    let targets: Vec<&str> = import_edges.iter().map(|e| e.target_fqn.as_str()).collect();
+
+    assert!(targets.contains(&"fmt"), "missing fmt import; got {targets:?}");
+    assert!(targets.contains(&"os"), "missing os import; got {targets:?}");
+    for e in &import_edges {
+        assert_eq!(
+            e.source_fqn, "tests/fixtures/go/sample.go",
+            "import edge source must be file path"
+        );
+    }
 }

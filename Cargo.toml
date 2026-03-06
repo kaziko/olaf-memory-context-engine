@@ -19,6 +19,7 @@ tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-php = "0.24"
+tree-sitter-go = "0.25"
 rusqlite = { version = "0.38", features = ["bundled"] }
 rusqlite_migration = "2.4"
 blake3 = "1.8"

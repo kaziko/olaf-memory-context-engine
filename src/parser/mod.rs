@@ -1,3 +1,4 @@
+pub(crate) mod go;
 pub(crate) mod php;
 pub(crate) mod python;
 pub(crate) mod rust_lang;
@@ -16,6 +17,7 @@ pub enum Language {
     Python,
     Rust,
     Php,
+    Go,
 }
 
 /// Detect language from relative file path extension.
@@ -30,6 +32,7 @@ pub fn detect_language(relative_path: &str) -> Option<Language> {
         "py" => Some(Language::Python),
         "rs" => Some(Language::Rust),
         "php" => Some(Language::Php),
+        "go" => Some(Language::Go),
         _ => None,
     }
 }
@@ -59,5 +62,6 @@ pub fn parse_file(
         Language::Python => python::parse(relative_path, source),
         Language::Rust => rust_lang::parse(relative_path, source),
         Language::Php => php::parse(relative_path, source),
+        Language::Go => go::parse(relative_path, source),
     }
 }

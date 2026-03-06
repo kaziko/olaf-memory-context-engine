@@ -94,6 +94,7 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
             Some(parser::Language::Python) => "python",
             Some(parser::Language::Rust) => "rust",
             Some(parser::Language::Php) => "php",
+            Some(parser::Language::Go) => "go",
             None => {
                 log::debug!("unsupported extension, skipping: {}", relative_path);
                 continue;
