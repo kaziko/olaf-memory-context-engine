@@ -4,7 +4,7 @@
 
 **Codebase context engine for Claude Code & Codex (soon).**
 
-Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request. Olaf also captures session observations and can restore files to pre-edit snapshots via built-in undo support.
+Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP, Go), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request. Olaf also captures session observations and can restore files to pre-edit snapshots via built-in undo support.
 
 ## Install
 
