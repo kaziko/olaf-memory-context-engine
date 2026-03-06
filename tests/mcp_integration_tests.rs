@@ -888,3 +888,206 @@ fn test_trace_flow_returns_path_for_connected_symbols() {
     assert!(text.contains("app.ts::main"), "path must include source; got: {text}");
     assert!(text.contains("app.ts::helper"), "path must include target; got: {text}");
 }
+
+// ─── Story 7.3 Tests ──────────────────────────────────────────────────────────
+
+/// Creates a TempDir with the given TypeScript source written to `app.ts`,
+/// runs `olaf index` in that dir, and returns the TempDir.
+/// Caller must keep the return value alive for the duration of the test.
+fn prepare_ts_tmpdir(source: &str) -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmpdir.path().join("app.ts"), source).expect("write app.ts");
+    let out = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index");
+    assert!(out.status.success(), "olaf index failed: {}", String::from_utf8_lossy(&out.stderr));
+    tmpdir
+}
+
+// Task 2 — AC1: missing target_fqn returns -32602
+#[test]
+fn test_trace_flow_missing_target_fqn_returns_32602() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "src/a.rs::foo"
+            // target_fqn intentionally absent
+        }}
+    })]);
+    assert_eq!(responses[0]["error"]["code"], -32602, "missing target_fqn must return -32602");
+}
+
+// Task 3 — AC2: source_fqn == target_fqn returns identity path with exactly one node
+#[test]
+fn test_trace_flow_source_equals_target() {
+    let tmpdir = prepare_indexed_tmpdir();
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "src/lib.rs::add",
+            "target_fqn": "src/lib.rs::add"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("1 path(s) found"), "must report 1 path; got: {text}");
+    let path_sec = &text[text.find("### Path 1 (0 hops)").expect("must have 0-hop header")..];
+    assert_eq!(
+        path_sec.matches("\n- `").count(), 1,
+        "identity path must list exactly one node; got path section: {path_sec}"
+    );
+}
+
+// Task 4 — AC3: disconnected symbols return "No execution path found"
+#[test]
+fn test_trace_flow_no_path_between_symbols() {
+    let tmpdir = prepare_ts_tmpdir("export function alpha() {}\nexport function beta() {}");
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::alpha",
+            "target_fqn": "app.ts::beta"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("No execution path found"), "must report no path; got: {text}");
+}
+
+// Task 5 — AC4: two-hop path with ordered node assertions
+#[test]
+fn test_trace_flow_two_hop_path() {
+    let tmpdir = prepare_ts_tmpdir(
+        "export function c() {}\nexport function b() { c(); }\nexport function a() { b(); }"
+    );
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::a",
+            "target_fqn": "app.ts::c"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("1 path(s) found"), "must find 1 path; got: {text}");
+    assert!(text.contains("2 hop"), "must show 2 hops; got: {text}");
+    // Slice from "### Path 1" to avoid false matches in the header line
+    let path_sec = &text[text.find("### Path 1").expect("path section")..];
+    let pa = path_sec.find("app.ts::a").expect("a in path");
+    let pb = path_sec.find("app.ts::b").expect("b in path");
+    let pc = path_sec.find("app.ts::c").expect("c in path");
+    assert!(pa < pb, "a must precede b in path listing");
+    assert!(pb < pc, "b must precede c in path listing");
+}
+
+// Task 6 — AC5: max_paths limits returned paths
+#[test]
+fn test_trace_flow_max_paths_honored() {
+    let tmpdir = prepare_ts_tmpdir(
+        "export function tgt() {}\n\
+         export function via1() { tgt(); }\n\
+         export function via2() { tgt(); }\n\
+         export function start() { via1(); via2(); }"
+    );
+    // Without max_paths: expect 2 paths
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::start",
+            "target_fqn": "app.ts::tgt"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("2 path(s) found"), "without max_paths must find 2 paths; got: {text}");
+
+    // With max_paths=1: expect exactly 1 path
+    let responses2 = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::start",
+            "target_fqn": "app.ts::tgt",
+            "max_paths": 1
+        }}
+    })]);
+    assert!(responses2[0].get("error").is_none(), "must not have error; got: {}", responses2[0]);
+    let text2 = responses2[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text2.contains("1 path(s) found"), "max_paths=1 must return exactly 1 path; got: {text2}");
+}
+
+// Task 7 — AC6: extends edges are traversed
+#[test]
+fn test_trace_flow_extends_edge_traversed() {
+    let tmpdir = prepare_ts_tmpdir(
+        "export class Base {}\nexport class Child extends Base {}"
+    );
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::Child",
+            "target_fqn": "app.ts::Base"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not have error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("path(s) found"),
+        "extends edge must produce a path; got: {text}"
+    );
+    assert!(
+        !text.contains("No execution path found"),
+        "must not say no path when extends edge exists; got: {text}"
+    );
+}
+
+// Task 8 — AC5 extended: max_paths boundary conditions
+#[test]
+fn test_trace_flow_max_paths_boundary() {
+    let tmpdir = prepare_ts_tmpdir(
+        "export function tgt() {}\n\
+         export function via1() { tgt(); }\n\
+         export function via2() { tgt(); }\n\
+         export function start() { via1(); via2(); }"
+    );
+
+    // max_paths=0 clamps to 1 internally; must return "1 path(s) found"
+    let r0 = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::start",
+            "target_fqn": "app.ts::tgt",
+            "max_paths": 0
+        }}
+    })]);
+    assert!(r0[0].get("error").is_none(), "max_paths=0 must not error; got: {}", r0[0]);
+    let t0 = r0[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(t0.contains("1 path(s) found"), "max_paths=0 clamps to 1; got: {t0}");
+
+    // max_paths=25 clamps to MAX_PATHS_LIMIT=20; fixture has 2 paths (well under cap)
+    let r25 = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::start",
+            "target_fqn": "app.ts::tgt",
+            "max_paths": 25
+        }}
+    })]);
+    assert!(r25[0].get("error").is_none(), "max_paths=25 must not error; got: {}", r25[0]);
+    let t25 = r25[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(t25.contains("2 path(s) found"), "max_paths=25 clamps to 20, fixture has 2 paths; got: {t25}");
+
+    // max_paths as invalid string "bad" → as_u64() returns None, falls back to default (5)
+    let rbad = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "app.ts::start",
+            "target_fqn": "app.ts::tgt",
+            "max_paths": "bad"
+        }}
+    })]);
+    assert!(rbad[0].get("error").is_none(), "max_paths='bad' must not error; got: {}", rbad[0]);
+    let tbad = rbad[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(tbad.contains("2 path(s) found"), "max_paths='bad' falls back to default (5), fixture has 2 paths; got: {tbad}");
+}
