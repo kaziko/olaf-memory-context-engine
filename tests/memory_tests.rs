@@ -1589,3 +1589,265 @@ fn test_session_end_concurrent_produces_exactly_one_anti_pattern() {
         .unwrap();
     assert_eq!(count, 1, "BEGIN IMMEDIATE must serialize: exactly 1 anti_pattern regardless of race outcome");
 }
+
+// ─── Story 8.1 Integration Tests ──────────────────────────────────────────────
+
+fn get_history_request_with_sort(
+    id: i64,
+    symbol_fqn: Option<&str>,
+    file_path: Option<&str>,
+    sessions_back: Option<i64>,
+    sort_mode: Option<&str>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({});
+    if let Some(fqn) = symbol_fqn {
+        args["symbol_fqn"] = serde_json::json!(fqn);
+    }
+    if let Some(fp) = file_path {
+        args["file_path"] = serde_json::json!(fp);
+    }
+    if let Some(sb) = sessions_back {
+        args["sessions_back"] = serde_json::json!(sb);
+    }
+    if let Some(sm) = sort_mode {
+        args["sort_mode"] = serde_json::json!(sm);
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "get_session_history", "arguments": args }
+    })
+}
+
+#[test]
+fn test_session_mode_shows_scores_and_session_headers() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "first finding", Some("f::foo"), None),
+        save_obs_request(2, "decision", "second finding", None, Some("src/a.rs")),
+        get_history_request_with_sort(3, None, None, None, Some("session")),
+    ]);
+    let text = extract_text(&responses[2]);
+    assert!(text.contains("## Session"), "must include session headers; got: {text}");
+    assert!(text.contains("[score:"), "must include score annotations; got: {text}");
+    assert!(text.contains("[insight]"), "must show kind; got: {text}");
+    assert!(text.contains("first finding"), "must include first obs; got: {text}");
+    assert!(text.contains("Relevance:"), "must include relevance footer; got: {text}");
+}
+
+#[test]
+fn test_session_mode_default_when_omitted() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "test obs", Some("f::x"), None),
+        get_history_request_with_sort(2, None, None, None, None),
+    ]);
+    let text = extract_text(&responses[1]);
+    // Default should behave like session mode: session headers present
+    assert!(text.contains("## Session"), "default must use session mode; got: {text}");
+    assert!(text.contains("[score:"), "default must include scores; got: {text}");
+}
+
+#[test]
+fn test_relevance_mode_flat_ranked_no_session_headers() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "alpha obs", Some("f::a"), None),
+        save_obs_request(2, "decision", "beta obs", None, Some("src/b.rs")),
+        get_history_request_with_sort(3, None, None, None, Some("relevance")),
+    ]);
+    let text = extract_text(&responses[2]);
+    assert!(!text.contains("## Session"), "relevance mode must NOT have session headers; got: {text}");
+    assert!(text.contains("Relevance Ranked"), "must have relevance header; got: {text}");
+    assert!(text.contains("1. [score:"), "must have numbered ranked entries; got: {text}");
+    assert!(text.contains("Relevance:"), "must have relevance footer; got: {text}");
+
+    // Scores should be in descending order
+    let scores: Vec<f64> = text.lines()
+        .filter_map(|l| {
+            let start = l.find("[score: ")?;
+            let rest = &l[start + 8..];
+            rest[..rest.find(']').unwrap_or(0)].parse::<f64>().ok()
+        })
+        .collect();
+    for pair in scores.windows(2) {
+        assert!(pair[0] >= pair[1], "scores must be descending: {:.2} >= {:.2}", pair[0], pair[1]);
+    }
+}
+
+#[test]
+fn test_invalid_sort_mode_returns_error() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request_with_sort(1, None, None, None, Some("invalid")),
+    ]);
+    let error = &responses[0]["error"];
+    assert!(error.is_object(), "must return error for invalid sort_mode; got: {:?}", responses[0]);
+    assert_eq!(error["code"], -32602, "must return -32602 InvalidParams; got: {:?}", error);
+}
+
+#[test]
+fn test_relevance_mode_stale_after_nonstale_at_similar_scores() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Save two observations
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "fresh finding", Some("f::fresh"), None),
+        save_obs_request(2, "insight", "stale finding", Some("f::stale"), None),
+    ]);
+    assert!(responses[0]["result"].is_object());
+    assert!(responses[1]["result"].is_object());
+
+    // Mark second observation stale
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE observations SET is_stale = 1, stale_reason = 'source changed' WHERE content = 'stale finding'",
+        [],
+    ).unwrap();
+    drop(conn);
+
+    // Query in relevance mode
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request_with_sort(1, None, None, Some(2), Some("relevance")),
+    ]);
+    let text = extract_text(&responses[0]);
+
+    // Fresh should appear before stale
+    let fresh_pos = text.find("fresh finding").expect("must contain fresh finding");
+    let stale_pos = text.find("stale finding").expect("must contain stale finding");
+    assert!(fresh_pos < stale_pos, "non-stale must appear before stale; fresh@{fresh_pos} stale@{stale_pos}");
+    assert!(text.contains("STALE"), "must show stale marker; got: {text}");
+}
+
+#[test]
+fn test_relevance_mode_sorts_before_truncation() {
+    // Regression test: relevance mode must sort ALL fetched observations by score,
+    // then truncate to 200. Previously it truncated first, losing high-relevance items.
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Save 1 observation via MCP to bootstrap the DB
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "bootstrap", Some("f::x"), None),
+    ]);
+    assert!(responses[0]["result"].is_object());
+
+    // Directly insert 210 observations: 205 old (30 days) + 5 very recent (1 min ago)
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+    // Get the session_id from the bootstrap observation
+    let session_id: String = conn.query_row(
+        "SELECT session_id FROM observations LIMIT 1", [], |r| r.get(0),
+    ).unwrap();
+
+    // Insert 205 old observations (30 days ago) — these will have low scores
+    for i in 0..205 {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, is_stale, stale_reason) \
+             VALUES (?1, ?2, 'insight', ?3, NULL, NULL, 0, 0, NULL)",
+            rusqlite::params![session_id, now - 30 * 86400, format!("old-obs-{i}")],
+        ).unwrap();
+    }
+
+    // Insert 5 very recent observations (1 minute ago) — these will have high scores
+    for i in 0..5 {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, is_stale, stale_reason) \
+             VALUES (?1, ?2, 'insight', ?3, NULL, NULL, 0, 0, NULL)",
+            rusqlite::params![session_id, now - 60, format!("RECENT-obs-{i}")],
+        ).unwrap();
+    }
+    drop(conn);
+
+    // Query in relevance mode — should surface the 5 recent ones in top results
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request_with_sort(1, None, None, Some(5), Some("relevance")),
+    ]);
+    let text = extract_text(&responses[0]);
+
+    // All 5 recent observations must appear (they have highest scores)
+    for i in 0..5 {
+        assert!(
+            text.contains(&format!("RECENT-obs-{i}")),
+            "recent obs {i} must appear in top 200; got: {text}"
+        );
+    }
+
+    // The first 5 ranked items should all be RECENT (highest scores)
+    let lines: Vec<&str> = text.lines()
+        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+        .take(6) // bootstrap + 5 recent
+        .collect();
+    let recent_in_top = lines.iter().filter(|l| l.contains("RECENT-obs-")).count();
+    assert!(recent_in_top >= 5, "all 5 recent observations must be in top ranks; found {recent_in_top} in top lines");
+}
+
+#[test]
+fn test_relevance_mode_header_reflects_actual_sessions() {
+    // The relevance header must show the count of sessions actually present in
+    // the displayed results, not the requested sessions_back value.
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Save observations — all go into the same session (single server invocation)
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "only session obs", Some("f::x"), None),
+        // Request 10 sessions back but only 1 session exists
+        get_history_request_with_sort(2, None, None, Some(10), Some("relevance")),
+    ]);
+    let text = extract_text(&responses[1]);
+
+    // Header should say "from 1 sessions", not "from 10 sessions"
+    assert!(
+        text.contains("from 1 sessions"),
+        "header must reflect actual session count (1), not requested (10); got: {text}"
+    );
+}
+
+#[test]
+fn test_relevance_mode_tiebreak_newest_first() {
+    // At equal score and equal staleness, newer observations should rank first.
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Bootstrap DB
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "bootstrap", Some("f::x"), None),
+    ]);
+    assert!(responses[0]["result"].is_object());
+
+    // Insert two observations with identical age characteristics but different created_at
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+    let session_id: String = conn.query_row(
+        "SELECT session_id FROM observations LIMIT 1", [], |r| r.get(0),
+    ).unwrap();
+
+    // Both 3 days old, but OLDER is 1 hour older than NEWER
+    // They'll have nearly identical scores, so tiebreak by created_at should apply
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, is_stale, stale_reason) \
+         VALUES (?1, ?2, 'insight', 'OLDER-tiebreak', NULL, NULL, 0, 0, NULL)",
+        rusqlite::params![session_id, now - 3 * 86400 - 3600],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, is_stale, stale_reason) \
+         VALUES (?1, ?2, 'insight', 'NEWER-tiebreak', NULL, NULL, 0, 0, NULL)",
+        rusqlite::params![session_id, now - 3 * 86400],
+    ).unwrap();
+    drop(conn);
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request_with_sort(1, None, None, Some(5), Some("relevance")),
+    ]);
+    let text = extract_text(&responses[0]);
+
+    let newer_pos = text.find("NEWER-tiebreak").expect("must contain NEWER-tiebreak");
+    let older_pos = text.find("OLDER-tiebreak").expect("must contain OLDER-tiebreak");
+    assert!(
+        newer_pos < older_pos,
+        "at equal score, newer must rank before older; newer@{newer_pos} older@{older_pos}"
+    );
+}

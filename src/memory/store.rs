@@ -101,6 +101,37 @@ pub fn is_sensitive_path(path: &str) -> bool {
     false
 }
 
+#[derive(Debug)]
+pub(crate) struct ScoredObservation {
+    pub(crate) obs: ObservationRow,
+    pub(crate) relevance_score: f64,
+}
+
+/// Score observations by recency (90% weight) and staleness (10% weight).
+/// Recency uses absolute exponential decay with 7-day half-life: `0.5^(age_days / 7.0)`.
+/// Score is request-scoped — not stored in DB.
+pub(crate) fn score_observations(observations: Vec<ObservationRow>) -> Vec<ScoredObservation> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as f64;
+
+    observations
+        .into_iter()
+        .map(|obs| {
+            let age_secs = (now_secs - obs.created_at as f64).max(0.0);
+            let age_days = age_secs / 86400.0;
+            let recency = 0.5_f64.powf(age_days / 7.0);
+            let staleness = if obs.is_stale { 0.0 } else { 1.0 };
+            let score = (0.90 * recency + 0.10 * staleness).clamp(0.0, 1.0);
+            ScoredObservation {
+                obs,
+                relevance_score: score,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn get_recent_session_ids(
     conn: &Connection,
     limit: usize,
@@ -832,5 +863,104 @@ mod tests {
             .query_row("SELECT compressed FROM sessions WHERE id = 's1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(compressed, 1, "session must be marked compressed");
+    }
+
+    // ─── Story 8.1 Unit Tests ────────────────────────────────────────────────────
+
+    fn make_obs(created_at: i64, is_stale: bool, stale_reason: Option<&str>) -> ObservationRow {
+        ObservationRow {
+            id: 1,
+            session_id: "s1".into(),
+            created_at,
+            kind: "insight".into(),
+            content: "test".into(),
+            symbol_fqn: None,
+            file_path: None,
+            is_stale,
+            stale_reason: stale_reason.map(|s| s.to_string()),
+        }
+    }
+
+    fn now_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn test_score_recency_ordering() {
+        let now = now_epoch();
+        let recent = make_obs(now - 3600, false, None);       // 1 hour old
+        let old = make_obs(now - 14 * 86400, false, None);    // 14 days old
+
+        let scored = score_observations(vec![recent, old]);
+        assert!(
+            scored[0].relevance_score > scored[1].relevance_score,
+            "1-hour-old ({:.4}) must score higher than 14-day-old ({:.4})",
+            scored[0].relevance_score, scored[1].relevance_score
+        );
+    }
+
+    #[test]
+    fn test_score_staleness_penalty() {
+        let now = now_epoch();
+        let fresh = make_obs(now - 86400, false, None);
+        let stale = make_obs(now - 86400, true, Some("source changed"));
+
+        let scored = score_observations(vec![fresh, stale]);
+        assert!(
+            scored[0].relevance_score > scored[1].relevance_score,
+            "non-stale ({:.4}) must score higher than same-age stale ({:.4})",
+            scored[0].relevance_score, scored[1].relevance_score
+        );
+    }
+
+    #[test]
+    fn test_score_absolute_decay_stability() {
+        let now = now_epoch();
+        let obs1 = make_obs(now - 3 * 86400, false, None);
+        let obs2 = make_obs(now - 3 * 86400, false, None);
+
+        // Score in two different result sets
+        let scored_alone = score_observations(vec![obs1]);
+        let scored_with_others = score_observations(vec![
+            make_obs(now - 100, false, None),
+            obs2,
+            make_obs(now - 30 * 86400, false, None),
+        ]);
+
+        let diff = (scored_alone[0].relevance_score - scored_with_others[1].relevance_score).abs();
+        assert!(diff < 0.01, "same observation in different sets must produce similar score (diff={:.4})", diff);
+    }
+
+    #[test]
+    fn test_score_clamping() {
+        let now = now_epoch();
+        let zero_age = make_obs(now, false, None);
+        let very_old = make_obs(0, false, None); // epoch
+
+        let scored = score_observations(vec![zero_age, very_old]);
+        for so in &scored {
+            assert!(so.relevance_score >= 0.0, "score must be >= 0.0");
+            assert!(so.relevance_score <= 1.0, "score must be <= 1.0");
+        }
+    }
+
+    #[test]
+    fn test_score_7day_half_life() {
+        let now = now_epoch();
+        let seven_days = make_obs(now - 7 * 86400, false, None);
+
+        let scored = score_observations(vec![seven_days]);
+        // Recency at 7 days = 0.5, staleness = 1.0 (non-stale)
+        // Expected: 0.90 * 0.5 + 0.10 * 1.0 = 0.55
+        let expected = 0.55;
+        let diff = (scored[0].relevance_score - expected).abs();
+        assert!(
+            diff < 0.02,
+            "7-day-old observation should score ~{:.2} but got {:.4} (diff={:.4})",
+            expected, scored[0].relevance_score, diff
+        );
     }
 }

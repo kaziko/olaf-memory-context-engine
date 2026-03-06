@@ -126,6 +126,11 @@ pub(crate) fn list() -> Vec<Value> {
                     "sessions_back": {
                         "type": "integer",
                         "description": "How many recent sessions to include (default: 5, max: 50)"
+                    },
+                    "sort_mode": {
+                        "type": "string",
+                        "description": "Presentation mode: 'session' (default, grouped by session) or 'relevance' (flat ranked by relevance score)",
+                        "enum": ["session", "relevance"]
                     }
                 }
             }
@@ -347,6 +352,13 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
     let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let file_path = args.get("file_path").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
 
+    let sort_mode = args.get("sort_mode").and_then(|v| v.as_str()).unwrap_or("session");
+    if sort_mode != "session" && sort_mode != "relevance" {
+        return Err(ToolError::InvalidParams(
+            format!("Invalid sort_mode '{}'. Must be 'session' or 'relevance'.", sort_mode),
+        ));
+    }
+
     let session_ids = crate::memory::store::get_recent_session_ids(conn, sessions_back)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
@@ -362,21 +374,33 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
     }
 
     let total = observations.len();
+    let scored = crate::memory::store::score_observations(observations);
     let capped = total.min(200);
 
-    // Group observations by session_id, preserving order
+    match sort_mode {
+        "relevance" => format_relevance_mode(&scored, capped, total),
+        _ => format_session_mode(conn, &scored, capped, total, &session_ids),
+    }
+}
+
+fn format_session_mode(
+    conn: &rusqlite::Connection,
+    scored: &[crate::memory::store::ScoredObservation],
+    capped: usize,
+    total: usize,
+    session_ids: &[String],
+) -> Result<String, ToolError> {
     let mut session_order: Vec<String> = Vec::new();
-    let mut by_session: std::collections::HashMap<String, Vec<&crate::memory::store::ObservationRow>> =
+    let mut by_session: std::collections::HashMap<String, Vec<&crate::memory::store::ScoredObservation>> =
         std::collections::HashMap::new();
 
-    for obs in observations.iter().take(capped) {
-        if !by_session.contains_key(&obs.session_id) {
-            session_order.push(obs.session_id.clone());
+    for so in scored.iter().take(capped) {
+        if !by_session.contains_key(&so.obs.session_id) {
+            session_order.push(so.obs.session_id.clone());
         }
-        by_session.entry(obs.session_id.clone()).or_default().push(obs);
+        by_session.entry(so.obs.session_id.clone()).or_default().push(so);
     }
 
-    // Pre-fetch session start times for accurate headers
     let session_timestamps: std::collections::HashMap<String, i64> = session_ids.iter().filter_map(|sid| {
         conn.query_row(
             "SELECT started_at FROM sessions WHERE id = ?1",
@@ -387,6 +411,8 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
 
     let mut output = format!("# Session History (last {} sessions)\n", session_ids.len());
     let mut stale_count = 0usize;
+    let mut min_score = f64::MAX;
+    let mut max_score = f64::MIN;
 
     for sid in &session_order {
         let ts = session_timestamps.get(sid).copied().unwrap_or(0);
@@ -397,18 +423,27 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
         output.push_str(&format!("\n## Session {} ({})\n\n", sid, dt));
 
         let obs_list = &by_session[sid];
-        for obs in obs_list {
-            if obs.is_stale {
+        for so in obs_list {
+            min_score = min_score.min(so.relevance_score);
+            max_score = max_score.max(so.relevance_score);
+
+            if so.obs.is_stale {
                 stale_count += 1;
-                let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
-                output.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {}\n", reason, obs.kind, obs.content));
+                let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
+                output.push_str(&format!(
+                    "- \u{26a0} [STALE \u{2014} {}] [{}] [score: {:.2}] {}\n",
+                    reason, so.obs.kind, so.relevance_score, so.obs.content
+                ));
             } else {
-                output.push_str(&format!("- [{}] {}\n", obs.kind, obs.content));
+                output.push_str(&format!(
+                    "- [{}] [score: {:.2}] {}\n",
+                    so.obs.kind, so.relevance_score, so.obs.content
+                ));
             }
-            if let Some(fqn) = &obs.symbol_fqn {
+            if let Some(fqn) = &so.obs.symbol_fqn {
                 output.push_str(&format!("  Symbol: {}\n", fqn));
             }
-            if let Some(fp) = &obs.file_path {
+            if let Some(fp) = &so.obs.file_path {
                 output.push_str(&format!("  File: {}\n", fp));
             }
         }
@@ -425,6 +460,80 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
         capped,
         stale_suffix
     ));
+
+    if min_score <= max_score {
+        output.push_str(&format!("Relevance: {:.2}\u{2013}{:.2}\n", min_score, max_score));
+    }
+
+    if total > 200 {
+        output.push_str(&format!(
+            "\n(Showing 200 of {} observations. Use filters to narrow results.)\n",
+            total
+        ));
+    }
+
+    Ok(output)
+}
+
+fn format_relevance_mode(
+    scored: &[crate::memory::store::ScoredObservation],
+    capped: usize,
+    total: usize,
+) -> Result<String, ToolError> {
+    // Sort ALL scored observations by relevance first, THEN take top `capped`.
+    // This ensures relevance mode surfaces the most relevant from the full fetched set,
+    // not just the newest 200.
+    let mut sorted: Vec<&crate::memory::store::ScoredObservation> = scored.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.obs.is_stale.cmp(&b.obs.is_stale))
+            .then_with(|| b.obs.created_at.cmp(&a.obs.created_at))
+    });
+    sorted.truncate(capped);
+
+    // Count actual distinct sessions in the displayed results
+    let actual_sessions: std::collections::HashSet<&str> = sorted.iter()
+        .map(|so| so.obs.session_id.as_str())
+        .collect();
+    let mut output = format!("# Session History — Relevance Ranked (from {} sessions)\n\n", actual_sessions.len());
+    let mut stale_count = 0usize;
+    let mut min_score = f64::MAX;
+    let mut max_score = f64::MIN;
+
+    for (i, so) in sorted.iter().enumerate() {
+        min_score = min_score.min(so.relevance_score);
+        max_score = max_score.max(so.relevance_score);
+
+        if so.obs.is_stale {
+            stale_count += 1;
+            let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
+            output.push_str(&format!(
+                "{}. [score: {:.2}] \u{26a0} [STALE \u{2014} {}] [{}] {}\n",
+                i + 1, so.relevance_score, reason, so.obs.kind, so.obs.content
+            ));
+        } else {
+            output.push_str(&format!(
+                "{}. [score: {:.2}] [{}] {}\n",
+                i + 1, so.relevance_score, so.obs.kind, so.obs.content
+            ));
+        }
+        if let Some(fqn) = &so.obs.symbol_fqn {
+            output.push_str(&format!("  Symbol: {}\n", fqn));
+        }
+        if let Some(fp) = &so.obs.file_path {
+            output.push_str(&format!("  File: {}\n", fp));
+        }
+    }
+
+    output.push_str(&format!(
+        "\n{} observations{}\n",
+        sorted.len(),
+        if stale_count > 0 { format!(" ({} stale)", stale_count) } else { String::new() }
+    ));
+
+    if min_score <= max_score {
+        output.push_str(&format!("Relevance: {:.2}\u{2013}{:.2}\n", min_score, max_score));
+    }
 
     if total > 200 {
         output.push_str(&format!(

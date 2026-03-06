@@ -659,6 +659,90 @@ pub(crate) fn index_status(conn: &Connection) -> Result<String, QueryError> {
     ))
 }
 
+const MAX_IMPACT_PER_HOP: usize = 100;
+const MAX_IMPACT_DEPTH: usize = 10;
+
+pub(crate) fn get_impact(
+    conn: &Connection,
+    symbol_fqn: &str,
+    depth: usize,
+) -> Result<String, QueryError> {
+    let depth = depth.min(MAX_IMPACT_DEPTH);
+    let symbol_id: Option<i64> = conn.query_row(
+        "SELECT id FROM symbols WHERE fqn = ?1",
+        params![symbol_fqn],
+        |r| r.get(0),
+    ).optional()?;
+
+    let Some(symbol_id) = symbol_id else {
+        return Ok(format!(
+            "Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."
+        ));
+    };
+
+    let mut visited: HashSet<i64> = HashSet::from([symbol_id]);
+    let mut queue: VecDeque<(i64, usize)> = VecDeque::from([(symbol_id, 0)]);
+    let mut results: Vec<(String, String, String, String, usize)> = Vec::new(); // fqn, name, path, kind, depth
+    let mut truncated = false;
+
+    while let Some((current_id, current_depth)) = queue.pop_front() {
+        if current_depth >= depth { continue; }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
+             FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
+             WHERE e.target_id=?1
+               AND e.kind IN ('calls', 'extends', 'implements')
+             LIMIT ?2"
+        )?;
+        let rows: Vec<(i64, String, String, String, String)> = stmt.query_map(
+            params![current_id, MAX_IMPACT_PER_HOP as i64],
+            |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?,
+                    r.get::<_,String>(3)?, r.get::<_,String>(4)?))
+        )?.collect::<Result<_,_>>()?;
+        if rows.len() == MAX_IMPACT_PER_HOP { truncated = true; }
+        for (id, fqn, name, path, kind) in rows {
+            if visited.insert(id) {
+                queue.push_back((id, current_depth + 1));
+                if !is_output_sensitive(&path) {
+                    results.push((fqn, name, path, kind, current_depth + 1));
+                }
+            }
+        }
+    }
+
+    let mut output = format!("# Impact Analysis: {symbol_fqn}\n\n");
+    output.push_str(&format!(
+        "{} direct and transitive dependent(s) found (depth={depth})\n",
+        results.len()
+    ));
+    output.push_str("Note: import relationships are not tracked — only calls, extends, and implements edges.\n\n");
+
+    if results.is_empty() {
+        output.push_str("No dependents found.\n");
+    } else {
+        // Group by depth
+        let mut by_depth: std::collections::BTreeMap<usize, Vec<(&str, &str, &str, &str)>> = Default::default();
+        for (fqn, name, path, kind, d) in &results {
+            by_depth.entry(*d).or_default().push((fqn, name, path, kind));
+        }
+        for (d, items) in &by_depth {
+            output.push_str(&format!("### Depth {d}\n\n"));
+            for (fqn, name, path, kind) in items {
+                output.push_str(&format!("- {name} ({kind}) in {path}\n  FQN: {fqn}\n"));
+            }
+            output.push('\n');
+        }
+    }
+
+    if truncated {
+        output.push_str(&format!(
+            "⚠ Results truncated: ≥{MAX_IMPACT_PER_HOP} dependents per hop — use a narrower symbol or reduce depth\n"
+        ));
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,7 +1112,7 @@ mod tests {
 
         let conn = build_test_db();
         conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
-        conn.execute(&format!("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)"), []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)", []).unwrap();
 
         let result = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000).unwrap();
 
@@ -1244,88 +1328,4 @@ mod tests {
         let ctx_ids: Vec<i64> = result.into_iter().filter(|&id| id == 10 || id == 20 || id == 30).collect();
         assert_eq!(ctx_ids, vec![10, 20, 30], "symbols with equal score must be ordered by id ASC");
     }
-}
-
-const MAX_IMPACT_PER_HOP: usize = 100;
-const MAX_IMPACT_DEPTH: usize = 10;
-
-pub(crate) fn get_impact(
-    conn: &Connection,
-    symbol_fqn: &str,
-    depth: usize,
-) -> Result<String, QueryError> {
-    let depth = depth.min(MAX_IMPACT_DEPTH);
-    let symbol_id: Option<i64> = conn.query_row(
-        "SELECT id FROM symbols WHERE fqn = ?1",
-        params![symbol_fqn],
-        |r| r.get(0),
-    ).optional()?;
-
-    let Some(symbol_id) = symbol_id else {
-        return Ok(format!(
-            "Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."
-        ));
-    };
-
-    let mut visited: HashSet<i64> = HashSet::from([symbol_id]);
-    let mut queue: VecDeque<(i64, usize)> = VecDeque::from([(symbol_id, 0)]);
-    let mut results: Vec<(String, String, String, String, usize)> = Vec::new(); // fqn, name, path, kind, depth
-    let mut truncated = false;
-
-    while let Some((current_id, current_depth)) = queue.pop_front() {
-        if current_depth >= depth { continue; }
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
-             FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
-             WHERE e.target_id=?1
-               AND e.kind IN ('calls', 'extends', 'implements')
-             LIMIT ?2"
-        )?;
-        let rows: Vec<(i64, String, String, String, String)> = stmt.query_map(
-            params![current_id, MAX_IMPACT_PER_HOP as i64],
-            |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?,
-                    r.get::<_,String>(3)?, r.get::<_,String>(4)?))
-        )?.collect::<Result<_,_>>()?;
-        if rows.len() == MAX_IMPACT_PER_HOP { truncated = true; }
-        for (id, fqn, name, path, kind) in rows {
-            if visited.insert(id) {
-                queue.push_back((id, current_depth + 1));
-                if !is_output_sensitive(&path) {
-                    results.push((fqn, name, path, kind, current_depth + 1));
-                }
-            }
-        }
-    }
-
-    let mut output = format!("# Impact Analysis: {symbol_fqn}\n\n");
-    output.push_str(&format!(
-        "{} direct and transitive dependent(s) found (depth={depth})\n",
-        results.len()
-    ));
-    output.push_str("Note: import relationships are not tracked — only calls, extends, and implements edges.\n\n");
-
-    if results.is_empty() {
-        output.push_str("No dependents found.\n");
-    } else {
-        // Group by depth
-        let mut by_depth: std::collections::BTreeMap<usize, Vec<(&str, &str, &str, &str)>> = Default::default();
-        for (fqn, name, path, kind, d) in &results {
-            by_depth.entry(*d).or_default().push((fqn, name, path, kind));
-        }
-        for (d, items) in &by_depth {
-            output.push_str(&format!("### Depth {d}\n\n"));
-            for (fqn, name, path, kind) in items {
-                output.push_str(&format!("- {name} ({kind}) in {path}\n  FQN: {fqn}\n"));
-            }
-            output.push('\n');
-        }
-    }
-
-    if truncated {
-        output.push_str(&format!(
-            "⚠ Results truncated: ≥{MAX_IMPACT_PER_HOP} dependents per hop — use a narrower symbol or reduce depth\n"
-        ));
-    }
-
-    Ok(output)
 }
