@@ -66,6 +66,15 @@ pub fn format_structural_observation(diff: &StructuralDiff) -> Option<String> {
     for fqn in &diff.removed {
         parts.push(format!("removed `{}`", fqn_short_name(fqn)));
     }
+    for (old_fqn, new_fqn) in &diff.renamed {
+        let old_short = fqn_short_name(old_fqn);
+        let new_short = fqn_short_name(new_fqn);
+        if old_short != new_short {
+            parts.push(format!("renamed `{}` → `{}`", old_short, new_short));
+        } else {
+            parts.push(format!("moved `{}` → `{}`", old_fqn, new_fqn));
+        }
+    }
 
     if parts.len() > 5 {
         let excess = parts.len() - 5;
@@ -324,6 +333,7 @@ mod tests {
         sig_changed: Vec<(&str, &str, &str)>,
         removed: Vec<&str>,
         body_only: Vec<&str>,
+        renamed: Vec<(&str, &str)>,
     ) -> StructuralDiff {
         StructuralDiff {
             file_path: "src/auth.rs".into(),
@@ -334,18 +344,22 @@ mod tests {
                 .collect(),
             removed: removed.into_iter().map(|s| s.to_string()).collect(),
             body_only: body_only.into_iter().map(|s| s.to_string()).collect(),
+            renamed: renamed
+                .into_iter()
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .collect(),
         }
     }
 
     #[test]
     fn format_body_only_returns_none() {
-        let diff = make_diff(vec![], vec![], vec![], vec!["src/auth.rs::foo"]);
+        let diff = make_diff(vec![], vec![], vec![], vec!["src/auth.rs::foo"], vec![]);
         assert!(format_structural_observation(&diff).is_none());
     }
 
     #[test]
     fn format_added_contains_added_text() {
-        let diff = make_diff(vec!["src/auth.rs::foo"], vec![], vec![], vec![]);
+        let diff = make_diff(vec!["src/auth.rs::foo"], vec![], vec![], vec![], vec![]);
         let result = format_structural_observation(&diff).unwrap();
         assert!(result.contains("added `foo`"), "got: {result}");
     }
@@ -357,6 +371,7 @@ mod tests {
             vec![("src/auth.rs::foo", "fn foo()", "fn foo(x: i32)")],
             vec![],
             vec![],
+            vec![],
         );
         let result = format_structural_observation(&diff).unwrap();
         assert!(result.contains("fn foo()"), "got: {result}");
@@ -365,7 +380,7 @@ mod tests {
 
     #[test]
     fn format_removed_contains_removed_text() {
-        let diff = make_diff(vec![], vec![], vec!["src/auth.rs::bar"], vec![]);
+        let diff = make_diff(vec![], vec![], vec!["src/auth.rs::bar"], vec![], vec![]);
         let result = format_structural_observation(&diff).unwrap();
         assert!(result.contains("removed `bar`"), "got: {result}");
     }
@@ -375,14 +390,47 @@ mod tests {
         let added: Vec<&str> = vec![
             "f.rs::a1", "f.rs::a2", "f.rs::a3", "f.rs::a4", "f.rs::a5", "f.rs::a6", "f.rs::a7",
         ];
-        let diff = make_diff(added, vec![], vec![], vec![]);
+        let diff = make_diff(added, vec![], vec![], vec![], vec![]);
         let result = format_structural_observation(&diff).unwrap();
         assert!(result.contains("and 2 more"), "got: {result}");
     }
 
     #[test]
     fn format_empty_diff_returns_none() {
-        let diff = make_diff(vec![], vec![], vec![], vec![]);
+        let diff = make_diff(vec![], vec![], vec![], vec![], vec![]);
         assert!(format_structural_observation(&diff).is_none());
+    }
+
+    #[test]
+    fn format_rename_short_names_differ() {
+        let diff = make_diff(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![("src/auth.rs::old_name", "src/auth.rs::new_name")],
+        );
+        let result = format_structural_observation(&diff).unwrap();
+        assert!(result.contains("renamed `old_name` → `new_name`"), "got: {result}");
+    }
+
+    #[test]
+    fn format_rename_short_names_identical_shows_moved() {
+        let diff = make_diff(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![("src/old_mod.rs::foo", "src/new_mod.rs::foo")],
+        );
+        let result = format_structural_observation(&diff).unwrap();
+        assert!(result.contains("moved `src/old_mod.rs::foo` → `src/new_mod.rs::foo`"), "got: {result}");
+    }
+
+    #[test]
+    fn format_rename_only_has_structural_changes() {
+        let diff = make_diff(vec![], vec![], vec![], vec![], vec![("f.rs::a", "f.rs::b")]);
+        assert!(diff.has_structural_changes());
+        assert!(format_structural_observation(&diff).is_some());
     }
 }

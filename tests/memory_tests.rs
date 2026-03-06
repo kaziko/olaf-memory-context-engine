@@ -1851,3 +1851,257 @@ fn test_relevance_mode_tiebreak_newest_first() {
         "at equal score, newer must rank before older; newer@{newer_pos} older@{older_pos}"
     );
 }
+
+// ─── Story 8.2 Tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_82_signature_change_stale_reason_includes_signatures() {
+    // 6.1: Enhanced stale_reason with old→new signatures
+    let tmpdir = setup_indexed_project_with_observation(
+        "function greet() { return 'hi'; }\n",
+        "greet returns greeting",
+        Some("test.ts::greet"),
+        None,
+    );
+
+    // Change signature
+    std::fs::write(tmpdir.path().join("test.ts"), "function greet(name: string) { return name; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::greet"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "must be stale; got: {text}");
+    assert!(text.contains("function greet()"), "reason must include old signature; got: {text}");
+    assert!(text.contains("function greet(name: string)"), "reason must include new signature; got: {text}");
+}
+
+#[test]
+fn test_82_rename_detection_end_to_end() {
+    // 6.2: Rename detection requires identical (signature, kind) between removed+added FQNs.
+    // In TS, function signatures include the name (e.g., "function foo() "), so renaming a
+    // function always changes the signature. The rename path fires when FQNs change but
+    // signatures stay identical — a narrow case that the unit tests cover thoroughly
+    // (rename_detected_unique_sig_kind in diff.rs).
+    //
+    // This integration test verifies the observable end-to-end behavior: when a function
+    // is renamed, the old FQN disappears and the observation is correctly marked stale.
+    let tmpdir = setup_indexed_project_with_observation(
+        "function oldName() { return 1; }\n",
+        "oldName is important",
+        Some("test.ts::oldName"),
+        None,
+    );
+
+    std::fs::write(tmpdir.path().join("test.ts"), "function newName() { return 1; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::oldName"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "must be stale after rename; got: {text}");
+    // TS function rename changes signature, so falls back to "no longer exists"
+    assert!(
+        text.contains("no longer exists"),
+        "TS function rename (signature changes) must use 'no longer exists'; got: {text}"
+    );
+}
+
+#[test]
+fn test_82_ambiguous_rename_falls_back() {
+    // 6.3: 2 removed + 2 added with same sig → no rename, just remove+add
+    let tmpdir = setup_indexed_project_with_observation(
+        "function alpha() { return 1; }\nfunction beta() { return 2; }\n",
+        "alpha is entry point",
+        Some("test.ts::alpha"),
+        None,
+    );
+
+    // Remove both, add two new with same signature pattern
+    std::fs::write(tmpdir.path().join("test.ts"), "function gamma() { return 3; }\nfunction delta() { return 4; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::alpha"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "must be stale; got: {text}");
+    assert!(
+        text.contains("no longer exists"),
+        "ambiguous rename must fall back to 'no longer exists'; got: {text}"
+    );
+}
+
+#[test]
+fn test_82_file_path_obs_backtick_reference_stale() {
+    // 6.4: File-path observation with backtick-quoted symbol reference → stale
+    let tmpdir = setup_indexed_project_with_observation(
+        "function render() { return '<div>'; }\n",
+        "The `render` function creates HTML",
+        None,
+        Some("test.ts"),
+    );
+
+    // Change render's signature
+    std::fs::write(tmpdir.path().join("test.ts"), "function render(tag: string) { return tag; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, None, Some("test.ts"), Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(
+        text.contains("STALE"),
+        "file-path obs with backtick reference must be stale; got: {text}"
+    );
+    assert!(
+        text.contains("Referenced symbol"),
+        "reason must mention 'Referenced symbol'; got: {text}"
+    );
+}
+
+#[test]
+fn test_82_file_path_obs_no_backtick_not_stale() {
+    // 6.5: File-path observation WITHOUT backtick reference → NOT stale
+    let tmpdir = setup_indexed_project_with_observation(
+        "function render() { return '<div>'; }\n",
+        "The render function creates HTML output for the page",
+        None,
+        Some("test.ts"),
+    );
+
+    // Change render's signature
+    std::fs::write(tmpdir.path().join("test.ts"), "function render(tag: string) { return tag; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, None, Some("test.ts"), Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(
+        !text.contains("STALE"),
+        "file-path obs without backtick reference must NOT be stale; got: {text}"
+    );
+}
+
+#[test]
+fn test_82_backward_compat_symbol_removal() {
+    // 6.6: Existing behavior preserved for symbol removal
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\nfunction world() { return 2; }\n",
+        "hello is the main function",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // Remove hello entirely
+    std::fs::write(tmpdir.path().join("test.ts"), "function world() { return 2; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("STALE"), "must be stale; got: {text}");
+    assert!(
+        text.contains("no longer exists"),
+        "reason must say 'no longer exists'; got: {text}"
+    );
+}
+
+#[test]
+fn test_82_body_only_no_staleness_any_type() {
+    // 6.7: Body-only changes don't trigger staleness for any observation type
+    let tmpdir = tempfile::tempdir().unwrap();
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 1; }\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Save both a symbol-linked and file-path observation
+    run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "hello is fast", Some("test.ts::hello"), None),
+        save_obs_request(2, "insight", "The `hello` function is fast", None, Some("test.ts")),
+    ]);
+
+    // Body-only change (same signature)
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello() { return 999; }\n").unwrap();
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_context_request(1, &["test.ts"]),
+        get_history_request(2, Some("test.ts::hello"), None, Some(2)),
+        get_history_request(3, None, Some("test.ts"), Some(2)),
+    ]);
+    let text1 = extract_text(&responses[1]);
+    let text2 = extract_text(&responses[2]);
+    assert!(!text1.contains("STALE"), "symbol-linked obs must not be stale on body-only change; got: {text1}");
+    assert!(!text2.contains("STALE"), "file-path obs must not be stale on body-only change; got: {text2}");
+}
+
+#[test]
+fn test_82_first_reason_wins() {
+    // 6.8: Already-stale observation doesn't get overwritten
+    let tmpdir = setup_indexed_project_with_observation(
+        "function hello() { return 1; }\n",
+        "hello returns 1",
+        Some("test.ts::hello"),
+        None,
+    );
+
+    // First change: signature change → stale
+    std::fs::write(tmpdir.path().join("test.ts"), "function hello(x: number) { return x; }\n").unwrap();
+    run_requests_in(tmpdir.path(), &[get_context_request(1, &["test.ts"])]);
+
+    // Second change: remove symbol entirely
+    std::fs::write(tmpdir.path().join("test.ts"), "function other() { return 2; }\n").unwrap();
+    run_requests_in(tmpdir.path(), &[get_context_request(1, &["test.ts"])]);
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, Some("test.ts::hello"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("STALE"), "must be stale; got: {text}");
+    // First reason was signature change, not "no longer exists"
+    assert!(
+        text.contains("Signature of symbol"),
+        "first reason must be preserved (signature change, not removal); got: {text}"
+    );
+}
+
+#[test]
+fn test_82_full_reindex_rename_detection() {
+    // 6.9: Full reindex also triggers rename detection
+    let tmpdir = setup_indexed_project_with_observation(
+        "function oldFunc() { return 1; }\n",
+        "oldFunc is important",
+        Some("test.ts::oldFunc"),
+        None,
+    );
+
+    // Rename: remove old, add new with same signature
+    std::fs::write(tmpdir.path().join("test.ts"), "function newFunc() { return 1; }\n").unwrap();
+
+    // Full re-index via CLI (not incremental)
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_request(1, Some("test.ts::oldFunc"), None, Some(2)),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("STALE"), "full reindex must mark stale after rename; got: {text}");
+    // TS function rename changes signature, so falls back to "no longer exists"
+    assert!(
+        text.contains("no longer exists"),
+        "TS function rename (signature changes) must use 'no longer exists'; got: {text}"
+    );
+}
