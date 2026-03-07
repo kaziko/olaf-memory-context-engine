@@ -591,6 +591,7 @@ dependencies = [
  "ignore",
  "log",
  "pretty_assertions",
+ "regex",
  "rusqlite",
  "rusqlite_migration",
  "serde",

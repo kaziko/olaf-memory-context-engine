@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::Path;
+use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
@@ -89,6 +91,18 @@ pub(crate) fn list() -> Vec<Value> {
                     }
                 },
                 "required": ["symbol_fqn"]
+            }
+        }),
+        serde_json::json!({
+            "name": "analyze_failure",
+            "description": "Parse a stack trace, error message, or test failure output and return a context brief focused on the failure path. Extracts file paths, line numbers, and symbols from the trace to seed precise pivots in bug-fix mode, and surfaces prior failure observations. Use when a test fails or a runtime error occurs — pass the raw output directly.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trace": { "type": "string", "description": "Raw stack trace, error message, or test failure output" },
+                    "token_budget": { "type": "integer", "description": "Max tokens for context brief (default 10000)" }
+                },
+                "required": ["trace"]
             }
         }),
         serde_json::json!({
@@ -224,6 +238,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
 
     let args = params.and_then(|p| p.get("arguments"));
     match tool_name {
+        "analyze_failure"  => handle_analyze_failure(conn, project_root, session_id, args),
         "get_context"      => handle_get_context(conn, project_root, args),
         "get_impact"       => handle_get_impact(conn, args),
         "get_file_skeleton" => handle_get_file_skeleton(conn, args),
@@ -242,6 +257,424 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
 fn mcp_normalize(project_root: &Path, file_path: &str) -> Result<String, ToolError> {
     crate::restore::normalize_rel_path(project_root, file_path)
         .map_err(|e| ToolError::InvalidParams(e.to_string()))
+}
+
+// ─── analyze_failure data structures ──────────────────────────────────────────
+
+#[cfg_attr(test, derive(Debug))]
+struct TraceFrame {
+    file_path: Option<String>,
+    line: Option<u32>,
+    symbol_name: Option<String>,
+}
+
+struct TraceExtraction {
+    frames: Vec<TraceFrame>,
+    error_summary: String,
+}
+
+struct FrameResolution {
+    file_path: Option<String>,
+    line: Option<u32>,
+    resolved_fqn: Option<String>,
+    tier: &'static str,
+}
+
+struct PivotResolution {
+    pivot_fqns: Vec<String>,
+    frame_details: Vec<FrameResolution>,
+}
+
+// ─── trace parsing ───────────────────────────────────────────────────────────
+
+fn parse_trace(raw: &str, project_root: &Path) -> TraceExtraction {
+    let error_summary = raw.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .chars().take(200).collect::<String>();
+
+    let mut frames: Vec<TraceFrame> = Vec::new();
+    let is_python = raw.contains("most recent call last") || raw.contains("Traceback");
+
+    // File path + line patterns
+    let re_rust = Regex::new(r"at\s+\.?/?(.+\.rs):(\d+)").unwrap();
+    let re_ts = Regex::new(r"at\s+(?:\S+\s+)?\(?(.+\.[tj]sx?):(\d+):\d+\)?").unwrap();
+    let re_python = Regex::new(r#"File\s+"(.+\.py)",\s+line\s+(\d+)"#).unwrap();
+    let re_go = Regex::new(r"\s+(.+\.go):(\d+)\s").unwrap();
+    let re_php = Regex::new(r"(.+\.php)[\(:](\d+)\)?").unwrap();
+    let re_generic = Regex::new(r"([\w./\\-]+\.\w{1,4}):(\d+)").unwrap();
+
+    // Symbol name patterns
+    let re_sym_rust = Regex::new(r"(\w+(?:::\w+)*)\(\)").unwrap();
+    let re_sym_ts = Regex::new(r"at\s+(\w[\w.]*)\s+\(").unwrap();
+    let re_sym_python = Regex::new(r"in\s+(\w+)\s*$").unwrap();
+    let re_sym_go = Regex::new(r"(\w+(?:\.\w+)*)\(\)").unwrap();
+
+    // Assertion-style patterns
+    let re_rust_test = Regex::new(r"---- (\S+) stdout ----").unwrap();
+    let re_jest = Regex::new(r"FAIL\s+(.+\.[tj]sx?)").unwrap();
+    let re_pytest = Regex::new(r"FAILED\s+(.+\.py)::(\w+)").unwrap();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        // Assertion-style: Rust test
+        if let Some(caps) = re_rust_test.captures(trimmed) {
+            frames.push(TraceFrame {
+                file_path: None,
+                line: None,
+                symbol_name: Some(caps[1].to_string()),
+            });
+            continue;
+        }
+
+        // Assertion-style: Jest
+        if let Some(caps) = re_jest.captures(trimmed) {
+            let raw_path = &caps[1];
+            let normalized = try_normalize_path(project_root, raw_path);
+            frames.push(TraceFrame {
+                file_path: normalized,
+                line: None,
+                symbol_name: None,
+            });
+            continue;
+        }
+
+        // Assertion-style: pytest
+        if let Some(caps) = re_pytest.captures(trimmed) {
+            let raw_path = &caps[1];
+            let normalized = try_normalize_path(project_root, raw_path);
+            frames.push(TraceFrame {
+                file_path: normalized,
+                line: None,
+                symbol_name: Some(caps[2].to_string()),
+            });
+            continue;
+        }
+
+        // File path + line extraction (try language-specific first, then generic)
+        let (file_path, line_num) = try_extract_file_line(
+            trimmed, project_root,
+            &[&re_rust, &re_ts, &re_python, &re_go, &re_php, &re_generic],
+        );
+
+        // Symbol name extraction
+        let symbol_name = try_extract_symbol(
+            trimmed,
+            &[&re_sym_rust, &re_sym_ts, &re_sym_python, &re_sym_go],
+        );
+
+        if file_path.is_some() || symbol_name.is_some() {
+            frames.push(TraceFrame { file_path, line: line_num, symbol_name });
+        }
+    }
+
+    // Drop all-None frames
+    frames.retain(|f| f.file_path.is_some() || f.line.is_some() || f.symbol_name.is_some());
+
+    // Python: reverse so failing frame comes first
+    if is_python {
+        frames.reverse();
+    }
+
+    // Cap at 30 frames
+    frames.truncate(30);
+
+    TraceExtraction { frames, error_summary }
+}
+
+fn try_normalize_path(project_root: &Path, raw_path: &str) -> Option<String> {
+    crate::restore::normalize_rel_path(project_root, raw_path).ok()
+}
+
+fn try_extract_file_line(
+    line: &str,
+    project_root: &Path,
+    patterns: &[&Regex],
+) -> (Option<String>, Option<u32>) {
+    for re in patterns {
+        if let Some(caps) = re.captures(line) {
+            let raw_path = &caps[1];
+            let line_num = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+            match try_normalize_path(project_root, raw_path) {
+                Some(p) => return (Some(p), line_num),
+                None => return (None, None), // system/library path — don't store
+            }
+        }
+    }
+    (None, None)
+}
+
+fn try_extract_symbol(line: &str, patterns: &[&Regex]) -> Option<String> {
+    for re in patterns {
+        if let Some(caps) = re.captures(line) {
+            return Some(caps[1].to_string());
+        }
+    }
+    None
+}
+
+// ─── pivot resolution ────────────────────────────────────────────────────────
+
+fn resolve_trace_pivots(conn: &rusqlite::Connection, extraction: &TraceExtraction) -> Result<PivotResolution, ToolError> {
+    let mut pivot_fqns: Vec<String> = Vec::new();
+    let mut seen_fqns: HashSet<String> = HashSet::new();
+    let mut frame_details: Vec<FrameResolution> = Vec::new();
+
+    for frame in &extraction.frames {
+        let mut resolved_fqn: Option<String> = None;
+        let mut tier: &str = "unresolved";
+
+        // Tier 1 — Line-precise
+        if let (Some(path), Some(line)) = (&frame.file_path, frame.line) {
+            match crate::graph::store::lookup_symbol_at_line(conn, path, line) {
+                Ok(Some(fqn)) => { resolved_fqn = Some(fqn); tier = "line"; }
+                Ok(None) => {}
+                Err(e) => return Err(ToolError::Internal(anyhow::anyhow!("Tier 1 lookup failed: {e}"))),
+            }
+        }
+
+        // Tier 2 — Nearest-symbol fallback (file-based)
+        if resolved_fqn.is_none()
+            && let Some(path) = &frame.file_path
+        {
+            let line_val = frame.line.unwrap_or(0) as i64;
+            let mut stmt = conn.prepare(
+                "SELECT s.fqn FROM symbols s \
+                 JOIN files f ON s.file_id = f.id \
+                 WHERE f.path = ?1 \
+                 ORDER BY MIN(ABS(s.start_line - ?2), ABS(s.end_line - ?2)) ASC, \
+                          s.start_line ASC, s.id ASC \
+                 LIMIT 5"
+            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 prepare failed: {e}")))?;
+            let fqns: Vec<String> = stmt
+                .query_map(rusqlite::params![path, line_val], |r| r.get::<_, String>(0))
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 query failed: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 row read failed: {e}")))?;
+
+            if let Some(fqn) = fqns.into_iter().next() {
+                resolved_fqn = Some(fqn);
+                tier = "file";
+            }
+        }
+
+        // Tier 3 — Symbol name search
+        if resolved_fqn.is_none()
+            && let Some(name) = &frame.symbol_name
+            && name.len() >= 4
+        {
+            let mut stmt = conn.prepare(
+                "SELECT fqn FROM symbols WHERE name = ?1 LIMIT 2"
+            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 prepare failed: {e}")))?;
+            let fqns: Vec<String> = stmt
+                .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 query failed: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 row read failed: {e}")))?;
+
+            if fqns.len() == 1 {
+                resolved_fqn = Some(fqns.into_iter().next().unwrap());
+                tier = "name";
+            }
+        }
+
+        if let Some(fqn) = &resolved_fqn
+            && seen_fqns.insert(fqn.clone())
+        {
+            pivot_fqns.push(fqn.clone());
+        }
+
+        frame_details.push(FrameResolution {
+            file_path: frame.file_path.clone(),
+            line: frame.line,
+            resolved_fqn,
+            tier,
+        });
+    }
+
+    // Cap pivots at 20
+    pivot_fqns.truncate(20);
+
+    Ok(PivotResolution { pivot_fqns, frame_details })
+}
+
+// ─── trace sanitization ─────────────────────────────────────────────────────
+
+fn sanitize_trace_output(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+
+    // Head/tail truncation
+    let truncated = if lines.len() > 100 {
+        let head = &lines[..80];
+        let tail = &lines[lines.len() - 20..];
+        let omitted = lines.len() - 100;
+        let mut result: Vec<String> = head.iter().map(|l| l.to_string()).collect();
+        result.push(format!("... ({omitted} lines omitted) ..."));
+        result.extend(tail.iter().map(|l| l.to_string()));
+        result
+    } else {
+        lines.iter().map(|l| l.to_string()).collect()
+    };
+
+    // Sensitive line redaction patterns
+    let re_env = Regex::new(r"\.env\b").unwrap();
+    let re_pem = Regex::new(r"\.pem\b").unwrap();
+    let re_p12 = Regex::new(r"\.p12\b").unwrap();
+    let re_id_rsa = Regex::new(r"\bid_rsa\b").unwrap();
+    let re_secret = Regex::new(r"(?i)(secret|password|credential|_token)\s*[=:]").unwrap();
+
+    // Absolute path stripping
+    let re_unix_path = Regex::new(r"(/(?:Users|home|var|usr|opt|tmp|root|etc|srv|mnt|private|Library|Volumes)/\S+)").unwrap();
+    let re_win_path = Regex::new(r"([A-Z]:\\(?:Users\\|)\S+)").unwrap();
+
+    let mut output_lines: Vec<String> = Vec::with_capacity(truncated.len());
+
+    for line in &truncated {
+        // Check for sensitive content
+        if re_env.is_match(line) || re_pem.is_match(line) || re_p12.is_match(line)
+            || re_id_rsa.is_match(line) || re_secret.is_match(line)
+        {
+            output_lines.push("[redacted: sensitive content]".to_string());
+            continue;
+        }
+
+        // Strip absolute paths
+        let mut sanitized = re_unix_path.replace_all(line, |caps: &regex::Captures| {
+            let full = &caps[1];
+            let filename = full.rsplit('/').next().unwrap_or(full);
+            format!("<abs>/{filename}")
+        }).to_string();
+
+        sanitized = re_win_path.replace_all(&sanitized, |caps: &regex::Captures| {
+            let full = &caps[1];
+            let filename = full.rsplit('\\').next().unwrap_or(full);
+            format!("<abs>\\{filename}")
+        }).to_string();
+
+        output_lines.push(sanitized);
+    }
+
+    output_lines.join("\n")
+}
+
+// ─── frame resolution table ─────────────────────────────────────────────────
+
+fn format_frame_table(details: &[FrameResolution]) -> String {
+    let mut table = String::from("### Frame Resolution\n| # | Path | Line | Resolved Symbol | Method |\n|-|-|-|-|-|\n");
+    for (i, fr) in details.iter().enumerate() {
+        let path = fr.file_path.as_deref().unwrap_or("\u{2014}");
+        let line = fr.line.map(|l| l.to_string()).unwrap_or_else(|| "\u{2014}".to_string());
+        let fqn = fr.resolved_fqn.as_deref().unwrap_or("\u{2014}");
+        let tier = fr.tier;
+        table.push_str(&format!("| {} | {} | {} | {} | {} |\n", i + 1, path, line, fqn, tier));
+    }
+    table
+}
+
+// ─── analyze_failure handler ─────────────────────────────────────────────────
+
+fn handle_analyze_failure(
+    conn: &mut rusqlite::Connection,
+    project_root: &Path,
+    _session_id: &str,
+    args: Option<&serde_json::Value>,
+) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let trace = args.get("trace").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParams("missing 'trace'".into()))?;
+    if trace.trim().is_empty() {
+        return Err(ToolError::InvalidParams("trace is empty".into()));
+    }
+    let token_budget = args.get("token_budget")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.clamp(100, 1_000_000) as usize)
+        .unwrap_or(10_000);
+
+    crate::index::run_incremental(conn, project_root)?;
+
+    let extraction = parse_trace(trace, project_root);
+    let resolution = resolve_trace_pivots(conn, &extraction)?;
+
+    let mut output = String::new();
+
+    if !resolution.pivot_fqns.is_empty() {
+        // Path A: Pivots resolved from trace
+        let intent = format!("fix error: {}", extraction.error_summary);
+        let brief = crate::graph::query::get_context_with_pivots(
+            conn, project_root, &intent, &resolution.pivot_fqns, token_budget
+        ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+        output.push_str("## Failure Analysis\n\n");
+        output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
+        if !resolution.frame_details.is_empty() {
+            output.push_str(&format_frame_table(&resolution.frame_details));
+            output.push('\n');
+        }
+        output.push_str(&brief);
+    } else {
+        // Path B: Keyword fallback
+        let stop_words: HashSet<&str> = [
+            "error", "failed", "fatal", "panic", "exception",
+            "thrown", "undefined", "null", "none", "true", "false", "with", "from",
+            "that", "this", "have", "been", "were", "will", "would", "could", "should",
+        ].into_iter().collect();
+
+        let mut keywords: Vec<String> = Vec::new();
+        let mut seen_kw: HashSet<String> = HashSet::new();
+        for word in trace.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
+            if word.len() >= 4 {
+                let lower = word.to_lowercase();
+                if !stop_words.contains(lower.as_str()) && seen_kw.insert(lower.clone()) {
+                    keywords.push(lower);
+                    if keywords.len() >= 10 { break; }
+                }
+            }
+        }
+
+        let mut keyword_pivots = Vec::new();
+        if !keywords.is_empty() {
+            keyword_pivots = crate::graph::query::rank_symbols_by_keywords(conn, &keywords, 5)
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!("keyword search failed: {e}")))?;
+        }
+
+        if !keyword_pivots.is_empty() {
+            // Path B: keywords matched symbols
+            let pivot_fqns: Vec<String> = keyword_pivots.into_iter().map(|(_, fqn)| fqn).collect();
+            let intent = format!("fix error: {}", extraction.error_summary);
+            let brief = crate::graph::query::get_context_with_pivots(
+                conn, project_root, &intent, &pivot_fqns, token_budget
+            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+            output.push_str("## Failure Analysis\n\n");
+            output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
+            if !resolution.frame_details.is_empty() {
+                output.push_str(&format_frame_table(&resolution.frame_details));
+                output.push('\n');
+            }
+            output.push_str(&brief);
+        } else {
+            // Path C: No pivots, no keywords
+            output.push_str("## Failure Analysis\n\n");
+            output.push_str(&format!("**Error:** {}\n", extraction.error_summary));
+            output.push_str("Could not resolve input to indexed code.\n");
+            output.push_str("This may be due to unsupported trace formats, ambiguous symbol names,\n");
+            output.push_str("unindexed code, or input without parseable structure.\n");
+            output.push_str("The raw input is preserved below.\n\n");
+            if !resolution.frame_details.is_empty() {
+                output.push_str(&format_frame_table(&resolution.frame_details));
+                output.push('\n');
+            }
+            output.push_str("### Raw Trace\n```\n");
+            output.push_str(&sanitize_trace_output(trace));
+            output.push_str("\n```\n");
+        }
+    }
+
+    truncate_to_budget(&mut output, token_budget);
+    Ok(output)
 }
 
 fn handle_get_context(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
@@ -816,5 +1249,336 @@ mod tests {
         let budget = 20;
         truncate_to_budget(&mut s, budget);
         assert!(s.len().div_ceil(4) <= budget, "truncated div_ceil(len/4)={} must be <= {budget}", s.len().div_ceil(4));
+    }
+
+    // ─── Task 5.2: analyze_failure in tool list ─────────────────────────────
+
+    #[test]
+    fn test_list_contains_analyze_failure() {
+        let tools = list();
+        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "analyze_failure").collect();
+        assert_eq!(matches.len(), 1, "list() must contain exactly one analyze_failure entry");
+        let desc = matches[0]["description"].as_str().unwrap();
+        assert!(desc.contains("stack trace"), "description must mention 'stack trace'");
+    }
+
+    // ─── Task 8: trace parsing unit tests ───────────────────────────────────
+
+    fn test_project_root() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn parse_trace_rust_backtrace() {
+        let tmp = test_project_root();
+        std::fs::write(tmp.path().join("src/handlers.rs"), "").unwrap();
+        let trace = "thread 'main' panicked at 'error':\n  0: process_request()\n           at ./src/handlers.rs:128\n";
+        let ext = parse_trace(trace, tmp.path());
+        let frame = ext.frames.iter().find(|f| f.file_path.as_deref() == Some("src/handlers.rs"));
+        assert!(frame.is_some(), "must extract src/handlers.rs");
+        let frame = frame.unwrap();
+        assert_eq!(frame.line, Some(128));
+    }
+
+    #[test]
+    fn parse_trace_typescript_error() {
+        let tmp = test_project_root();
+        std::fs::write(tmp.path().join("src/app.ts"), "").unwrap();
+        let trace = "Error: something\n    at handleRequest (src/app.ts:10:5)\n";
+        let ext = parse_trace(trace, tmp.path());
+        let frame = ext.frames.iter().find(|f| f.file_path.as_deref() == Some("src/app.ts"));
+        assert!(frame.is_some(), "must extract src/app.ts");
+        assert_eq!(frame.unwrap().line, Some(10));
+    }
+
+    #[test]
+    fn parse_trace_python_traceback() {
+        let tmp = test_project_root();
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("views.py"), "").unwrap();
+        let trace = "Traceback (most recent call last):\n  File \"app/views.py\", line 42, in process_order\n    raise ValueError\nValueError\n";
+        let ext = parse_trace(trace, tmp.path());
+        let frame = ext.frames.iter().find(|f| f.file_path.as_deref() == Some("app/views.py"));
+        assert!(frame.is_some(), "must extract app/views.py");
+        assert_eq!(frame.unwrap().line, Some(42));
+    }
+
+    #[test]
+    fn parse_trace_go_panic() {
+        let tmp = test_project_root();
+        let cmd_dir = tmp.path().join("cmd");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::write(cmd_dir.join("server.go"), "").unwrap();
+        let trace = "goroutine 1 [running]:\nmain.ServeHTTP()\n\tcmd/server.go:42 +0x1a\n";
+        let ext = parse_trace(trace, tmp.path());
+        let frame = ext.frames.iter().find(|f| f.file_path.as_deref() == Some("cmd/server.go"));
+        assert!(frame.is_some(), "must extract cmd/server.go");
+        assert_eq!(frame.unwrap().line, Some(42));
+    }
+
+    #[test]
+    fn parse_trace_assertion_failure() {
+        let tmp = test_project_root();
+        std::fs::write(tmp.path().join("src/app.test.ts"), "").unwrap();
+        let trace = "---- test_my_function stdout ----\nFAIL src/app.test.ts\nFAILED tests/test_file.py::test_name\n";
+        let ext = parse_trace(trace, tmp.path());
+        assert!(ext.frames.iter().any(|f| f.symbol_name.as_deref() == Some("test_my_function")),
+            "must extract Rust test name");
+    }
+
+    #[test]
+    fn parse_trace_name_only_preserved() {
+        let tmp = test_project_root();
+        let trace = "  0: alpha_handler()\n  1: beta_processor()\n";
+        let ext = parse_trace(trace, tmp.path());
+        let names: Vec<_> = ext.frames.iter()
+            .filter_map(|f| f.symbol_name.as_deref())
+            .collect();
+        assert!(names.contains(&"alpha_handler"), "must have alpha_handler");
+        assert!(names.contains(&"beta_processor"), "must have beta_processor");
+        assert!(ext.frames.len() >= 2, "two frames preserved (no dedup on input)");
+    }
+
+    #[test]
+    fn parse_trace_system_paths_dropped() {
+        let tmp = test_project_root();
+        let trace = "  0: system_func()\n           at /usr/lib/libfoo.so:42\n";
+        let ext = parse_trace(trace, tmp.path());
+        for frame in &ext.frames {
+            assert!(frame.file_path.is_none(),
+                "system paths must not be stored; got: {:?}", frame.file_path);
+        }
+    }
+
+    #[test]
+    fn parse_trace_empty() {
+        let tmp = test_project_root();
+        let ext = parse_trace("", tmp.path());
+        assert!(ext.frames.is_empty());
+        assert!(ext.error_summary.is_empty());
+    }
+
+    #[test]
+    fn parse_trace_error_summary_truncation() {
+        let tmp = test_project_root();
+        let long_line = "E".repeat(500);
+        let ext = parse_trace(&long_line, tmp.path());
+        assert_eq!(ext.error_summary.len(), 200);
+    }
+
+    #[test]
+    fn parse_trace_frame_cap() {
+        let tmp = test_project_root();
+        let mut trace = String::new();
+        for i in 0..50 {
+            trace.push_str(&format!("  {i}: func_{i}()\n"));
+        }
+        let ext = parse_trace(&trace, tmp.path());
+        assert!(ext.frames.len() <= 30, "frames must be capped at 30, got {}", ext.frames.len());
+    }
+
+    #[test]
+    fn parse_trace_python_reversal() {
+        let tmp = test_project_root();
+        let trace = "Traceback (most recent call last):\n  first_func()\n  failing_func()\n";
+        let ext = parse_trace(trace, tmp.path());
+        if let Some(first) = ext.frames.first() {
+            assert_eq!(first.symbol_name.as_deref(), Some("failing_func"),
+                "Python: failing function must come first after reversal");
+        }
+    }
+
+    // ─── Task 9: pivot resolution unit tests ────────────────────────────────
+
+    fn open_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL, hash TEXT);
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
+                 name TEXT NOT NULL, kind TEXT, start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+             );
+             CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);",
+        ).unwrap();
+        conn
+    }
+
+    fn insert_test_symbol(conn: &mut rusqlite::Connection, file_path: &str, fqn: &str, name: &str, start: i64, end: i64) {
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT OR IGNORE INTO files (path, hash) VALUES (?1, 'h')", rusqlite::params![file_path]).unwrap();
+        let file_id: i64 = tx.query_row("SELECT id FROM files WHERE path = ?1", rusqlite::params![file_path], |r| r.get::<_, i64>(0)).unwrap();
+        tx.execute(
+            "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line) VALUES (?1, ?2, ?3, 'function', ?4, ?5)",
+            rusqlite::params![file_id, fqn, name, start, end],
+        ).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn resolve_pivots_tier1_line_match() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/handler.rs", "src/handler.rs::process", "process", 40, 50);
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: Some("src/handler.rs".into()), line: Some(42), symbol_name: None }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "line");
+        assert_eq!(res.pivot_fqns, vec!["src/handler.rs::process"]);
+    }
+
+    #[test]
+    fn resolve_pivots_tier2_file_fallback() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/db.rs", "src/db.rs::query", "query", 10, 20);
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: Some("src/db.rs".into()), line: Some(99), symbol_name: None }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "file");
+        assert!(res.pivot_fqns.contains(&"src/db.rs::query".to_string()));
+    }
+
+    #[test]
+    fn resolve_pivots_tier2_nearest_line() {
+        let mut conn = open_test_db();
+        for i in 0..10 {
+            let start = i * 10 + 1;
+            let end = start + 8;
+            insert_test_symbol(&mut conn, "src/big.rs",
+                &format!("src/big.rs::fn_{i}"), &format!("fn_{i}"), start, end);
+        }
+        // fn_4 spans 41-49, fn_5 spans 51-59. Line 50 is between them.
+        // Distance to fn_4: MIN(|41-50|, |49-50|) = 1
+        // Distance to fn_5: MIN(|51-50|, |59-50|) = 1
+        // Tie broken by start_line ASC → fn_4 first
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: Some("src/big.rs".into()), line: Some(50), symbol_name: None }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "file");
+        assert_eq!(res.pivot_fqns[0], "src/big.rs::fn_4");
+    }
+
+    #[test]
+    fn resolve_pivots_tier3_name_search() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/util.rs", "src/util.rs::parse_input", "parse_input", 1, 10);
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: None, line: None, symbol_name: Some("parse_input".into()) }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "name");
+        assert!(res.pivot_fqns.contains(&"src/util.rs::parse_input".to_string()));
+    }
+
+    #[test]
+    fn resolve_pivots_tier3_skips_short_names() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/a.rs", "src/a.rs::run", "run", 1, 5);
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: None, line: None, symbol_name: Some("run".into()) }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "unresolved");
+    }
+
+    #[test]
+    fn resolve_pivots_tier3_skips_ambiguous() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/a.rs", "src/a.rs::process", "process", 1, 5);
+        insert_test_symbol(&mut conn, "src/b.rs", "src/b.rs::process", "process", 1, 5);
+        let extraction = TraceExtraction {
+            frames: vec![TraceFrame { file_path: None, line: None, symbol_name: Some("process".into()) }],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.frame_details[0].tier, "unresolved");
+    }
+
+    #[test]
+    fn resolve_pivots_dedup_output() {
+        let mut conn = open_test_db();
+        insert_test_symbol(&mut conn, "src/a.rs", "src/a.rs::handler", "handler", 10, 20);
+        let extraction = TraceExtraction {
+            frames: vec![
+                TraceFrame { file_path: Some("src/a.rs".into()), line: Some(15), symbol_name: None },
+                TraceFrame { file_path: Some("src/a.rs".into()), line: Some(15), symbol_name: None },
+            ],
+            error_summary: "error".into(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert_eq!(res.pivot_fqns.len(), 1, "FQN list must be deduped");
+        assert_eq!(res.frame_details.len(), 2, "frame details preserves both");
+    }
+
+    #[test]
+    fn resolve_pivots_empty() {
+        let conn = open_test_db();
+        let extraction = TraceExtraction {
+            frames: vec![],
+            error_summary: String::new(),
+        };
+        let res = resolve_trace_pivots(&conn, &extraction).unwrap();
+        assert!(res.pivot_fqns.is_empty());
+        assert!(res.frame_details.is_empty());
+    }
+
+    // ─── Task 10: sanitization unit tests ───────────────────────────────────
+
+    #[test]
+    fn sanitize_redacts_sensitive_lines() {
+        let input = "normal line\nloading .env file\npassword = \"hunter2\"\napi_token = \"abc\"\ntoken_budget = 100\napi_token.rs:42\n";
+        let output = sanitize_trace_output(input);
+        assert!(output.contains("[redacted: sensitive content]"), "sensitive lines must be redacted");
+        assert!(output.contains("token_budget"), "token_budget must NOT be redacted");
+        assert!(output.contains("api_token.rs"), "api_token.rs must NOT be redacted");
+        assert!(!output.contains("hunter2"), "password value must not appear");
+    }
+
+    #[test]
+    fn sanitize_strips_absolute_unix_paths() {
+        let input = "error at /var/log/app/src/main.rs:42\n";
+        let output = sanitize_trace_output(input);
+        assert!(output.contains("<abs>/main.rs:42"), "must strip to <abs>/filename; got: {output}");
+        assert!(!output.contains("/var/log"), "raw absolute path must be stripped");
+    }
+
+    #[test]
+    fn sanitize_strips_absolute_windows_paths() {
+        let input = "error at C:\\code\\src\\main.rs:10\n";
+        let output = sanitize_trace_output(input);
+        assert!(output.contains("<abs>\\main.rs:10"), "must strip to <abs>\\filename; got: {output}");
+        assert!(!output.contains("C:\\code"), "raw absolute path must be stripped");
+    }
+
+    #[test]
+    fn sanitize_strips_midline_paths() {
+        let input = "    at /home/user/project/src/app.ts:10:5\n  File \"/usr/lib/python/views.py\", line 42\n";
+        let output = sanitize_trace_output(input);
+        assert!(output.contains("<abs>/app.ts:10:5"), "must strip mid-line unix path");
+        assert!(output.contains("<abs>/views.py\""), "must strip mid-line python path");
+        assert!(!output.contains("/home/user"), "raw home path must be stripped");
+    }
+
+    #[test]
+    fn sanitize_head_tail_truncation() {
+        let mut input = String::new();
+        for i in 0..200 {
+            input.push_str(&format!("line {i}\n"));
+        }
+        let output = sanitize_trace_output(&input);
+        assert!(output.contains("lines omitted"), "must have omission marker");
+        let output_lines: Vec<&str> = output.lines().collect();
+        // 80 head + 1 marker + 20 tail = 101
+        assert_eq!(output_lines.len(), 101, "must have 101 lines; got {}", output_lines.len());
     }
 }

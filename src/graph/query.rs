@@ -213,6 +213,74 @@ fn estimate_tokens(s: &str) -> usize {
 /// File hints take priority: when `file_hints` is non-empty and at least one hint matches
 /// a symbol, those symbols are returned and keyword ranking is skipped. If hints match
 /// nothing, the function falls through to keyword ranking.
+pub(crate) fn rank_symbols_by_keywords(
+    conn: &Connection,
+    keywords: &[String],
+    limit: usize,
+) -> Result<Vec<(i64, String)>, QueryError> {
+    let unique_words: HashSet<String> = keywords.iter()
+        .filter(|w| w.len() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+
+    let mut candidates: HashMap<i64, usize> = HashMap::new();
+    for word in &unique_words {
+        let pattern = format!("%{word}%");
+        let mut stmt = conn.prepare(
+            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
+             ORDER BY id ASC LIMIT ?2"
+        )?;
+        let rows: Vec<i64> = stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
+            .collect::<Result<_,_>>()?;
+        for id in rows { *candidates.entry(id).or_insert(0) += 1; }
+    }
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const IN_DEG_CHUNK: usize = 500;
+    let cand_ids: Vec<i64> = candidates.keys().copied().collect();
+    let mut in_degrees: HashMap<i64, i64> = HashMap::new();
+    for chunk in cand_ids.chunks(IN_DEG_CHUNK) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(i64, i64)> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<_,_>>()?;
+        for (id, count) in rows { in_degrees.insert(id, count); }
+    }
+
+    let mut scored: Vec<(i64, usize, i64)> = candidates.into_iter()
+        .map(|(id, kw)| {
+            let in_deg = in_degrees.get(&id).copied().unwrap_or(0);
+            (id, kw, in_deg)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(b.2.cmp(&a.2))
+            .then(a.0.cmp(&b.0))
+    });
+
+    let mut result = Vec::new();
+    for (id, _, _) in scored.into_iter().take(limit) {
+        if let Some(fqn) = conn.query_row(
+            "SELECT fqn FROM symbols WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, String>(0),
+        ).optional()? {
+            result.push((id, fqn));
+        }
+    }
+    Ok(result)
+}
+
 fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<i64>, QueryError> {
     let mut ids: Vec<i64> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
@@ -234,67 +302,17 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
         if !ids.is_empty() { return Ok(ids); }
     }
 
-    // --- Keyword branch: RANKED ---
-    // Lowercase first, then dedup — prevents case variants ("Build"/"BUILD") from inflating kw_score.
-    let unique_words: HashSet<String> = intent.split_whitespace()
-        .filter(|w| w.len() > 3)
-        .map(|w| w.to_lowercase())
-        .collect();
+    // --- Keyword branch: delegate to shared ranking function ---
+    let keywords: Vec<String> = intent.split_whitespace().map(|s| s.to_string()).collect();
+    let ranked = rank_symbols_by_keywords(conn, &keywords, pool_size)?;
 
-    // Scalability note: `lower(col) LIKE '%word%'` forces a full table scan — SQLite cannot
-    // use a B-tree index for leading-wildcard patterns. This is the main latency hotspot as
-    // the symbols table grows. A future hardening story should evaluate adding an FTS5 virtual
-    // table or a generated trigram column to accelerate these lookups.
-    let mut candidates: HashMap<i64, usize> = HashMap::new(); // id → kw_score
-    for word in &unique_words {
-        let pattern = format!("%{word}%"); // word is already lowercased
-        let mut stmt = conn.prepare(
-            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
-             ORDER BY id ASC LIMIT ?2"
-        )?;
-        let rows: Vec<i64> = stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
-            .collect::<Result<_,_>>()?;
-        for id in rows { *candidates.entry(id).or_insert(0) += 1; }
+    if !ranked.is_empty() {
+        return Ok(ranked.into_iter().map(|(id, _)| id).collect());
     }
 
-    // Fallback: no keyword matches
-    if candidates.is_empty() {
-        let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id ASC LIMIT ?1")?;
-        return Ok(stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?);
-    }
-
-    // Batch in-degree lookup — chunk to stay under SQLite's 999 bind-variable limit.
-    const IN_DEG_CHUNK: usize = 500;
-    let cand_ids: Vec<i64> = candidates.keys().copied().collect();
-    let mut in_degrees: HashMap<i64, i64> = HashMap::new();
-    for chunk in cand_ids.chunks(IN_DEG_CHUNK) {
-        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(i64, i64)> = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<_,_>>()?;
-        for (id, count) in rows { in_degrees.insert(id, count); }
-    }
-
-    // Score and sort: primary kw_score DESC, secondary in_degree DESC, tertiary id ASC
-    let mut scored: Vec<(i64, usize, i64)> = candidates.into_iter()
-        .map(|(id, kw)| {
-            let in_deg = in_degrees.get(&id).copied().unwrap_or(0);
-            (id, kw, in_deg)
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.1.cmp(&a.1)          // kw_score DESC
-            .then(b.2.cmp(&a.2))   // in_degree DESC
-            .then(a.0.cmp(&b.0))   // id ASC (deterministic)
-    });
-
-    Ok(scored.into_iter().take(pool_size).map(|(id, _, _)| id).collect())
+    // Fallback: no keyword matches — return first symbols in DB
+    let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id ASC LIMIT ?1")?;
+    Ok(stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?)
 }
 
 #[allow(clippy::type_complexity)]
@@ -429,17 +447,10 @@ fn format_pivot_entry(row: &SymbolRow, source: &str) -> String {
     )
 }
 
-pub(crate) fn get_context(
-    conn: &Connection,
-    project_root: &Path,
-    intent: &str,
-    file_hints: &[String],
-    token_budget: usize,
-) -> Result<String, QueryError> {
-    let profile = detect_intent_profile(intent);
-    let policy = derive_traversal_policy(&profile);
+const NO_SYMBOLS_IN_INDEX: &str = "\nNo symbols found. Run `olaf index` first.\n";
+const NO_SYMBOLS_FOR_FQNS: &str = "\nNo symbols found matching provided FQNs.\n";
 
-    // Build the intent metadata header — always emitted so callers see detected intent even on empty index.
+fn format_intent_header(profile: &IntentProfile, intent: &str) -> String {
     let intent_label = match &profile.execution_mode {
         IntentMode::BugFix => "bug-fix",
         IntentMode::Refactor => "refactor",
@@ -455,7 +466,6 @@ pub(crate) fn get_context(
         "# Context Brief: {intent}\nintent_mode: {intent_label}\nintent_confidence: {:.2}\nintent_signals: {signals_str}\n",
         profile.confidence
     );
-    // Conditional: emit intent_mix only when confident AND 2nd-highest weight is material
     let mut weights = [
         ("bug-fix", profile.w_bugfix),
         ("refactor", profile.w_refactor),
@@ -468,21 +478,30 @@ pub(crate) fn get_context(
             profile.w_bugfix, profile.w_refactor, profile.w_impl
         ));
     }
-    // Emit fallback reason when a mode was detected but confidence was too low to use it
     if matches!(profile.execution_mode, IntentMode::Balanced)
         && !matches!(profile.dominant_mode, IntentMode::Balanced)
     {
         output.push_str("intent_fallback_reason: low confidence\n");
     }
+    output
+}
 
-    let pivot_ids = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+fn build_context_brief(
+    conn: &Connection,
+    project_root: &Path,
+    intent_header: &str,
+    pivot_ids: &[i64],
+    policy: &TraversalPolicy,
+    token_budget: usize,
+) -> Result<String, QueryError> {
+    let mut output = intent_header.to_string();
 
     if pivot_ids.is_empty() {
-        output.push_str("\nNo symbols found. Run `olaf index` first.\n");
+        output.push_str(NO_SYMBOLS_IN_INDEX);
         return Ok(output);
     }
 
-    let (pivots, supporting_with_reasons) = traverse_bfs(conn, &pivot_ids, &policy)?;
+    let (pivots, supporting_with_reasons) = traverse_bfs(conn, pivot_ids, policy)?;
 
     let pivot_budget = token_budget * 70 / 100;
     let skeleton_budget = token_budget * 20 / 100;
@@ -504,7 +523,6 @@ pub(crate) fn get_context(
         let source = match read_symbol_source(project_root, &row.file_path, row.start_line, row.end_line) {
             Ok(s) if !s.is_empty() => s,
             _ => {
-                // File not readable or corrupt line range — fall back to signature only
                 row.signature.as_deref().unwrap_or("(source unavailable)").to_string()
             }
         };
@@ -536,8 +554,6 @@ pub(crate) fn get_context(
             output.push_str(&skeleton);
             skeleton_tokens += skeleton_tokens_needed;
 
-            // Per-entry: include reason only if it fits; if not, drop just this reason (not the symbol).
-            // This allows later shorter reasons to still fit rather than killing all remaining reasons.
             if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
                 output.push_str(&reason_line);
                 skeleton_tokens += reason_tokens_needed;
@@ -575,6 +591,51 @@ pub(crate) fn get_context(
     }
 
     Ok(output)
+}
+
+pub(crate) fn get_context(
+    conn: &Connection,
+    project_root: &Path,
+    intent: &str,
+    file_hints: &[String],
+    token_budget: usize,
+) -> Result<String, QueryError> {
+    let profile = detect_intent_profile(intent);
+    let policy = derive_traversal_policy(&profile);
+    let intent_header = format_intent_header(&profile, intent);
+    let pivot_ids = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+    build_context_brief(conn, project_root, &intent_header, &pivot_ids, &policy, token_budget)
+}
+
+pub(crate) fn get_context_with_pivots(
+    conn: &Connection,
+    project_root: &Path,
+    intent: &str,
+    pivot_fqns: &[String],
+    token_budget: usize,
+) -> Result<String, QueryError> {
+    let profile = detect_intent_profile(intent);
+    let policy = derive_traversal_policy(&profile);
+    let intent_header = format_intent_header(&profile, intent);
+
+    let mut resolved_ids: Vec<i64> = Vec::new();
+    for fqn in pivot_fqns {
+        if let Some(id) = conn.query_row(
+            "SELECT id FROM symbols WHERE fqn = ?1",
+            params![fqn],
+            |r| r.get::<_, i64>(0),
+        ).optional()? {
+            resolved_ids.push(id);
+        }
+    }
+
+    if resolved_ids.is_empty() {
+        let mut output = intent_header;
+        output.push_str(NO_SYMBOLS_FOR_FQNS);
+        return Ok(output);
+    }
+
+    build_context_brief(conn, project_root, &intent_header, &resolved_ids, &policy, token_budget)
 }
 
 /// Private helper: query candidate file paths from the files table.
@@ -1401,5 +1462,110 @@ mod tests {
 
         let result = get_impact(&conn, "src/types.ts::Target", 1).unwrap();
         assert!(result.contains("Results truncated"), "truncation warning must appear when >100 dependents");
+    }
+
+    // ─── Task 11: get_context_with_pivots and rank_symbols_by_keywords ──────
+
+    #[test]
+    fn get_context_with_pivots_uses_explicit_fqns() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1, 'src/auth.rs', 'h')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1, 1, 'src/auth.rs::login', 'login', 'function', 1, 10, NULL, NULL, NULL)",
+            [],
+        ).unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("auth.rs"), "fn login() { todo!() }\n").unwrap();
+
+        let result = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix login bug",
+            &["src/auth.rs::login".to_string()], 4000,
+        ).unwrap();
+        assert!(result.contains("login"), "pivot symbol must appear in output");
+        assert!(result.contains("Pivot Symbols"), "must have pivot section");
+    }
+
+    #[test]
+    fn get_context_with_pivots_no_match() {
+        let conn = build_test_db();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let result = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix bug",
+            &["nonexistent::symbol".to_string()], 4000,
+        ).unwrap();
+        assert!(result.contains("No symbols found matching provided FQNs"),
+            "must indicate no match; got: {result}");
+    }
+
+    #[test]
+    fn get_context_with_pivots_includes_observations() {
+        let tmpdb = tempfile::tempdir().unwrap();
+        let db_path = tmpdb.path().join(".olaf").join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_indexed_at) VALUES ('src/a.rs', 'h', 0)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE path='src/a.rs'", [], |r| r.get::<_, i64>(0)).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (?1, 'src/a.rs::handler', 'handler', 'function', 1, 5, 'h')",
+            rusqlite::params![file_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, started_at) VALUES ('s1', 1704067200000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO observations (session_id, content, kind, symbol_fqn, created_at) \
+             VALUES ('s1', 'previous bug fix attempt failed', 'error', 'src/a.rs::handler', 1704067200000)",
+            [],
+        ).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
+
+        let result = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix error",
+            &["src/a.rs::handler".to_string()], 4000,
+        ).unwrap();
+        assert!(result.contains("previous bug fix attempt failed"),
+            "observation must appear in output; got: {result}");
+    }
+
+    #[test]
+    fn rank_symbols_by_keywords_matches_find_pivot_logic() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1, 'src/a.rs', 'h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2, 'src/b.rs', 'h')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1, 1, 'src/a.rs::authenticate', 'authenticate', 'fn', 1, 10, NULL, NULL, NULL)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (2, 2, 'src/b.rs::authorization', 'authorization', 'fn', 1, 10, NULL, NULL, NULL)",
+            [],
+        ).unwrap();
+        // Give symbol 2 higher in-degree
+        conn.execute("INSERT INTO edges VALUES (1, 1, 2, 'calls')", []).unwrap();
+
+        let keywords = vec!["auth".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert_eq!(result.len(), 2, "both symbols match 'auth'");
+        // Same kw_score (1 each), so in_degree breaks tie: symbol 2 has in_degree=1
+        assert_eq!(result[0].0, 2, "higher in-degree symbol first");
+        assert_eq!(result[1].0, 1);
+    }
+
+    #[test]
+    fn rank_symbols_by_keywords_no_match_returns_empty() {
+        let conn = build_test_db();
+        let keywords = vec!["nonexistent_keyword_xyz".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert!(result.is_empty(), "no match must return empty vec (no first-in-DB fallback)");
     }
 }

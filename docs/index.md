@@ -264,6 +264,7 @@ Once connected, Claude can use these tools:
 | `save_observation` | Store an insight or decision linked to a symbol FQN or file path |
 | `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol; supports `sort_mode` for relevance-ranked retrieval |
 | `trace_flow` | Trace execution paths between two symbols through the dependency graph |
+| `analyze_failure` | Parse a stack trace or error output and return a context brief focused on the failure path |
 | `list_restore_points` | Pre-edit snapshots for a file, sorted newest-first |
 | `undo_change` | Restore a file to a specific snapshot; records a decision observation |
 

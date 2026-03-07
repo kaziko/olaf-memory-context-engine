@@ -1114,3 +1114,194 @@ fn test_trace_flow_max_paths_boundary() {
     let tbad = rbad[0]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(tbad.contains("2 path(s) found"), "max_paths='bad' falls back to default (5), fixture has 2 paths; got: {tbad}");
 }
+
+// ─── Story 9.5: analyze_failure integration tests ────────────────────────────
+
+fn prepare_ts_indexed_tmpdir() -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::write(
+        src_dir.join("handler.ts"),
+        "export function handleRequest(req: any) {\n  return processData(req);\n}\n\
+         export function processData(data: any) {\n  throw new Error('fail');\n}\n",
+    ).expect("write handler.ts");
+    std::fs::write(
+        src_dir.join("service.ts"),
+        "export class UserService {\n  validateCredentials(user: string) {\n    return true;\n  }\n}\n",
+    ).expect("write service.ts");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(status.status.success(), "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr));
+    tmpdir
+}
+
+#[test]
+fn test_analyze_failure_with_indexed_trace() {
+    let tmpdir = prepare_ts_indexed_tmpdir();
+    let trace = "Error: fail\n    at processData (src/handler.ts:5:9)\n    at handleRequest (src/handler.ts:2:10)\n";
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": { "trace": trace } }
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Failure Analysis"), "must have Failure Analysis header; got: {text}");
+    assert!(text.contains("Frame Resolution"), "must have frame table");
+    // Path A proof: frame table must show resolved symbols with "line" or "file" tier
+    assert!(text.contains("| line |") || text.contains("| file |"),
+        "Path A must resolve at least one frame via tier 1 or 2; got: {text}");
+    // Path A proof: context brief with pivot symbols must appear (not Path C fallback)
+    assert!(text.contains("Pivot Symbols"), "Path A must produce pivot symbols section; got: {text}");
+    assert!(!text.contains("Could not resolve input"), "Path A must not show Path C fallback");
+}
+
+#[test]
+fn test_analyze_failure_no_match() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": {
+            "trace": "Error at /xyz/a.ts:1:1\n  at run (b.ts:2:3)"
+        } }
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error");
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Could not resolve input to indexed code"),
+        "must indicate no resolution; got: {text}");
+}
+
+#[test]
+fn test_analyze_failure_missing_trace_param() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": {} }
+    })]);
+    let err = &responses[0]["error"];
+    assert!(err.is_object(), "must have error; got: {}", responses[0]);
+    assert_eq!(err["code"], -32602, "must be InvalidParams error code");
+}
+
+#[test]
+fn test_analyze_failure_symbol_name_only() {
+    let tmpdir = prepare_ts_indexed_tmpdir();
+    let trace = "Error: fail\n  0: handleRequest()\n";
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": { "trace": trace } }
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error");
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    // handleRequest has 13 chars >= 4, and if unambiguous should resolve via Tier 3
+    assert!(text.contains("Failure Analysis"), "must have analysis; got: {text}");
+    // Tier 3 proof: if name resolved, we get pivots (Path A); if ambiguous, we get Path B/C
+    // Either way, should not get Path C if the symbol exists and is unambiguous
+    assert!(text.contains("Pivot Symbols") || text.contains("Context Brief"),
+        "Tier 3 with unambiguous name must produce context; got: {text}");
+}
+
+#[test]
+fn test_analyze_failure_sanitized_trace_redaction() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": {
+            "trace": "Error\nloading .env config\npassword = \"hunter2\"\nat /home/user/app/src/main.ts:10:5"
+        } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("hunter2"), "password must be redacted");
+    assert!(!text.contains("/home/user"), "absolute path must be stripped");
+}
+
+#[test]
+fn test_analyze_failure_budget_truncation() {
+    let mut big_trace = String::from("Error: big\n");
+    for i in 0..10000 {
+        big_trace.push_str(&format!("  line {i} of output\n"));
+    }
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": {
+            "trace": big_trace,
+            "token_budget": 500
+        } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.len().div_ceil(4) <= 500, "response must fit in 500 token budget; got {} tokens",
+        text.len().div_ceil(4));
+}
+
+#[test]
+fn test_analyze_failure_mixed_internal_external_frames() {
+    let tmpdir = prepare_ts_indexed_tmpdir();
+    let trace = "Error: fail\n    at processData (src/handler.ts:5:9)\n    at internalFunc (/usr/lib/node/internal.js:42:10)\n";
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": { "trace": trace } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("/usr/lib/"), "external paths must not leak; got: {text}");
+    // Frame with system path should show em-dash in path column since file_path is None
+    assert!(text.contains("\u{2014}"), "external frames should show em-dash in path column");
+}
+
+#[test]
+fn test_analyze_failure_keyword_fallback() {
+    let tmpdir = prepare_ts_indexed_tmpdir();
+    // No stack frames, but domain terms matching indexed symbols
+    let trace = "TypeError in UserService.validateCredentials: invalid input";
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": { "trace": trace } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    // Path B should find symbols matching "UserService" or "validateCredentials"
+    assert!(text.contains("Failure Analysis"), "must have analysis header; got: {text}");
+    // Path B proof: keyword fallback must produce context with matched symbols
+    assert!(text.contains("Pivot Symbols") || text.contains("Context Brief"),
+        "Path B keyword fallback must produce context from matched symbols; got: {text}");
+    assert!(!text.contains("Could not resolve input"),
+        "Path B must not fall through to Path C when keywords match; got: {text}");
+}
+
+#[test]
+fn test_analyze_failure_path_c_no_keywords() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": {
+            "trace": "it has an error and it failed"
+        } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Could not resolve input to indexed code"),
+        "must indicate fallback; got: {text}");
+}
+
+#[test]
+fn test_analyze_failure_frame_cap_in_output() {
+    let tmpdir = prepare_ts_indexed_tmpdir();
+    let mut trace = String::from("Error: deep stack\n");
+    for i in 0..50 {
+        trace.push_str(&format!("    at func_{i} (src/handler.ts:{i}:1)\n", i = i + 1));
+    }
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "analyze_failure", "arguments": { "trace": trace } }
+    })]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    // Extract Frame Resolution section and count data rows
+    if let Some(start) = text.find("### Frame Resolution") {
+        let section = &text[start..];
+        let end = section.find("\n## ").or_else(|| section.find("\n### ").filter(|&p| p > 0))
+            .unwrap_or(section.len());
+        let frame_section = &section[..end];
+        let data_rows = frame_section.lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| #") && !l.starts_with("|-"))
+            .count();
+        assert!(data_rows <= 30, "frame table must have at most 30 data rows; got {data_rows}");
+    }
+}

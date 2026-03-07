@@ -67,6 +67,7 @@ olaf init
 - `save_observation` — store a session note for future recall
 - `get_session_history` — retrieve observations and changes from recent sessions; supports relevance-ranked sorting
 - `trace_flow` — trace execution paths between two symbols through the dependency graph
+- `analyze_failure` — parse a stack trace or error output and return a context brief focused on the failure path
 - `list_restore_points` — view file snapshots available for undo
 - `undo_change` — restore a file to a specific pre-edit snapshot
 
