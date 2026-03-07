@@ -691,7 +691,7 @@ pub(crate) fn get_impact(
             "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
              FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
              WHERE e.target_id=?1
-               AND e.kind IN ('calls', 'extends', 'implements')
+               AND e.kind IN ('calls', 'extends', 'implements', 'uses_type')
              LIMIT ?2"
         )?;
         let rows: Vec<(i64, String, String, String, String)> = stmt.query_map(
@@ -715,7 +715,7 @@ pub(crate) fn get_impact(
         "{} direct and transitive dependent(s) found (depth={depth})\n",
         results.len()
     ));
-    output.push_str("Note: import relationships are not tracked — only calls, extends, and implements edges.\n\n");
+    output.push_str("Note: traverses calls, extends, implements, and uses_type edges. Import relationships are not yet tracked at symbol level.\n\n");
 
     if results.is_empty() {
         output.push_str("No dependents found.\n");
@@ -1327,5 +1327,79 @@ mod tests {
         let result = find_pivot_symbols(&conn, "context data", &[], 10).unwrap();
         let ctx_ids: Vec<i64> = result.into_iter().filter(|&id| id == 10 || id == 20 || id == 30).collect();
         assert_eq!(ctx_ids, vec![10, 20, 30], "symbols with equal score must be ordered by id ASC");
+    }
+
+    #[test]
+    fn impact_includes_uses_type_edges() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/types.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2,'src/handler.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'src/types.ts::MyInterface','MyInterface','interface',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,2,'src/handler.ts::handleRequest','handleRequest','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
+
+        let result = get_impact(&conn, "src/types.ts::MyInterface", 2).unwrap();
+        assert!(result.contains("handleRequest"), "type user must appear in impact results");
+        assert!(result.contains("uses_type"), "edge kind must be shown in output");
+    }
+
+    #[test]
+    fn impact_excludes_unrelated_edge_kinds() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/types.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2,'src/other.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'src/types.ts::Target','Target','class',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (2,2,'src/other.ts::Ref','Ref','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2,1,'references')", []).unwrap();
+
+        let result = get_impact(&conn, "src/types.ts::Target", 2).unwrap();
+        assert!(!result.contains("Ref"), "references edge must NOT appear in impact results");
+    }
+
+    #[test]
+    fn impact_traverses_uses_type_transitively() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/types.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2,'src/handler.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (3,'src/caller.ts','h')", []).unwrap();
+        // A: class/interface (type target)
+        conn.execute("INSERT INTO symbols VALUES (1,1,'src/types.ts::A','A','interface',1,10,NULL,NULL,NULL)", []).unwrap();
+        // B: function that uses_type A
+        conn.execute("INSERT INTO symbols VALUES (2,2,'src/handler.ts::B','B','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        // C: function that calls B
+        conn.execute("INSERT INTO symbols VALUES (3,3,'src/caller.ts::C','C','fn',1,5,NULL,NULL,NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
+        conn.execute("INSERT INTO edges VALUES (2,3,2,'calls')", []).unwrap();
+
+        let result = get_impact(&conn, "src/types.ts::A", 3).unwrap();
+        assert!(result.contains("B"), "B (uses_type A) must appear at depth 1");
+        assert!(result.contains("C"), "C (calls B) must appear at depth 2");
+        assert!(result.contains("uses_type"), "uses_type edge kind must be shown");
+        assert!(result.contains("calls"), "calls edge kind must be shown");
+    }
+
+    #[test]
+    fn impact_max_per_hop_with_uses_type() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/types.ts','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'src/types.ts::Target','Target','interface',1,10,NULL,NULL,NULL)", []).unwrap();
+        // Insert 101 symbols all with uses_type edges to Target
+        for i in 2..=102 {
+            conn.execute(
+                &format!("INSERT INTO files VALUES ({i},'src/dep{i}.ts','h')"),
+                [],
+            ).unwrap();
+            conn.execute(
+                &format!("INSERT INTO symbols VALUES ({i},{i},'src/dep{i}.ts::Dep{i}','Dep{i}','fn',1,5,NULL,NULL,NULL)"),
+                [],
+            ).unwrap();
+            conn.execute(
+                &format!("INSERT INTO edges VALUES ({i},{i},1,'uses_type')"),
+                [],
+            ).unwrap();
+        }
+
+        let result = get_impact(&conn, "src/types.ts::Target", 1).unwrap();
+        assert!(result.contains("Results truncated"), "truncation warning must appear when >100 dependents");
     }
 }

@@ -75,7 +75,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_impact",
-            "description": "Find symbols that call, extend, or implement a given symbol FQN. Note: import relationships are not tracked. For combined context+impact, use get_brief with symbol_fqn. Use get_impact when you already have a specific symbol and want only its dependents.",
+            "description": "Find symbols that call, extend, implement, or use a given symbol FQN as a type. Import relationships are not yet tracked at symbol level. For combined context+impact, use get_brief with symbol_fqn. Use get_impact when you already have a specific symbol and want only its dependents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

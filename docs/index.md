@@ -257,7 +257,7 @@ Once connected, Claude can use these tools:
 | Tool | Description |
 |-|-|
 | `get_context` | Token-budgeted context brief for a task; triggers incremental re-index |
-| `get_impact` | Find symbols that call, extend, or implement a given symbol FQN |
+| `get_impact` | Find symbols that call, extend, implement, or use a given symbol FQN as a type |
 | `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies) |
 | `get_brief` | Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Start here — use `get_context` or `get_impact` for fine-grained control |
 | `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
