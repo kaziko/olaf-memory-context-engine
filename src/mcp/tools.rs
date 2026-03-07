@@ -225,6 +225,29 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["file_path", "snapshot_id"]
             }
         }),
+        serde_json::json!({
+            "name": "submit_lsp_edges",
+            "description": "Submit type-resolved edges from a language server into the graph. Edges supplement static tree-sitter analysis with relationships like interface implementations, dynamic dispatch, and generic type resolution that static parsing cannot resolve. Edges are ephemeral — they must be resubmitted after a full reindex.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "edges": {
+                        "type": "array",
+                        "description": "Array of edge objects (max 500)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_fqn": { "type": "string", "description": "FQN of the source symbol" },
+                                "target_fqn": { "type": "string", "description": "FQN of the target symbol" },
+                                "kind": { "type": "string", "description": "One of: calls, extends, implements, uses_type" }
+                            },
+                            "required": ["source_fqn", "target_fqn", "kind"]
+                        }
+                    }
+                },
+                "required": ["edges"]
+            }
+        }),
     ]
 }
 
@@ -249,6 +272,7 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
         "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
         "get_brief"            => handle_get_brief(conn, project_root, args),
         "trace_flow"           => handle_trace_flow(conn, args),
+        "submit_lsp_edges"     => handle_submit_lsp_edges(conn, args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -1171,6 +1195,111 @@ fn relative_age_ms(millis: u128, now_ms: u128) -> String {
     } else {
         format!("{} days ago", diff / 86_400_000)
     }
+}
+
+// ─── submit_lsp_edges handler ─────────────────────────────────────────────────
+
+const ALLOWED_LSP_KINDS: &[&str] = &["calls", "extends", "implements", "uses_type"];
+
+fn handle_submit_lsp_edges(
+    conn: &mut rusqlite::Connection,
+    args: Option<&Value>,
+) -> Result<String, ToolError> {
+    let empty = serde_json::json!({});
+    let args = args.unwrap_or(&empty);
+
+    let edges_val = args.get("edges")
+        .ok_or_else(|| ToolError::InvalidParams("missing required field: edges".into()))?;
+    let edges_arr = edges_val.as_array()
+        .ok_or_else(|| ToolError::InvalidParams("edges must be an array".into()))?;
+
+    if edges_arr.len() > 500 {
+        return Err(ToolError::InvalidParams("max 500 edges per call".into()));
+    }
+
+    let submitted = edges_arr.len();
+    let mut valid_edges: Vec<(&str, &str, &str)> = Vec::new();
+    let mut invalid_kind = 0usize;
+    let mut malformed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, entry) in edges_arr.iter().enumerate() {
+        let obj = match entry.as_object() {
+            Some(o) => o,
+            None => { malformed += 1; continue; }
+        };
+
+        let source_fqn = match obj.get("source_fqn").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => { malformed += 1; continue; }
+        };
+        let target_fqn = match obj.get("target_fqn").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => { malformed += 1; continue; }
+        };
+        let kind = match obj.get("kind").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => { malformed += 1; continue; }
+        };
+
+        if !ALLOWED_LSP_KINDS.contains(&kind) {
+            invalid_kind += 1;
+            errors.push(format!("Edge {}: unknown kind '{}'", i, kind));
+            continue;
+        }
+
+        valid_edges.push((source_fqn, target_fqn, kind));
+    }
+
+    // Collect unique FQNs for batch resolution
+    let mut all_fqns: Vec<&str> = Vec::new();
+    let mut seen_fqns: HashSet<&str> = HashSet::new();
+    for (src, tgt, _) in &valid_edges {
+        if seen_fqns.insert(src) { all_fqns.push(src); }
+        if seen_fqns.insert(tgt) { all_fqns.push(tgt); }
+    }
+
+    let fqn_map = crate::graph::store::resolve_fqns_to_ids(conn, &all_fqns)
+        .map_err(|e| ToolError::Internal(e.into()))?;
+
+    let mut resolved: Vec<(i64, i64, &str)> = Vec::new();
+    let mut unresolved = 0usize;
+    let mut unresolved_examples: Vec<String> = Vec::new();
+
+    for (src_fqn, tgt_fqn, kind) in &valid_edges {
+        let src_id = fqn_map.get(*src_fqn);
+        let tgt_id = fqn_map.get(*tgt_fqn);
+        match (src_id, tgt_id) {
+            (Some(&s), Some(&t)) => resolved.push((s, t, kind)),
+            _ => {
+                unresolved += 1;
+                if unresolved_examples.len() < 5 && src_id.is_none() {
+                    unresolved_examples.push(src_fqn.to_string());
+                }
+                if unresolved_examples.len() < 5 && tgt_id.is_none() {
+                    unresolved_examples.push(tgt_fqn.to_string());
+                }
+            }
+        }
+    }
+
+    let tx = conn.transaction().map_err(|e| ToolError::Internal(e.into()))?;
+    let insert_result = crate::graph::store::insert_lsp_edges(&tx, &resolved)
+        .map_err(|e| ToolError::Internal(e.into()))?;
+    tx.commit().map_err(|e| ToolError::Internal(e.into()))?;
+
+    let response = serde_json::json!({
+        "submitted": submitted,
+        "inserted": insert_result.inserted,
+        "already_existed": insert_result.already_existed,
+        "unresolved": unresolved,
+        "invalid_kind": invalid_kind,
+        "malformed": malformed,
+        "unresolved_examples": unresolved_examples,
+        "errors": errors,
+    });
+
+    Ok(serde_json::to_string_pretty(&response).unwrap())
 }
 
 #[cfg(test)]

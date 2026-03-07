@@ -1305,3 +1305,183 @@ fn test_analyze_failure_frame_cap_in_output() {
         assert!(data_rows <= 30, "frame table must have at most 30 data rows; got {data_rows}");
     }
 }
+
+// ─── Story 9.6: submit_lsp_edges integration tests ───────────────────────────
+
+/// Creates a TempDir with two Rust functions that can be used for LSP edge tests.
+/// Returns (tmpdir, source_fqn, target_fqn).
+fn prepare_lsp_edge_tmpdir() -> (tempfile::TempDir, String, String) {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src/");
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn caller() {}\npub fn callee() {}\n",
+    ).expect("write fixture");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index");
+    assert!(status.status.success(), "olaf index must succeed");
+
+    (tmpdir, "src/lib.rs::caller".to_string(), "src/lib.rs::callee".to_string())
+}
+
+fn submit_lsp_edges_request(id: u64, edges: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "submit_lsp_edges", "arguments": { "edges": edges } }
+    })
+}
+
+fn parse_tool_text(response: &serde_json::Value) -> serde_json::Value {
+    let text = response["result"]["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("no text in response: {}", response));
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON in response text: {e}\n{text}"))
+}
+
+#[test]
+fn test_submit_lsp_edges_basic() {
+    let (tmpdir, src_fqn, tgt_fqn) = prepare_lsp_edge_tmpdir();
+    let req = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": src_fqn, "target_fqn": tgt_fqn, "kind": "calls" }
+    ]));
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let data = parse_tool_text(&responses[0]);
+    assert_eq!(data["submitted"], 1);
+    assert_eq!(data["inserted"], 1);
+    assert_eq!(data["already_existed"], 0);
+    assert_eq!(data["unresolved"], 0);
+    assert_eq!(data["invalid_kind"], 0);
+    assert_eq!(data["malformed"], 0);
+}
+
+#[test]
+fn test_submit_lsp_edges_unresolved_fqns() {
+    let (tmpdir, src_fqn, _) = prepare_lsp_edge_tmpdir();
+    let req = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": src_fqn, "target_fqn": "nonexistent::sym", "kind": "calls" }
+    ]));
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let data = parse_tool_text(&responses[0]);
+    assert_eq!(data["unresolved"], 1);
+    assert_eq!(data["inserted"], 0);
+    let examples = data["unresolved_examples"].as_array().unwrap();
+    assert!(!examples.is_empty(), "must report unresolved FQN examples");
+}
+
+#[test]
+fn test_submit_lsp_edges_invalid_kind() {
+    let (tmpdir, src_fqn, tgt_fqn) = prepare_lsp_edge_tmpdir();
+    let req = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": src_fqn, "target_fqn": tgt_fqn, "kind": "references" }
+    ]));
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let data = parse_tool_text(&responses[0]);
+    assert_eq!(data["invalid_kind"], 1);
+    assert_eq!(data["inserted"], 0);
+    let errors = data["errors"].as_array().unwrap();
+    assert!(errors[0].as_str().unwrap().contains("references"));
+}
+
+#[test]
+fn test_submit_lsp_edges_dedup() {
+    let (tmpdir, src_fqn, tgt_fqn) = prepare_lsp_edge_tmpdir();
+    // Submit twice — second should report already_existed
+    let req1 = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": &src_fqn, "target_fqn": &tgt_fqn, "kind": "calls" }
+    ]));
+    let req2 = submit_lsp_edges_request(2, serde_json::json!([
+        { "source_fqn": &src_fqn, "target_fqn": &tgt_fqn, "kind": "calls" }
+    ]));
+    let responses = run_requests_in(tmpdir.path(), &[req1, req2]);
+    let data1 = parse_tool_text(&responses[0]);
+    let data2 = parse_tool_text(&responses[1]);
+    assert_eq!(data1["inserted"], 1);
+    assert_eq!(data2["already_existed"], 1);
+    assert_eq!(data2["inserted"], 0);
+}
+
+#[test]
+fn test_submit_lsp_edges_batch_limit() {
+    let (tmpdir, _, _) = prepare_lsp_edge_tmpdir();
+    let edges: Vec<serde_json::Value> = (0..501)
+        .map(|i| serde_json::json!({ "source_fqn": format!("s{i}"), "target_fqn": format!("t{i}"), "kind": "calls" }))
+        .collect();
+    let req = submit_lsp_edges_request(1, serde_json::Value::Array(edges));
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["error"]["code"] == -32602, "batch >500 must return InvalidParams error");
+}
+
+#[test]
+fn test_submit_lsp_edges_malformed_entries() {
+    let (tmpdir, src_fqn, tgt_fqn) = prepare_lsp_edge_tmpdir();
+    let req = submit_lsp_edges_request(1, serde_json::json!([
+        "not_an_object",
+        { "source_fqn": "", "target_fqn": tgt_fqn, "kind": "calls" },
+        { "source_fqn": src_fqn, "target_fqn": tgt_fqn, "kind": 42 },
+        { "target_fqn": tgt_fqn, "kind": "calls" },
+        { "source_fqn": src_fqn, "target_fqn": tgt_fqn, "kind": "calls" }
+    ]));
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let data = parse_tool_text(&responses[0]);
+    assert_eq!(data["malformed"], 4, "4 entries are malformed");
+    assert_eq!(data["inserted"], 1, "1 valid entry should be inserted");
+    assert_eq!(data["submitted"], 5);
+}
+
+#[test]
+fn test_get_impact_includes_lsp_edges() {
+    let (tmpdir, src_fqn, tgt_fqn) = prepare_lsp_edge_tmpdir();
+
+    // Submit LSP edge: caller calls callee
+    let submit = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": &src_fqn, "target_fqn": &tgt_fqn, "kind": "calls" }
+    ]));
+    // Then check impact on callee — caller should appear
+    let impact = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "get_impact", "arguments": { "symbol_fqn": tgt_fqn } }
+    });
+    let responses = run_requests_in(tmpdir.path(), &[submit, impact]);
+    let impact_text = responses[1]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(impact_text.contains("caller"), "get_impact must include LSP edge source (caller) in output");
+}
+
+#[test]
+fn test_trace_flow_includes_lsp_edges() {
+    let (tmpdir, _, _) = prepare_lsp_edge_tmpdir();
+
+    // Create a chain: caller → callee (static via index), add a third symbol and LSP edge
+    let src_dir = tmpdir.path().join("src");
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn caller() { callee(); }\npub fn callee() {}\npub fn downstream() {}\n",
+    ).expect("write fixture");
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index");
+    assert!(status.status.success());
+
+    // Submit LSP edge: callee → downstream
+    let submit = submit_lsp_edges_request(1, serde_json::json!([
+        { "source_fqn": "src/lib.rs::callee", "target_fqn": "src/lib.rs::downstream", "kind": "calls" }
+    ]));
+    let trace = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "trace_flow", "arguments": {
+            "source_fqn": "src/lib.rs::caller",
+            "target_fqn": "src/lib.rs::downstream"
+        }}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[submit, trace]);
+    let trace_resp = &responses[1];
+    let trace_text = trace_resp["result"]["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("no text in trace_flow response: {}", serde_json::to_string_pretty(trace_resp).unwrap()));
+    assert!(trace_text.contains("downstream"), "trace_flow must traverse LSP edge to reach downstream. Output:\n{trace_text}");
+}

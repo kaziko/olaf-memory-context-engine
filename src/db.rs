@@ -13,6 +13,10 @@ pub enum DbError {
     Io(#[from] std::io::Error),
 }
 
+const MIGRATION_002: &str = "
+ALTER TABLE edges ADD COLUMN source_origin TEXT NOT NULL DEFAULT 'static';
+";
+
 const MIGRATION_001: &str = "
 CREATE TABLE IF NOT EXISTS files (
     id              INTEGER PRIMARY KEY,
@@ -148,7 +152,8 @@ fn handle_corruption_or_propagate(
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
         M::up(MIGRATION_001),
-        // Future migrations: append M::up(MIGRATION_002), etc. — never edit existing entries
+        M::up(MIGRATION_002),
+        // Future migrations: append M::up(MIGRATION_003), etc. — never edit existing entries
     ]);
     migrations.to_latest(conn)?;
     Ok(())
@@ -188,6 +193,37 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "table '{}' must exist", table);
         }
+    }
+
+    #[test]
+    fn test_migration_002_adds_source_origin() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        // Verify source_origin column exists and defaults to 'static'
+        // Insert a file and symbol first (FK requirements)
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, language, last_indexed_at) VALUES ('test.rs', 'h', 'rust', 1000)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE path = 'test.rs'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) VALUES (?1, 'test.rs::f', 'f', 'function', 1, 2, 'h')",
+            rusqlite::params![file_id],
+        ).unwrap();
+        let sym_id: i64 = conn.query_row("SELECT id FROM symbols WHERE fqn = 'test.rs::f'", [], |r| r.get(0)).unwrap();
+
+        // Insert edge without specifying source_origin — should default to 'static'
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, ?1, 'calls')",
+            rusqlite::params![sym_id],
+        ).unwrap();
+        let origin: String = conn.query_row(
+            "SELECT source_origin FROM edges WHERE source_id = ?1",
+            rusqlite::params![sym_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "static", "source_origin must default to 'static'");
     }
 
     #[test]

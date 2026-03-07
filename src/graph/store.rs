@@ -231,6 +231,62 @@ pub(crate) fn insert_edges_bulk(
     Ok(inserted)
 }
 
+/// Result of an `insert_lsp_edges` batch operation.
+pub(crate) struct InsertResult {
+    pub inserted: usize,
+    pub already_existed: usize,
+}
+
+/// Bulk insert LSP-originated edges with `source_origin = 'lsp'`.
+///
+/// Uses `INSERT OR IGNORE` against the `UNIQUE(source_id, target_id, kind)` constraint.
+/// Caller owns the transaction.
+pub(crate) fn insert_lsp_edges(
+    tx: &Transaction,
+    edges: &[(i64, i64, &str)],
+) -> Result<InsertResult, StoreError> {
+    let mut inserted = 0usize;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO edges (source_id, target_id, kind, source_origin) VALUES (?1, ?2, ?3, 'lsp')",
+    )?;
+    for (src_id, tgt_id, kind) in edges {
+        inserted += stmt.execute(params![src_id, tgt_id, kind])?;
+    }
+    let already_existed = edges.len() - inserted;
+    Ok(InsertResult { inserted, already_existed })
+}
+
+/// Batch-resolve FQN strings to symbol IDs using chunked `WHERE fqn IN (...)` queries.
+///
+/// Returns a map of FQN → symbol ID for all FQNs that matched. Missing FQNs are
+/// absent from the map. Uses chunk size 100 to stay under SQLite's variable limit.
+pub(crate) fn resolve_fqns_to_ids(
+    conn: &Connection,
+    fqns: &[&str],
+) -> Result<HashMap<String, i64>, StoreError> {
+    let mut result = HashMap::new();
+    for chunk in fqns.chunks(100) {
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT fqn, id FROM symbols WHERE fqn IN ({})", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (fqn, id) = row?;
+            result.insert(fqn, id);
+        }
+    }
+    Ok(result)
+}
+
 /// Load the full FQN → symbol ID map in a single SELECT.
 ///
 /// Used for bulk edge resolution after the file walk completes, replacing
@@ -768,5 +824,149 @@ mod tests {
         assert!(stats.files > 0, "at least one file must be indexed");
         assert!(stats.symbols > 0, "at least one symbol must be indexed");
         assert!(stats.last_indexed_at.is_some(), "last_indexed_at must be set after indexing");
+    }
+
+    // ─── Story 9.6 Unit Tests ────────────────────────────────────────────────────
+
+    fn setup_two_symbols(conn: &mut rusqlite::Connection) -> (i64, i64) {
+        let tx = conn.transaction().unwrap();
+        let file_id = upsert_file(&tx, "src/a.rs", "aaa", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        let make_sym = |fqn: &str, name: &str| crate::parser::symbols::Symbol {
+            fqn: fqn.to_string(),
+            name: name.to_string(),
+            kind: crate::parser::SymbolKind::Function,
+            start_line: 1,
+            end_line: 2,
+            signature: None,
+            docstring: None,
+            source_hash: "hash".to_string(),
+        };
+
+        let tx = conn.transaction().unwrap();
+        replace_file_symbols(
+            &tx,
+            file_id,
+            &[make_sym("src/a.rs::foo", "foo"), make_sym("src/a.rs::bar", "bar")],
+        ).unwrap();
+        tx.commit().unwrap();
+
+        let fqn_map = load_fqn_id_map(conn).unwrap();
+        (fqn_map["src/a.rs::foo"], fqn_map["src/a.rs::bar"])
+    }
+
+    #[test]
+    fn test_insert_lsp_edges_basic() {
+        let mut conn = open_test_db();
+        let (src, tgt) = setup_two_symbols(&mut conn);
+
+        let tx = conn.transaction().unwrap();
+        let result = insert_lsp_edges(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.already_existed, 0);
+
+        let origin: String = conn.query_row(
+            "SELECT source_origin FROM edges WHERE source_id = ?1 AND target_id = ?2",
+            params![src, tgt],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "lsp");
+    }
+
+    #[test]
+    fn test_insert_lsp_edges_dedup_with_static() {
+        let mut conn = open_test_db();
+        let (src, tgt) = setup_two_symbols(&mut conn);
+
+        // Insert static edge first
+        let tx = conn.transaction().unwrap();
+        insert_edges_bulk(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        // Insert same triple as LSP edge — should be ignored
+        let tx = conn.transaction().unwrap();
+        let result = insert_lsp_edges(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.already_existed, 1);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "only one edge row should exist");
+
+        let origin: String = conn.query_row(
+            "SELECT source_origin FROM edges WHERE source_id = ?1 AND target_id = ?2",
+            params![src, tgt],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "static", "first writer (static) must win");
+    }
+
+    #[test]
+    fn test_insert_lsp_edges_dedup_lsp_first() {
+        let mut conn = open_test_db();
+        let (src, tgt) = setup_two_symbols(&mut conn);
+
+        // Insert LSP edge first
+        let tx = conn.transaction().unwrap();
+        insert_lsp_edges(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        // Insert same triple as static edge — should be ignored
+        let tx = conn.transaction().unwrap();
+        insert_edges_bulk(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "only one edge row should exist");
+
+        let origin: String = conn.query_row(
+            "SELECT source_origin FROM edges WHERE source_id = ?1 AND target_id = ?2",
+            params![src, tgt],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "lsp", "first writer (lsp) must win");
+    }
+
+    #[test]
+    fn test_lsp_edges_cascade_on_symbol_delete() {
+        let mut conn = open_test_db();
+        let (src, tgt) = setup_two_symbols(&mut conn);
+
+        // Insert LSP edge
+        let tx = conn.transaction().unwrap();
+        insert_lsp_edges(&tx, &[(src, tgt, "calls")]).unwrap();
+        tx.commit().unwrap();
+
+        let edge_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(edge_count, 1);
+
+        // Get the file_id for our symbols
+        let file_id: i64 = conn.query_row(
+            "SELECT file_id FROM symbols WHERE id = ?1", params![src], |r| r.get(0),
+        ).unwrap();
+
+        // replace_file_symbols with empty vec — deletes all symbols, cascade deletes edges
+        let tx = conn.transaction().unwrap();
+        replace_file_symbols(&tx, file_id, &[]).unwrap();
+        tx.commit().unwrap();
+
+        let edge_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(edge_count, 0, "LSP edges must be cascade-deleted when symbols are removed");
+    }
+
+    #[test]
+    fn test_resolve_fqns_to_ids() {
+        let mut conn = open_test_db();
+        setup_two_symbols(&mut conn);
+
+        let result = resolve_fqns_to_ids(&conn, &["src/a.rs::foo", "src/a.rs::bar", "nonexistent::sym"]).unwrap();
+        assert_eq!(result.len(), 2, "only existing FQNs should resolve");
+        assert!(result.contains_key("src/a.rs::foo"));
+        assert!(result.contains_key("src/a.rs::bar"));
+        assert!(!result.contains_key("nonexistent::sym"));
     }
 }
