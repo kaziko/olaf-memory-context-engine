@@ -105,6 +105,35 @@ pub fn open(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
     Ok(conn)
 }
 
+/// Open an existing database read-only for cross-repo workspace queries.
+///
+/// Does NOT create directories, apply migrations, or recover corrupt DBs.
+/// Verifies WAL mode (must have been set by the owning process).
+/// Returns `DbError` on missing file, non-WAL DB, or corruption.
+pub fn open_readonly(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
+    use rusqlite::OpenFlags;
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    let conn = rusqlite::Connection::open_with_flags(db_path, flags)?;
+
+    // Verify WAL mode — do NOT attempt to set it (mutating pragma on read-only handle)
+    let mode: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    if mode != "wal" {
+        return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!("expected WAL mode but got '{mode}'")),
+        )));
+    }
+
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+
+    Ok(conn)
+}
+
 fn open_with_recovery(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
     // SQLite's Connection::open() is lazy — corruption is detected on first read.
     // Open the connection, then probe with a schema query to catch corrupt files early.
@@ -149,11 +178,16 @@ fn handle_corruption_or_propagate(
     }
 }
 
+/// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
+/// Update this when adding new migrations.
+pub const MIGRATION_COUNT: i64 = 2;
+
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
         M::up(MIGRATION_001),
         M::up(MIGRATION_002),
         // Future migrations: append M::up(MIGRATION_003), etc. — never edit existing entries
+        // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;
     Ok(())
@@ -237,6 +271,39 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "FK violation should be rejected");
+    }
+
+    #[test]
+    fn test_open_readonly_valid_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        // Create a valid WAL-mode DB first
+        let _conn = open(&db_path).expect("initial open");
+        drop(_conn);
+
+        // Now open read-only
+        let conn = open_readonly(&db_path).expect("read-only open should succeed");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn test_open_readonly_missing_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("nonexistent.db");
+        let result = open_readonly(&db_path);
+        assert!(result.is_err(), "should fail on missing file");
+    }
+
+    #[test]
+    fn test_open_readonly_does_not_create_dirs() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("new-dir").join("index.db");
+        let result = open_readonly(&db_path);
+        assert!(result.is_err());
+        assert!(!dir.path().join("new-dir").exists(), "should not create directories");
     }
 
     #[test]

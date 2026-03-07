@@ -36,11 +36,31 @@ enum Commands {
         file: Option<std::path::PathBuf>,
         timestamp: Option<i64>,
     },
+    /// Manage multi-repo workspace
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCommands,
+    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum WorkspaceCommands {
+    /// Initialize a workspace with the current repo
+    Init,
+    /// Add a repository to the workspace
+    Add {
+        /// Path to the repository to add
+        path: std::path::PathBuf,
+    },
+    /// List workspace members and their status
+    List,
+    /// Validate workspace members health
+    Doctor,
 }
 
 #[derive(clap::Subcommand)]
@@ -125,6 +145,20 @@ fn main() -> anyhow::Result<()> {
                         "usage: olaf restore <file> <timestamp>  OR  olaf restore list <file>"
                     );
                 }
+            }
+        },
+        Commands::Workspace { action } => match action {
+            WorkspaceCommands::Init => {
+                cli::workspace::run_init()?;
+            }
+            WorkspaceCommands::Add { path } => {
+                cli::workspace::run_add(&path)?;
+            }
+            WorkspaceCommands::List => {
+                cli::workspace::run_list()?;
+            }
+            WorkspaceCommands::Doctor => {
+                cli::workspace::run_doctor()?;
             }
         },
         Commands::Completions { shell } => {

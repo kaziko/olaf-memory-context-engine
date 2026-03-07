@@ -6,3 +6,4 @@ pub(crate) mod serve;
 pub(crate) mod sessions;
 pub(crate) mod setup;
 pub(crate) mod status;
+pub(crate) mod workspace;

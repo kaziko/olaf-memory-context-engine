@@ -8,6 +8,19 @@ Olaf is a codebase indexing and context retrieval engine that integrates with Cl
 
 Olaf also acts as **session memory** — it automatically records decisions, errors, and file changes as observations linked to specific symbols and files. These observations persist across sessions, so Claude remembers what was tried before, what failed, and why certain decisions were made. Combined with pre-edit snapshots, this gives Claude both recall and undo.
 
+### Features
+
+- **Multi-language indexing** — TypeScript, JavaScript, Python, Rust, PHP, Go
+- **Intent-aware context** — classifies your task (bug-fix, refactor, implementation) and adjusts retrieval depth and direction
+- **Token-budgeted briefs** — context fits within your budget, not a dump of every file
+- **Impact analysis** — traces callers, implementors, and type-usage edges for any symbol
+- **Execution path tracing** — find how symbol A reaches symbol B through the call graph
+- **Session memory** — decisions, errors, and insights persist across conversations
+- **Pre-edit snapshots** — undo any AI edit instantly, no git required
+- **LSP edge injection** — enrich the graph with type-resolved edges from language servers
+- **Failure analysis** — parse stack traces and get context briefs focused on the error path
+- **Multi-repo workspaces** — federated context retrieval across linked repositories via `.olaf/workspace.toml` (pivot search and context assembly span repos; impact analysis, memory, and graph traversal remain local per-repo)
+
 ## Install
 
 ### Via cargo
@@ -75,6 +88,13 @@ olaf init
 **Code navigation:**
 - `trace_flow` — trace execution paths between two symbols through the call graph
 - `index_status` — check indexing coverage and freshness
+
+**LSP integration:**
+- `submit_lsp_edges` — inject type-resolved edges from a language server (interface implementations, dynamic dispatch, generics) into the graph for richer `get_impact` and `trace_flow` results
+
+**Multi-repo workspace:**
+- `get_brief` and `get_context` automatically fan out across linked repos when `.olaf/workspace.toml` exists
+- Impact analysis, memory, and graph traversal remain local per-repo
 
 **Safety:**
 - `list_restore_points` — view pre-edit snapshots available for undo

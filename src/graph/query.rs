@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::graph::skeleton::skeletonize;
+use crate::workspace::Workspace;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueryError {
@@ -636,6 +637,244 @@ pub(crate) fn get_context_with_pivots(
     }
 
     build_context_brief(conn, project_root, &intent_header, &resolved_ids, &policy, token_budget)
+}
+
+// --- Workspace-aware federated queries ---
+
+/// Tagged pivot: a symbol from a specific workspace member.
+#[derive(Debug, Clone)]
+pub(crate) struct TaggedPivot {
+    pub member_index: usize,
+    pub symbol_id: i64,
+}
+
+/// Find pivot symbols across all workspace members.
+/// Tags results with `(member_index, symbol_id)`.
+/// Interleaves local-first: up to 60% from local, rest round-robin from remotes.
+pub(crate) fn find_pivot_symbols_multi(
+    workspace: &Workspace,
+    intent: &str,
+    file_hints: &[String],
+    pool_size: usize,
+) -> Result<Vec<TaggedPivot>, QueryError> {
+    let members = workspace.all_read_conns();
+    let mut per_member: Vec<(usize, Vec<i64>)> = Vec::new();
+
+    for m in &members {
+        let ids = find_pivot_symbols(m.conn, intent, file_hints, pool_size)?;
+        if !ids.is_empty() {
+            per_member.push((m.index, ids));
+        }
+    }
+
+    if per_member.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Separate local (index 0) from remotes (keep per-member grouping for round-robin)
+    let local_pivots: Vec<i64> = per_member
+        .iter()
+        .filter(|(idx, _)| *idx == 0)
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    let remote_groups: Vec<&(usize, Vec<i64>)> = per_member
+        .iter()
+        .filter(|(idx, _)| *idx != 0)
+        .collect();
+    let has_remotes = !remote_groups.is_empty();
+
+    let local_limit = if !has_remotes {
+        pool_size
+    } else {
+        // At least 1 remote slot when pool_size >= 2
+        let max_local = pool_size * 60 / 100;
+        max_local.min(pool_size.saturating_sub(1))
+    };
+
+    let mut result: Vec<TaggedPivot> = Vec::new();
+    let mut seen: HashSet<(usize, i64)> = HashSet::new();
+
+    // Take local pivots first
+    for id in &local_pivots {
+        if result.len() >= local_limit {
+            break;
+        }
+        if seen.insert((0, *id)) {
+            result.push(TaggedPivot { member_index: 0, symbol_id: *id });
+        }
+    }
+
+    // Fill remaining from remotes using true round-robin across members
+    if has_remotes {
+        let mut cursors: Vec<usize> = vec![0; remote_groups.len()];
+        let mut exhausted = 0;
+        while result.len() < pool_size && exhausted < remote_groups.len() {
+            exhausted = 0;
+            for (gi, (idx, ids)) in remote_groups.iter().enumerate() {
+                let idx = *idx;
+                if result.len() >= pool_size { break; }
+                // Advance cursor for this group until we find an unseen pivot or exhaust
+                while cursors[gi] < ids.len() {
+                    let id = ids[cursors[gi]];
+                    cursors[gi] += 1;
+                    if seen.insert((idx, id)) {
+                        result.push(TaggedPivot { member_index: idx, symbol_id: id });
+                        break;
+                    }
+                }
+                if cursors[gi] >= ids.len() {
+                    exhausted += 1;
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Build context brief from tagged pivots across workspace members.
+pub(crate) fn build_context_brief_multi(
+    workspace: &Workspace,
+    intent_header: &str,
+    tagged_pivots: &[TaggedPivot],
+    policy: &TraversalPolicy,
+    token_budget: usize,
+) -> Result<String, QueryError> {
+    let members = workspace.all_read_conns();
+    let mut output = intent_header.to_string();
+
+    if tagged_pivots.is_empty() {
+        output.push_str(NO_SYMBOLS_IN_INDEX);
+        return Ok(output);
+    }
+
+    let pivot_budget = token_budget * 70 / 100;
+    let skeleton_budget = token_budget * 20 / 100;
+
+    output.push_str("\n## Pivot Symbols\n\n");
+
+    let mut pivot_tokens = 0usize;
+    // Only local fqns/file_paths for memory injection — remote identifiers must NOT
+    // pollute local observation queries (story: "memory local-only").
+    let mut local_fqns: HashSet<String> = HashSet::new();
+    let mut local_file_paths: HashSet<String> = HashSet::new();
+
+    for tp in tagged_pivots {
+        let m = match members.iter().find(|m| m.index == tp.member_index) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let Some(row) = load_symbol_row(m.conn, tp.symbol_id)? else { continue };
+        if is_output_sensitive(&row.file_path) { continue; }
+
+        // Only collect identifiers from local repo for memory matching
+        if tp.member_index == 0 {
+            local_fqns.insert(row.fqn.clone());
+            local_file_paths.insert(row.file_path.clone());
+        }
+
+        let source = match read_symbol_source(m.project_root, &row.file_path, row.start_line, row.end_line) {
+            Ok(s) if !s.is_empty() => s,
+            _ => row.signature.as_deref().unwrap_or("(source unavailable)").to_string(),
+        };
+
+        let entry = if tp.member_index != 0 {
+            format!(
+                "## {} (`{}`) [{}]\nFile: `{}` lines {}-{}\n\n```\n{}\n```\n\n",
+                row.name, row.fqn, m.label, row.file_path, row.start_line, row.end_line, source
+            )
+        } else {
+            format_pivot_entry(&row, &source)
+        };
+        let entry_tokens = estimate_tokens(&entry);
+        if pivot_tokens + entry_tokens > pivot_budget { break; }
+        output.push_str(&entry);
+        pivot_tokens += entry_tokens;
+    }
+
+    // Supporting symbols — BFS per member (local only for traversal, per story scope)
+    // Only do BFS for local pivots since cross-repo traversal is out of scope
+    let local_pivots: Vec<i64> = tagged_pivots
+        .iter()
+        .filter(|tp| tp.member_index == 0)
+        .map(|tp| tp.symbol_id)
+        .collect();
+
+    if !local_pivots.is_empty() {
+        let local = &members[0];
+        let (_, supporting_with_reasons) = traverse_bfs(local.conn, &local_pivots, policy)?;
+        if !supporting_with_reasons.is_empty() {
+            output.push_str("## Supporting Symbols\n\n");
+            let mut skeleton_tokens = 0usize;
+            for (id, reason) in &supporting_with_reasons {
+                let Some(row) = load_symbol_row(local.conn, *id)? else { continue };
+                if is_output_sensitive(&row.file_path) { continue; }
+
+                local_fqns.insert(row.fqn.clone());
+                local_file_paths.insert(row.file_path.clone());
+
+                let skeleton = skeletonize(local.conn, row.id)?;
+                let reason_line = format!("Why: {reason}\n");
+                let skeleton_tokens_needed = estimate_tokens(&skeleton);
+                let reason_tokens_needed = estimate_tokens(&reason_line);
+
+                if skeleton_tokens + skeleton_tokens_needed > skeleton_budget { break; }
+                output.push_str(&skeleton);
+                skeleton_tokens += skeleton_tokens_needed;
+
+                if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
+                    output.push_str(&reason_line);
+                    skeleton_tokens += reason_tokens_needed;
+                }
+            }
+        }
+    }
+
+    // Memory injection — local only (10% budget)
+    let memory_budget = token_budget * 10 / 100;
+    let local_conn = &members[0].conn;
+    let fqns: Vec<&str> = local_fqns.iter().map(|s| s.as_str()).collect();
+    let file_paths: Vec<&str> = local_file_paths.iter().map(|s| s.as_str()).collect();
+
+    if !fqns.is_empty() || !file_paths.is_empty() {
+        let observations = crate::memory::store::get_observations_for_context(
+            local_conn, &fqns, &file_paths, 50,
+        )
+        .unwrap_or_default();
+
+        if !observations.is_empty() {
+            let mut mem_section = String::new();
+            let mut mem_tokens = 0usize;
+            for obs in &observations {
+                let entry = format_observation_entry(obs);
+                let entry_tokens = estimate_tokens(&entry);
+                if mem_tokens + entry_tokens > memory_budget { break; }
+                mem_section.push_str(&entry);
+                mem_tokens += entry_tokens;
+            }
+            if !mem_section.is_empty() {
+                output.push_str("## Session Memory\n\n");
+                output.push_str(&mem_section);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Top-level workspace-aware context retrieval.
+pub(crate) fn get_context_workspace(
+    workspace: &Workspace,
+    intent: &str,
+    file_hints: &[String],
+    token_budget: usize,
+) -> Result<String, QueryError> {
+    let profile = detect_intent_profile(intent);
+    let policy = derive_traversal_policy(&profile);
+    let intent_header = format_intent_header(&profile, intent);
+    let tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
+    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget)
 }
 
 /// Private helper: query candidate file paths from the files table.

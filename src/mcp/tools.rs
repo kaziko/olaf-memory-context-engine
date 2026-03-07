@@ -253,7 +253,7 @@ pub(crate) fn list() -> Vec<Value> {
 
 /// Dispatches a tools/call request to the appropriate handler.
 /// Returns the tool's text response (server.rs wraps it in MCP content format).
-pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, session_id: &str, params: Option<&Value>) -> Result<String, ToolError> {
+pub(crate) fn dispatch(ws: &mut crate::workspace::Workspace, session_id: &str, params: Option<&Value>) -> Result<String, ToolError> {
     let tool_name = params
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
@@ -261,18 +261,20 @@ pub(crate) fn dispatch(conn: &mut rusqlite::Connection, project_root: &Path, ses
 
     let args = params.and_then(|p| p.get("arguments"));
     match tool_name {
-        "analyze_failure"  => handle_analyze_failure(conn, project_root, session_id, args),
-        "get_context"      => handle_get_context(conn, project_root, args),
-        "get_impact"       => handle_get_impact(conn, args),
-        "get_file_skeleton" => handle_get_file_skeleton(conn, args),
-        "index_status"     => handle_index_status(conn),
-        "save_observation"     => handle_save_observation(conn, session_id, args),
-        "get_session_history"  => handle_get_session_history(conn, args),
-        "list_restore_points"  => handle_list_restore_points(project_root, args),
-        "undo_change"          => handle_undo_change(conn, project_root, session_id, args),
-        "get_brief"            => handle_get_brief(conn, project_root, args),
-        "trace_flow"           => handle_trace_flow(conn, args),
-        "submit_lsp_edges"     => handle_submit_lsp_edges(conn, args),
+        // Workspace-aware: context portion federates across repos
+        "get_brief"            => handle_get_brief(ws, args),
+        "get_context"          => handle_get_context(ws, args),
+        // Local-only tools
+        "analyze_failure"  => { let (c, r) = ws.local_parts(); handle_analyze_failure(c, r, session_id, args) }
+        "get_impact"       => handle_get_impact(ws.local_conn(), args),
+        "get_file_skeleton" => handle_get_file_skeleton(ws.local_conn(), args),
+        "index_status"     => handle_index_status(ws.local_conn()),
+        "save_observation"     => handle_save_observation(ws.local_conn(), session_id, args),
+        "get_session_history"  => handle_get_session_history(ws.local_conn(), args),
+        "list_restore_points"  => handle_list_restore_points(ws.local_root(), args),
+        "undo_change"          => { let (c, r) = ws.local_parts(); handle_undo_change(c, r, session_id, args) }
+        "trace_flow"           => handle_trace_flow(ws.local_conn(), args),
+        "submit_lsp_edges"     => handle_submit_lsp_edges(ws.local_conn(), args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -701,7 +703,7 @@ fn handle_analyze_failure(
     Ok(output)
 }
 
-fn handle_get_context(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
     let intent = args.get("intent").and_then(|v| v.as_str())
@@ -711,10 +713,24 @@ fn handle_get_context(conn: &mut rusqlite::Connection, project_root: &Path, args
         .unwrap_or_default();
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(4000);
 
-    crate::index::run_incremental(conn, project_root)?;
+    // Incremental reindex local only
+    {
+        let (conn, root) = ws.local_parts();
+        crate::index::run_incremental(conn, root)?;
+    }
 
-    crate::graph::query::get_context(conn, project_root, intent, &file_hints, token_budget)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+    let mut result = if ws.has_remotes() {
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+    } else {
+        let (conn, root) = ws.local_parts();
+        crate::graph::query::get_context(conn, root, intent, &file_hints, token_budget)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+    };
+
+    // Append workspace warnings (budget-exempt)
+    result.push_str(&ws.format_warnings_with_freshness());
+    Ok(result)
 }
 
 fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
@@ -1078,8 +1094,7 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
 const MAX_TOKEN_BUDGET: u64 = 1_000_000;
 
 fn handle_get_brief(
-    conn: &mut rusqlite::Connection,
-    project_root: &Path,
+    ws: &mut crate::workspace::Workspace,
     args: Option<&Value>,
 ) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
@@ -1100,29 +1115,43 @@ fn handle_get_brief(
         .map(|v| (v as usize).clamp(1, 10))
         .unwrap_or(3);
 
-    // 2.2 Trigger incremental re-index
-    crate::index::run_incremental(conn, project_root)?;
+    // 2.2 Trigger incremental re-index (local only)
+    {
+        let (conn, root) = ws.local_parts();
+        crate::index::run_incremental(conn, root)?;
+    }
 
-    // 2.3 Compute context budget and call get_context
+    // 2.3 Compute context budget — use workspace-aware path when remotes exist
     let ctx_budget = token_budget * 80 / 100;
-    let context_output = crate::graph::query::get_context(conn, project_root, intent, &file_hints, ctx_budget)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+    let context_output = if ws.has_remotes() {
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+    } else {
+        let (conn, root) = ws.local_parts();
+        crate::graph::query::get_context(conn, root, intent, &file_hints, ctx_budget)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+    };
 
-    // 2.4 Build impact section
+    // 2.4 Build impact section (local-only)
     let impact_output = if let Some(fqn) = symbol_fqn {
-        crate::graph::query::get_impact(conn, fqn, depth)
+        crate::graph::query::get_impact(ws.local_conn(), fqn, depth)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
     };
 
-    // 2.5 Assemble output (both sections already have #-level headings; use only --- as separator)
+    // 2.5 Assemble output
     let mut output = format!("{context_output}\n---\n{impact_output}");
 
     // 2.6 Hard-truncate to enforce token budget
     truncate_to_budget(&mut output, token_budget);
 
-    // 2.7 Return
+    // 2.7 Append budget-exempt sections after truncation
+    if ws.has_remotes() {
+        output.push_str("\n_Impact analysis: local repo only. Memory: local repo only._\n");
+    }
+    output.push_str(&ws.format_warnings_with_freshness());
+
     Ok(output)
 }
 

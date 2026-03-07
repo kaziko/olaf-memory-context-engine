@@ -19,6 +19,14 @@ pub fn run() -> anyhow::Result<()> {
         ts.as_secs(),
         ts.subsec_nanos()
     );
-    crate::memory::store::upsert_session(&conn, &session_id, "claude-code")?;
-    server::run(conn, project_root, session_id)
+
+    // Detect workspace and construct Workspace state
+    let (config, parse_warnings) = crate::workspace::parse_workspace_config(&project_root);
+    let workspace = match config {
+        Some(cfg) => crate::workspace::Workspace::load(conn, project_root, &cfg),
+        None => crate::workspace::Workspace::single(conn, project_root, parse_warnings),
+    };
+
+    crate::memory::store::upsert_session(workspace.local_conn_ref(), &session_id, "claude-code")?;
+    server::run(workspace, session_id)
 }

@@ -1,14 +1,14 @@
 // stdout-pure: no print!/println! ever in this module
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::mcp::{
     protocol::Response,
     tools,
 };
+use crate::workspace::Workspace;
 
-pub(crate) fn run(mut conn: rusqlite::Connection, project_root: PathBuf, session_id: String) -> anyhow::Result<()> {
+pub(crate) fn run(mut workspace: Workspace, session_id: String) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Lock both for the duration — avoids repeated locking overhead in the hot loop
@@ -28,7 +28,7 @@ pub(crate) fn run(mut conn: rusqlite::Connection, project_root: PathBuf, session
             continue;
         }
 
-        if let Some(response) = handle_message(&mut conn, &project_root, &session_id, &line) {
+        if let Some(response) = handle_message(&mut workspace, &session_id, &line) {
             let json = match serde_json::to_string(&response) {
                 Ok(j) => j,
                 Err(e) => {
@@ -45,7 +45,7 @@ pub(crate) fn run(mut conn: rusqlite::Connection, project_root: PathBuf, session
     Ok(())
 }
 
-fn handle_message(conn: &mut rusqlite::Connection, project_root: &std::path::Path, session_id: &str, line: &str) -> Option<Response> {
+fn handle_message(workspace: &mut Workspace, session_id: &str, line: &str) -> Option<Response> {
     // Stage 1: parse as raw JSON value.
     // True parse failures (malformed JSON) → -32700, id: null.
     let value: Value = match serde_json::from_str(line) {
@@ -129,12 +129,11 @@ fn handle_message(conn: &mut rusqlite::Connection, project_root: &std::path::Pat
         }
     };
 
-    Some(dispatch_request(conn, project_root, session_id, id, method, obj.get("params")))
+    Some(dispatch_request(workspace, session_id, id, method, obj.get("params")))
 }
 
 fn dispatch_request(
-    conn: &mut rusqlite::Connection,
-    project_root: &std::path::Path,
+    workspace: &mut Workspace,
     session_id: &str,
     id: Value,
     method: &str,
@@ -157,7 +156,7 @@ fn dispatch_request(
             Response::ok(id, serde_json::json!({ "tools": tools::list() }))
         }
 
-        "tools/call" => match tools::dispatch(conn, project_root, session_id, params) {
+        "tools/call" => match tools::dispatch(workspace, session_id, params) {
             Ok(text) => Response::ok(
                 id,
                 serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
