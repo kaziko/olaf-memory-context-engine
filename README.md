@@ -4,7 +4,9 @@
 
 **Codebase context engine for Claude Code & Codex (soon).**
 
-Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP, Go), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request. Olaf also captures session observations and can restore files to pre-edit snapshots via built-in undo support.
+Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP, Go), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request.
+
+Olaf also acts as **session memory** — it automatically records decisions, errors, and file changes as observations linked to specific symbols and files. These observations persist across sessions, so Claude remembers what was tried before, what failed, and why certain decisions were made. Combined with pre-edit snapshots, this gives Claude both recall and undo.
 
 ## Install
 
@@ -59,17 +61,24 @@ olaf init
 
 **3. Use in Claude Code** — Olaf exposes these MCP tools to Claude:
 
-- `get_context` — retrieve indexed summaries for files relevant to your task
-- `get_impact` — find files that reference a given symbol or path
-- `get_file_skeleton` — get the structure (functions, classes, exports) of a file
-- `get_brief` — get a context brief for any task; includes impact analysis when `symbol_fqn` is provided
+**Context retrieval:**
+- `get_brief` — start here. Context brief for any task with optional impact analysis
+- `get_context` — token-budgeted context retrieval (fine-grained control)
+- `get_impact` — find symbols that call, extend, or depend on a given symbol
+- `get_file_skeleton` — structure of a file (signatures, edges, no bodies)
+- `analyze_failure` — parse a stack trace or error and get a context brief focused on the failure path
+
+**Session memory:**
+- `save_observation` — record a decision, insight, or error linked to a symbol or file
+- `get_session_history` — retrieve past observations across sessions, ranked by relevance
+
+**Code navigation:**
+- `trace_flow` — trace execution paths between two symbols through the call graph
 - `index_status` — check indexing coverage and freshness
-- `save_observation` — store a session note for future recall
-- `get_session_history` — retrieve observations and changes from recent sessions; supports relevance-ranked sorting
-- `trace_flow` — trace execution paths between two symbols through the dependency graph
-- `analyze_failure` — parse a stack trace or error output and return a context brief focused on the failure path
-- `list_restore_points` — view file snapshots available for undo
-- `undo_change` — restore a file to a specific pre-edit snapshot
+
+**Safety:**
+- `list_restore_points` — view pre-edit snapshots available for undo
+- `undo_change` — restore a file to a specific snapshot
 
 ## Documentation
 

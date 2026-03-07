@@ -7,7 +7,7 @@ title: Getting Started
 
 # Getting Started with Olaf
 
-Olaf is a codebase context engine for Claude Code. It indexes your project's symbols and dependencies, then exposes them through an MCP server so Claude can instantly retrieve focused, token-budgeted context for any task. Install it once per project and Claude automatically gets the context it needs.
+Olaf is a codebase context engine and session memory for Claude Code. It indexes your project's symbols and dependencies, then exposes them through an MCP server so Claude can instantly retrieve focused, token-budgeted context for any task. It also records observations — decisions, errors, insights — linked to specific symbols and files, so Claude remembers what happened in previous sessions. Install it once per project and Claude automatically gets both the context and the memory it needs.
 
 ---
 
@@ -30,6 +30,8 @@ Claude Code reads files. A lot of them. On every request it may scan dozens of s
 **Free with no limits.** because why not. Olaf is open source and runs entirely on your machine.
 
 **Built specifically for Claude Code.** `olaf init` wires everything up in one command — MCP server registration, hooks, initial index. No manual config files, no agent-specific workarounds.
+
+**Session memory across conversations.** Olaf automatically records decisions, errors, and file changes as observations linked to symbols and files. When Claude retrieves context, relevant past observations surface automatically — so it knows what was tried before, what failed, and why.
 
 **Undo any AI edit instantly.** Before every file change, Olaf creates a shadow snapshot. If Claude makes a mess, `undo_change` restores the file to exactly how it was — no git required, no lost work.
 
@@ -168,7 +170,7 @@ Download the latest release from the [GitHub Releases page](https://github.com/k
 
 ## How Claude Uses Olaf
 
-Once Olaf is connected, Claude can see all 9 tools and decides on its own whether to call them — you don't need to mention them in every prompt.
+Once Olaf is connected, Claude can see all 11 tools and decides on its own whether to call them — you don't need to mention them in every prompt.
 
 **The short version:** task-oriented prompts trigger Olaf automatically; vague prompts may not.
 
@@ -238,6 +240,26 @@ Restore src/auth.rs to snapshot 1741234567890-12345-3
 
 Snapshots are created automatically — no git required, no manual setup.
 
+### Session memory
+
+Olaf records observations — decisions, errors, insights, file changes — linked to specific symbols and files. These persist across sessions and surface automatically when Claude retrieves context for the same area of code.
+
+**Why this matters:** without memory, Claude starts every session from zero. If a previous session tried an approach that failed, Claude has no way to know. With Olaf, past observations appear in the context brief alongside the code, so Claude avoids repeating mistakes and builds on previous work.
+
+**To save an observation manually:**
+
+```
+Use save_observation to record that the retry logic in connection_pool was removed because it masked timeout errors
+```
+
+**To review past observations:**
+
+```
+Use get_session_history filtered to src/db/connection_pool.rs
+```
+
+Most observations are captured automatically by the PostToolUse hook — you only need `save_observation` for high-level decisions or insights that Claude wouldn't otherwise record.
+
 ### What runs automatically (no prompting needed)
 
 Three hooks run silently in the background during every Claude Code session:
@@ -254,17 +276,34 @@ You never need to ask for these — they fire on their own.
 
 Once connected, Claude can use these tools:
 
+**Context retrieval**
+
 | Tool | Description |
 |-|-|
+| `get_brief` | Start here. Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Use `get_context` or `get_impact` for fine-grained control |
 | `get_context` | Token-budgeted context brief for a task; triggers incremental re-index |
 | `get_impact` | Find symbols that call, extend, implement, or use a given symbol FQN as a type |
 | `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies) |
-| `get_brief` | Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Start here — use `get_context` or `get_impact` for fine-grained control |
-| `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
-| `save_observation` | Store an insight or decision linked to a symbol FQN or file path |
-| `get_session_history` | Observations and changes from recent sessions, filterable by file or symbol; supports `sort_mode` for relevance-ranked retrieval |
-| `trace_flow` | Trace execution paths between two symbols through the dependency graph |
 | `analyze_failure` | Parse a stack trace or error output and return a context brief focused on the failure path |
+
+**Session memory**
+
+| Tool | Description |
+|-|-|
+| `save_observation` | Record a decision, insight, or error linked to a symbol FQN or file path |
+| `get_session_history` | Observations from recent sessions, filterable by file or symbol; supports relevance-ranked retrieval |
+
+**Code navigation & status**
+
+| Tool | Description |
+|-|-|
+| `trace_flow` | Trace execution paths between two symbols through the dependency graph |
+| `index_status` | File count, symbol count, edge count, observation count, last indexed timestamp |
+
+**Safety**
+
+| Tool | Description |
+|-|-|
 | `list_restore_points` | Pre-edit snapshots for a file, sorted newest-first |
 | `undo_change` | Restore a file to a specific snapshot; records a decision observation |
 
