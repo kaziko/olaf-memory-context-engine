@@ -1,8 +1,13 @@
 use rusqlite::Connection;
 
 pub const DEFAULT_COMPRESSION_THRESHOLD_SECS: i64 = 3600;
+pub const DEFAULT_PURGE_THRESHOLD_SECS: i64 = 90 * 86400; // 7_776_000
 
 pub fn run_compression(conn: &mut Connection, threshold_secs: i64) -> anyhow::Result<()> {
+    let purged = super::store::purge_old_sessions(conn, DEFAULT_PURGE_THRESHOLD_SECS)?;
+    if purged > 0 {
+        log::info!("purged {} session(s) older than 90 days", purged);
+    }
     let compressed = super::store::compress_stale_sessions(conn, threshold_secs)?;
     if !compressed.is_empty() {
         log::info!(
@@ -153,6 +158,87 @@ mod tests {
         let compressed = super::super::store::compress_stale_sessions(&mut conn, 3600).unwrap();
         assert!(compressed.is_empty());
         assert_eq!(count_obs(&conn, "recent"), 1);
+    }
+
+    // ─── Story 10.1: Purge Tests ──────────────────────────────────────────────
+
+    // Session ended 91 days ago → purged (session + obs gone)
+    #[test]
+    fn test_purge_old_session_deleted() {
+        let (mut conn, _dir) = open_test_db();
+        let ended = now_secs() - 91 * 86400;
+        create_ended_session(&conn, "old", ended);
+        insert_obs(&conn, "old", "insight", "old insight");
+        insert_obs(&conn, "old", "decision", "old decision");
+
+        let purged = super::super::store::purge_old_sessions(&mut conn, 90 * 86400).unwrap();
+        assert_eq!(purged, 1);
+
+        // Session row gone
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE id = 'old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        // Observations gone
+        assert_eq!(count_obs(&conn, "old"), 0);
+    }
+
+    // Active session (ended_at IS NULL) → not purged
+    #[test]
+    fn test_purge_active_session_not_deleted() {
+        let (mut conn, _dir) = open_test_db();
+        conn.execute(
+            "INSERT INTO sessions (id, started_at, agent) VALUES ('active', ?1, 'test')",
+            params![now_secs() - 100 * 86400],
+        ).unwrap();
+        insert_obs(&conn, "active", "insight", "active insight");
+
+        let purged = super::super::store::purge_old_sessions(&mut conn, 90 * 86400).unwrap();
+        assert_eq!(purged, 0);
+        assert_eq!(count_obs(&conn, "active"), 1);
+    }
+
+    // Session ended 89 days ago → not purged
+    #[test]
+    fn test_purge_recent_session_not_deleted() {
+        let (mut conn, _dir) = open_test_db();
+        let ended = now_secs() - 89 * 86400;
+        create_ended_session(&conn, "recent", ended);
+        insert_obs(&conn, "recent", "insight", "recent insight");
+
+        let purged = super::super::store::purge_old_sessions(&mut conn, 90 * 86400).unwrap();
+        assert_eq!(purged, 0);
+        assert_eq!(count_obs(&conn, "recent"), 1);
+    }
+
+    // 2 old sessions → returns 2
+    #[test]
+    fn test_purge_returns_count() {
+        let (mut conn, _dir) = open_test_db();
+        let ended = now_secs() - 100 * 86400;
+        create_ended_session(&conn, "old1", ended);
+        create_ended_session(&conn, "old2", ended - 86400);
+
+        let purged = super::super::store::purge_old_sessions(&mut conn, 90 * 86400).unwrap();
+        assert_eq!(purged, 2);
+    }
+
+    // Verify observations deleted atomically with session
+    #[test]
+    fn test_purge_observations_cascade_in_transaction() {
+        let (mut conn, _dir) = open_test_db();
+        let ended = now_secs() - 100 * 86400;
+        create_ended_session(&conn, "old", ended);
+        insert_obs(&conn, "old", "insight", "insight1");
+        insert_obs(&conn, "old", "decision", "decision1");
+        insert_obs(&conn, "old", "error", "error1");
+
+        // Keep a recent session to verify it's untouched
+        create_ended_session(&conn, "keep", now_secs() - 86400);
+        insert_obs(&conn, "keep", "insight", "keep this");
+
+        super::super::store::purge_old_sessions(&mut conn, 90 * 86400).unwrap();
+
+        assert_eq!(count_obs(&conn, "old"), 0);
+        assert_eq!(count_obs(&conn, "keep"), 1);
     }
 
     // Task 8.5: multiple sessions, only ended+stale ones compressed

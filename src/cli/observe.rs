@@ -249,6 +249,48 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
             log::debug!("observe: handler completed in {:?}", start.elapsed());
         }
 
+        n if n == "mcp__olaf__get_context"
+            || n == "mcp__olaf__get_brief"
+            || n == "mcp__olaf__get_impact" =>
+        {
+            let tool_input = match &payload.tool_input {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+
+            // Extract normalized subject string for dead-end detection
+            let subject = if n == "mcp__olaf__get_impact" {
+                match tool_input.get("symbol_fqn").and_then(|v| v.as_str()) {
+                    Some(fqn) => format!("get_impact: {fqn}"),
+                    None => return Ok(()), // malformed payload — skip
+                }
+            } else {
+                match tool_input.get("intent").and_then(|v| v.as_str()) {
+                    Some(intent) => format!("get_context: {intent}"),
+                    None => return Ok(()), // malformed payload — skip
+                }
+            };
+
+            let start = std::time::Instant::now();
+            let conn = match olaf::db::open(&cwd.join(".olaf/index.db")) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::debug!("observe: DB open failed: {e}");
+                    return Ok(());
+                }
+            };
+            olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
+            olaf::memory::insert_auto_observation(
+                &conn,
+                &payload.session_id,
+                "context_retrieval",
+                &subject,
+                None,
+                None,
+            )?;
+            log::debug!("observe: context_retrieval recorded in {:?}", start.elapsed());
+        }
+
         _ => {}
     }
 

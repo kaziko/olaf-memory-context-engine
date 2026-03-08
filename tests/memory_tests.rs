@@ -2105,3 +2105,155 @@ fn test_82_full_reindex_rename_detection() {
         "TS function rename (signature changes) must use 'no longer exists'; got: {text}"
     );
 }
+
+// ─── Story 10.1: Dead-end detection end-to-end via hook harness ──────────────
+
+#[test]
+fn test_dead_end_detection_via_hook_harness() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "dead-end-e2e";
+
+    // Post two get_context events with the same intent
+    for _ in 0..2 {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__olaf__get_context",
+            "tool_input": {
+                "intent": "refactoring auth module"
+            }
+        });
+        let output = run_observe_event("post-tool-use", &tmpdir, &payload);
+        assert!(output.status.success(), "post-tool-use must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Trigger session-end to run dead-end detection
+    let end_payload = make_session_end_payload(session_id, cwd);
+    let output = run_observe_event("session-end", &tmpdir, &end_payload);
+    assert!(output.status.success(), "session-end must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    // Verify anti_pattern observation with "Dead-end" was written
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM observations WHERE session_id = ?1 AND kind = 'anti_pattern'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .expect("anti_pattern observation must exist");
+    assert!(content.contains("Dead-end"), "content must mention Dead-end; got: {content}");
+    assert!(content.contains("refactoring auth module"), "content must mention the repeated intent; got: {content}");
+}
+
+// get_brief records context_retrieval with "get_context:" prefix (same as get_context)
+#[test]
+fn test_context_retrieval_get_brief() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "brief-e2e";
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__olaf__get_brief",
+        "tool_input": { "intent": "adding caching layer" }
+    });
+    let output = run_observe_event("post-tool-use", &tmpdir, &payload);
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM observations WHERE session_id = ?1 AND kind = 'context_retrieval'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .expect("context_retrieval observation must exist for get_brief");
+    assert_eq!(content, "get_context: adding caching layer");
+}
+
+// get_impact records context_retrieval with "get_impact:" prefix using symbol_fqn
+#[test]
+fn test_context_retrieval_get_impact() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "impact-e2e";
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__olaf__get_impact",
+        "tool_input": { "symbol_fqn": "src/db.rs::connect" }
+    });
+    let output = run_observe_event("post-tool-use", &tmpdir, &payload);
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM observations WHERE session_id = ?1 AND kind = 'context_retrieval'",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .expect("context_retrieval observation must exist for get_impact");
+    assert_eq!(content, "get_impact: src/db.rs::connect");
+}
+
+// Malformed payload (missing required field) → no observation written, exit 0
+#[test]
+fn test_context_retrieval_malformed_payload_skipped() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let session_id = "malformed-e2e";
+
+    // get_context without "intent" field
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__olaf__get_context",
+        "tool_input": { "wrong_field": "value" }
+    });
+    let output = run_observe_event("post-tool-use", &tmpdir, &payload);
+    assert!(output.status.success(), "malformed payload must not crash");
+
+    // get_impact without "symbol_fqn" field
+    let payload2 = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__olaf__get_impact",
+        "tool_input": { "fqn": "wrong_name" }
+    });
+    let output2 = run_observe_event("post-tool-use", &tmpdir, &payload2);
+    assert!(output2.status.success(), "malformed get_impact payload must not crash");
+
+    // No observations should have been written
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "malformed payloads must not produce observations");
+}

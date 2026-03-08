@@ -138,7 +138,7 @@ pub(crate) fn get_recent_session_ids(
 ) -> Result<Vec<String>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT s.id FROM sessions s \
-         JOIN observations o ON o.session_id = s.id \
+         JOIN observations o ON o.session_id = s.id AND o.kind != 'context_retrieval' \
          ORDER BY s.started_at DESC, s.rowid DESC \
          LIMIT ?1",
     )?;
@@ -161,7 +161,7 @@ pub(crate) fn get_observations_filtered(
     let placeholders: Vec<String> = (1..=session_ids.len()).map(|i| format!("?{i}")).collect();
     let mut sql = format!(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason \
-         FROM observations WHERE session_id IN ({}) ",
+         FROM observations WHERE session_id IN ({}) AND kind != 'context_retrieval' ",
         placeholders.join(", ")
     );
 
@@ -251,7 +251,7 @@ pub(crate) fn get_observations_for_context(
 
     let sql = format!(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason \
-         FROM observations WHERE ({}) ORDER BY created_at DESC, id DESC LIMIT {}",
+         FROM observations WHERE ({}) AND kind != 'context_retrieval' ORDER BY created_at DESC, id DESC LIMIT {}",
         conditions.join(" OR "),
         limit_ph,
     );
@@ -301,8 +301,8 @@ pub struct SessionSummary {
     pub compressed: bool,
 }
 
-/// Delete ephemeral observations (tool_call, file_change) from a session within
-/// the caller-provided transaction, then mark session compressed.
+/// Delete ephemeral observations (tool_call, file_change, context_retrieval) from a session
+/// within the caller-provided transaction, then mark session compressed.
 /// Returns count of deleted observations. Idempotent: returns Ok(0) if already compressed.
 pub(crate) fn compress_session(tx: &Transaction, session_id: &str) -> Result<u64, StoreError> {
     // Guard: if already compressed, no-op
@@ -316,7 +316,7 @@ pub(crate) fn compress_session(tx: &Transaction, session_id: &str) -> Result<u64
     }
 
     let deleted = tx.execute(
-        "DELETE FROM observations WHERE session_id = ?1 AND kind IN ('tool_call', 'file_change')",
+        "DELETE FROM observations WHERE session_id = ?1 AND kind IN ('tool_call', 'file_change', 'context_retrieval')",
         params![session_id],
     )?;
     tx.execute(
@@ -389,6 +389,28 @@ pub(crate) fn compress_stale_sessions(
     Ok(compressed_ids)
 }
 
+/// Purge sessions (and their observations) older than the given threshold.
+/// Only affects sessions with ended_at set and older than cutoff.
+/// Deletes observations first (FK child), then sessions (FK parent), in a single transaction.
+pub(crate) fn purge_old_sessions(conn: &mut Connection, older_than_secs: i64) -> Result<usize, StoreError> {
+    let cutoff: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        - older_than_secs;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM observations WHERE session_id IN (SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1)",
+        params![cutoff],
+    )?;
+    let purged = tx.execute(
+        "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+        params![cutoff],
+    )?;
+    tx.commit()?;
+    Ok(purged)
+}
+
 /// List recent sessions with observation counts.
 /// LEFT JOIN ensures zero-observation sessions appear with obs_count = 0.
 pub fn list_sessions(
@@ -397,7 +419,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionSummary>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.started_at, s.compressed, COUNT(o.id) AS obs_count \
-         FROM sessions s LEFT JOIN observations o ON o.session_id = s.id \
+         FROM sessions s LEFT JOIN observations o ON o.session_id = s.id AND o.kind != 'context_retrieval' \
          GROUP BY s.id ORDER BY s.started_at DESC, s.rowid DESC LIMIT ?1",
     )?;
     let rows = stmt
@@ -435,7 +457,7 @@ pub fn get_session_observations(
 
     let mut stmt = conn.prepare(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason \
-         FROM observations WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+         FROM observations WHERE session_id = ?1 AND kind != 'context_retrieval' ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt
         .query_map(params![session_id], |r| {
@@ -617,6 +639,20 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], "s3"); // most recent first
         assert_eq!(ids[1], "s2");
+    }
+
+    #[test]
+    fn test_get_recent_session_ids_skips_context_retrieval_only_sessions() {
+        let (conn, _dir) = open_test_db();
+        // Session with only context_retrieval obs should not consume a slot
+        conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('retrieval-only', 500, 'a')", []).unwrap();
+        insert_auto_observation(&conn, "retrieval-only", "context_retrieval", "get_context: debug", None, None).unwrap();
+        // Session with real observations
+        conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('real', 400, 'a')", []).unwrap();
+        insert_observation(&conn, "real", "insight", "useful finding", Some("f::x"), None).unwrap();
+
+        let ids = get_recent_session_ids(&conn, 10).unwrap();
+        assert_eq!(ids, vec!["real"], "context_retrieval-only session must not appear");
     }
 
     #[test]

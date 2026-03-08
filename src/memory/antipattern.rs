@@ -4,13 +4,48 @@ use rusqlite::{Connection, params};
 
 use super::store::{StoreError, insert_auto_observation};
 
-/// Dead-end detection deferred: requires symbol lifecycle audit not in current schema.
-/// See Story 4.2 AC2.
+/// Detect dead-end exploration: same context retrieved ≥2 times with no productive activity.
+/// Returns Vec of "{subject} (×{count})" strings for repeated subjects, or empty if
+/// the session was productive (has insight/decision/file_change observations).
 pub fn detect_dead_end(
-    _conn: &Connection,
-    _session_id: &str,
+    conn: &Connection,
+    session_id: &str,
 ) -> Result<Vec<String>, StoreError> {
-    Ok(vec![])
+    // Step A: find repeated subjects (same content, count ≥ 2)
+    let mut stmt = conn.prepare(
+        "SELECT content, CAST(COUNT(*) AS INTEGER) AS cnt \
+         FROM observations \
+         WHERE session_id = ?1 AND kind = 'context_retrieval' AND auto_generated = 1 \
+         GROUP BY content \
+         HAVING cnt >= 2 \
+         ORDER BY content",
+    )?;
+    let repeated: Vec<(String, usize)> = stmt
+        .query_map(params![session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if repeated.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step B: check for productive activity (suppression guard)
+    let productive_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations \
+         WHERE session_id = ?1 AND kind IN ('insight', 'decision', 'file_change')",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    if productive_count > 0 {
+        return Ok(vec![]);
+    }
+
+    // Step C: return repeated subjects formatted
+    Ok(repeated
+        .into_iter()
+        .map(|(subject, count)| format!("{subject} (×{count})"))
+        .collect())
 }
 
 /// Detect file thrashing using a tumbling 5-minute window (epoch bucket: created_at / 300).
@@ -58,8 +93,16 @@ pub fn detect_and_write_anti_patterns(
     conn: &Connection,
     session_id: &str,
 ) -> Result<(), StoreError> {
-    // Dead-end detection (no-op stub)
-    detect_dead_end(conn, session_id)?;
+    // Dead-end detection
+    let dead_ends = detect_dead_end(conn, session_id)?;
+    if !dead_ends.is_empty() {
+        let content = format!(
+            "Dead-end exploration: same context retrieved multiple times without producing \
+             insight, decision, or file changes. Repeated: {}",
+            dead_ends.join(", ")
+        );
+        insert_auto_observation(conn, session_id, "anti_pattern", &content, None, None)?;
+    }
 
     // File thrashing detection
     let thrashing = detect_file_thrashing(conn, session_id)?;
@@ -213,19 +256,125 @@ mod tests {
         assert_eq!(auto_gen, 1);
     }
 
-    // 1.11: detect_dead_end always returns empty regardless of observation state
+    // Dead-end: 2 same intents, no productive obs → returns 1 subject
     #[test]
-    fn test_detect_dead_end_always_empty() {
+    fn test_dead_end_two_same_intents_no_productive_obs() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "test").unwrap();
-        // Insert some observations — should not affect result
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+                 VALUES ('s1', 100, 'context_retrieval', 'get_context: refactoring', 1)",
+                [],
+            ).unwrap();
+        }
+        let result = detect_dead_end(&conn, "s1").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("get_context: refactoring"));
+        assert!(result[0].contains("×2"));
+    }
+
+    // Dead-end suppressed by file_change
+    #[test]
+    fn test_no_dead_end_with_file_change() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+                 VALUES ('s1', 100, 'context_retrieval', 'get_context: refactoring', 1)",
+                [],
+            ).unwrap();
+        }
         conn.execute(
             "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
-             VALUES ('s1', 100, 'insight', 'some obs', 1)",
+             VALUES ('s1', 200, 'file_change', 'edited src/main.rs', 1)",
             [],
-        )
-        .unwrap();
+        ).unwrap();
         let result = detect_dead_end(&conn, "s1").unwrap();
-        assert!(result.is_empty(), "detect_dead_end must always return empty (no-op stub)");
+        assert!(result.is_empty(), "file_change should suppress dead-end");
+    }
+
+    // Dead-end suppressed by decision
+    #[test]
+    fn test_no_dead_end_with_decision() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+                 VALUES ('s1', 100, 'context_retrieval', 'get_context: refactoring', 1)",
+                [],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+             VALUES ('s1', 200, 'decision', 'chose approach A', 0)",
+            [],
+        ).unwrap();
+        let result = detect_dead_end(&conn, "s1").unwrap();
+        assert!(result.is_empty(), "decision should suppress dead-end");
+    }
+
+    // Single retrieval → below threshold
+    #[test]
+    fn test_no_dead_end_single_retrieval() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+             VALUES ('s1', 100, 'context_retrieval', 'get_context: refactoring', 1)",
+            [],
+        ).unwrap();
+        let result = detect_dead_end(&conn, "s1").unwrap();
+        assert!(result.is_empty(), "single retrieval should not trigger dead-end");
+    }
+
+    // Two different subjects: A appears 2×, B appears 1× → only A returned
+    #[test]
+    fn test_dead_end_two_different_subjects() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+                 VALUES ('s1', 100, 'context_retrieval', 'get_context: refactoring', 1)",
+                [],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+             VALUES ('s1', 100, 'context_retrieval', 'get_impact: foo::bar', 1)",
+            [],
+        ).unwrap();
+        let result = detect_dead_end(&conn, "s1").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("get_context: refactoring"));
+    }
+
+    // Full detect_and_write_anti_patterns → verify anti_pattern obs content
+    #[test]
+    fn test_dead_end_observation_written() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, auto_generated) \
+                 VALUES ('s1', 100, 'context_retrieval', 'get_context: debug auth', 1)",
+                [],
+            ).unwrap();
+        }
+        detect_and_write_anti_patterns(&conn, "s1").unwrap();
+
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM observations WHERE kind = 'anti_pattern' AND session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(content.contains("Dead-end exploration"));
+        assert!(content.contains("get_context: debug auth"));
+        assert!(content.contains("×3"));
     }
 }
