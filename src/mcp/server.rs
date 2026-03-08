@@ -6,9 +6,10 @@ use crate::mcp::{
     protocol::Response,
     tools,
 };
+use crate::activity::MonitorGuard;
 use crate::workspace::Workspace;
 
-pub(crate) fn run(mut workspace: Workspace, session_id: String) -> anyhow::Result<()> {
+pub(crate) fn run(mut workspace: Workspace, session_id: String, mut monitor: MonitorGuard) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Lock both for the duration — avoids repeated locking overhead in the hot loop
@@ -28,7 +29,7 @@ pub(crate) fn run(mut workspace: Workspace, session_id: String) -> anyhow::Resul
             continue;
         }
 
-        if let Some(response) = handle_message(&mut workspace, &session_id, &line) {
+        if let Some(response) = handle_message(&mut workspace, &session_id, &line, &mut monitor) {
             let json = match serde_json::to_string(&response) {
                 Ok(j) => j,
                 Err(e) => {
@@ -45,7 +46,7 @@ pub(crate) fn run(mut workspace: Workspace, session_id: String) -> anyhow::Resul
     Ok(())
 }
 
-fn handle_message(workspace: &mut Workspace, session_id: &str, line: &str) -> Option<Response> {
+fn handle_message(workspace: &mut Workspace, session_id: &str, line: &str, monitor: &mut MonitorGuard) -> Option<Response> {
     // Stage 1: parse as raw JSON value.
     // True parse failures (malformed JSON) → -32700, id: null.
     let value: Value = match serde_json::from_str(line) {
@@ -129,7 +130,7 @@ fn handle_message(workspace: &mut Workspace, session_id: &str, line: &str) -> Op
         }
     };
 
-    Some(dispatch_request(workspace, session_id, id, method, obj.get("params")))
+    Some(dispatch_request(workspace, session_id, id, method, obj.get("params"), monitor))
 }
 
 fn dispatch_request(
@@ -138,6 +139,7 @@ fn dispatch_request(
     id: Value,
     method: &str,
     params: Option<&Value>,
+    monitor: &mut MonitorGuard,
 ) -> Response {
     match method {
         "initialize" => {
@@ -156,21 +158,55 @@ fn dispatch_request(
             Response::ok(id, serde_json::json!({ "tools": tools::list() }))
         }
 
-        "tools/call" => match tools::dispatch(workspace, session_id, params) {
-            Ok(text) => Response::ok(
-                id,
-                serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-            ),
-            Err(tools::ToolError::UnknownTool(name)) => {
-                Response::error(id, -32601, format!("unknown tool: {name}"))
+        "tools/call" => {
+            // Extract tool name and args for activity monitoring
+            let tool_name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_args = params.and_then(|p| p.get("arguments")).cloned();
+
+            let start = std::time::Instant::now();
+            let result = tools::dispatch(workspace, session_id, params);
+            let elapsed = start.elapsed().as_millis() as u64;
+
+            // Emit activity event
+            let (is_error, error_message, result_len) = match &result {
+                Ok(text) => (false, None, Some(text.len())),
+                Err(e) => (true, Some(crate::activity::sanitize_error(&e.to_string(), 200)), None),
+            };
+            monitor.emit(crate::activity::ActivityEvent {
+                source: "mcp",
+                session_id: Some(session_id.to_string()),
+                event_type: "tool_call",
+                tool_name: Some(tool_name.clone()),
+                summary: crate::activity::summarize_tool_call(
+                    &tool_name,
+                    tool_args.as_ref(),
+                    result_len,
+                ),
+                duration_ms: Some(elapsed),
+                is_error,
+                error_message,
+            });
+
+            match result {
+                Ok(text) => Response::ok(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                ),
+                Err(tools::ToolError::UnknownTool(name)) => {
+                    Response::error(id, -32601, format!("unknown tool: {name}"))
+                }
+                Err(tools::ToolError::InvalidParams(msg)) => {
+                    Response::error(id, -32602, msg)
+                }
+                Err(tools::ToolError::Internal(e)) => {
+                    Response::error(id, -32603, e.to_string())
+                }
             }
-            Err(tools::ToolError::InvalidParams(msg)) => {
-                Response::error(id, -32602, msg)
-            }
-            Err(tools::ToolError::Internal(e)) => {
-                Response::error(id, -32603, e.to_string())
-            }
-        },
+        }
 
         _ => Response::error(id, -32601, format!("method not found: {method}")),
     }

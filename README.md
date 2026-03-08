@@ -18,6 +18,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 - **Execution path tracing** — find how symbol A reaches symbol B through the call graph
 - **Session memory** — decisions, errors, and insights persist across conversations
 - **Auto-generated project rules** — when the same code-level insight or decision recurs across 3+ sessions for the same file or symbol, Olaf promotes it to a standing rule that appears in every relevant context brief. Not for workflow preferences (use CLAUDE.md for those) — for lessons Claude learns about your code through repeated work
+- **Live activity monitor** — run `olaf monitor` in a separate terminal to see MCP tool calls, hook events, session lifecycle, and index operations in real time. Supports `--json`, `--tool`, `--errors-only` filters
 - **Pre-edit snapshots** — undo any AI edit instantly, no git required
 - **LSP edge injection** — enrich the graph with type-resolved edges from language servers
 - **Failure analysis** — parse stack traces and get context briefs focused on the error path

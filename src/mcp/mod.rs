@@ -20,6 +20,8 @@ pub fn run() -> anyhow::Result<()> {
         ts.subsec_nanos()
     );
 
+    let monitor = crate::activity::MonitorGuard::new(&project_root);
+
     // Detect workspace and construct Workspace state
     let (config, parse_warnings) = crate::workspace::parse_workspace_config(&project_root);
     let workspace = match config {
@@ -28,5 +30,5 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     crate::memory::store::upsert_session(workspace.local_conn_ref(), &session_id, "claude-code")?;
-    server::run(workspace, session_id)
+    server::run(workspace, session_id, monitor)
 }

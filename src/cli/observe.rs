@@ -3,28 +3,54 @@ use std::io::Read;
 use std::path::PathBuf;
 
 pub(crate) fn run(event: &str) -> anyhow::Result<()> {
-    if let Err(e) = inner(event) {
+    // Phase 1: read stdin and parse payload (if this fails, we have no cwd — just log)
+    let payload = match read_and_parse_payload() {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("observe: {e}");
+            return Ok(());
+        }
+    };
+    let cwd = PathBuf::from(&payload.cwd);
+    let monitor_active = olaf::activity::is_monitor_active(&cwd);
+
+    // Phase 2: handle event (if this fails, we can emit an error event using cwd)
+    if let Err(ref e) = handle_event(event, &payload, monitor_active) {
         log::debug!("observe: {e}");
+        if monitor_active {
+            if let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db")) {
+                olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                    source: "hook",
+                    event_type: "hook_error",
+                    summary: olaf::activity::truncate(&e.to_string(), 120),
+                    is_error: true,
+                    error_message: Some(olaf::activity::sanitize_error(&e.to_string(), 200)),
+                    ..Default::default()
+                });
+            }
+        }
     }
     Ok(())
 }
 
-fn inner(event: &str) -> anyhow::Result<()> {
+fn read_and_parse_payload() -> anyhow::Result<olaf::memory::HookPayload> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    let payload = match serde_json::from_str::<olaf::memory::HookPayload>(&input) {
-        Ok(p) => p,
+    match serde_json::from_str::<olaf::memory::HookPayload>(&input) {
+        Ok(p) => Ok(p),
         Err(e) => {
             log::debug!("observe: failed to parse payload: {e}");
-            return Ok(());
+            anyhow::bail!("failed to parse payload: {e}");
         }
-    };
+    }
+}
 
+fn handle_event(event: &str, payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
     match event {
-        "pre-tool-use" => handle_pre_tool_use(&payload),
-        "post-tool-use" => handle_post_tool_use(&payload),
-        "session-end" => handle_session_end(&payload),
+        "pre-tool-use" => handle_pre_tool_use(payload, monitor_active),
+        "post-tool-use" => handle_post_tool_use(payload, monitor_active),
+        "session-end" => handle_session_end(payload, monitor_active),
         _ => {
             log::debug!("observe: unhandled event: {event}");
             Ok(())
@@ -32,7 +58,7 @@ fn inner(event: &str) -> anyhow::Result<()> {
     }
 }
 
-fn handle_pre_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
+fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
     // AC5: Only snapshot for Edit/Write tools
     match payload.tool_name.as_deref() {
         Some("Edit") | Some("Write") => {}
@@ -58,9 +84,6 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()
     let cwd = PathBuf::from(&payload.cwd);
 
     // AC8: Enforce project root boundary — reject paths outside cwd.
-    // strip_prefix is lexical; walk components to:
-    //   - reject ParentDir (..) to prevent /project/../outside escape
-    //   - skip CurDir (.) to normalize src/./main.rs → src/main.rs (stable hash bucket)
     let rel_file_path = match std::path::Path::new(abs_file_path).strip_prefix(&cwd) {
         Ok(rel) => {
             let mut normalized = std::path::PathBuf::new();
@@ -72,7 +95,7 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()
                         );
                         return Ok(());
                     }
-                    std::path::Component::CurDir => {} // skip '.' — normalizes path for stable hash
+                    std::path::Component::CurDir => {}
                     c => normalized.push(c),
                 }
             }
@@ -91,36 +114,82 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()
     // AC3: non-existent file handled inside snapshot() via NotFound match
     olaf::restore::snapshot(&cwd, &rel_file_path)?;
 
-    log::debug!("observe pre-tool-use: snapshot completed in {:?}", start.elapsed());
+    let elapsed = start.elapsed();
+    log::debug!("observe pre-tool-use: snapshot completed in {:?}", elapsed);
+
+    if monitor_active {
+        if let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db")) {
+            let summary = if olaf::memory::is_sensitive_path(&rel_file_path) {
+                "Snapshot: <redacted>".to_string()
+            } else {
+                format!("Snapshot: {rel_file_path}")
+            };
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "snapshot",
+                summary,
+                duration_ms: Some(elapsed.as_millis() as u64),
+                ..Default::default()
+            });
+        }
+    }
+
     Ok(())
 }
 
-fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
+fn handle_session_end(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let cwd = PathBuf::from(&payload.cwd);
     let mut conn = olaf::db::open(&cwd.join(".olaf/index.db"))
         .map_err(|e| { log::debug!("observe session-end: DB open failed: {e}"); e })?;
     olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
     olaf::memory::mark_session_ended(&conn, &payload.session_id)?;
-    // AC3/AC7: atomic detect+compress in a single BEGIN IMMEDIATE transaction.
-    // IMMEDIATE acquires the write lock before the compressed check, preventing
-    // concurrent processes from both passing the guard and writing duplicate anti_pattern obs.
     let branch = olaf::config::detect_git_branch(&cwd);
     let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id, branch.as_deref())?;
+
     if !ran {
         log::debug!("observe session-end: session already compressed, skipping");
+        if monitor_active {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "session",
+                session_id: Some(payload.session_id.clone()),
+                summary: "Session ended: already compressed, skipped".to_string(),
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                ..Default::default()
+            });
+        }
     } else {
-        // Rule detection runs in its own DEFERRED transaction, OUTSIDE the IMMEDIATE lock,
-        // to avoid holding write locks during cross-session clustering.
-        // Only runs when the pipeline actually ran (skip on duplicate/no-op SessionEnd events).
+        if monitor_active {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "session",
+                session_id: Some(payload.session_id.clone()),
+                summary: "Session ended: compressed".to_string(),
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                ..Default::default()
+            });
+        }
+
+        let rule_start = std::time::Instant::now();
         let rule_count = olaf::memory::detect_and_write_rules(&mut conn, branch.as_deref())?;
         if rule_count > 0 {
             log::debug!("Generated {} new project rule(s)", rule_count);
         }
+        if monitor_active {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "rule",
+                session_id: Some(payload.session_id.clone()),
+                summary: format!("Rule detection: {rule_count} new rule(s)"),
+                duration_ms: Some(rule_start.elapsed().as_millis() as u64),
+                ..Default::default()
+            });
+        }
     }
-    // FR22: cleanup restore points older than 7 days, protecting current-session snapshots
+
+    // FR22: cleanup restore points older than 7 days
     let protect_ms = {
-        // Get session start time from DB to ensure current-session snapshots are never deleted
         conn.query_row(
             "SELECT started_at FROM sessions WHERE id = ?1",
             rusqlite::params![&payload.session_id],
@@ -129,12 +198,23 @@ fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()>
     };
     if let Err(e) = olaf::restore::cleanup_old_restore_points(&cwd, protect_ms) {
         log::debug!("observe session-end: restore cleanup failed: {e}");
+        if monitor_active {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "hook_error",
+                session_id: Some(payload.session_id.clone()),
+                summary: "Restore cleanup failed".to_string(),
+                is_error: true,
+                error_message: Some(olaf::activity::sanitize_error(&e.to_string(), 200)),
+                ..Default::default()
+            });
+        }
     }
-    log::debug!("observe session-end: completed in {:?}", start.elapsed()); // AC8: NFR5 — always logged
+    log::debug!("observe session-end: completed in {:?}", start.elapsed());
     Ok(())
 }
 
-fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<()> {
+fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
     let tool_name = match payload.tool_name.as_deref() {
         Some(t) => t,
         None => return Ok(()),
@@ -144,7 +224,6 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
 
     match tool_name {
         "Bash" => {
-            // Bash path: unchanged — use parse_post_tool_use, non-mut DB
             let result = match olaf::memory::parse_post_tool_use(payload) {
                 Some(r) => r,
                 None => return Ok(()),
@@ -169,7 +248,20 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 result.file_path.as_deref(),
                 branch.as_deref(),
             )?;
-            log::debug!("observe: handler completed in {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            log::debug!("observe: handler completed in {:?}", elapsed);
+
+            if monitor_active {
+                olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                    source: "hook",
+                    event_type: "observation",
+                    session_id: Some(result.session_id.clone()),
+                    tool_name: Some(tool_name.to_string()),
+                    summary: format!("{tool_name} → {}", result.kind),
+                    duration_ms: Some(elapsed.as_millis() as u64),
+                    ..Default::default()
+                });
+            }
         }
 
         "Edit" | "Write" => {
@@ -182,7 +274,6 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 None => return Ok(()),
             };
 
-            // Same path normalization as handle_pre_tool_use (lines 64–87)
             let rel_path = match std::path::Path::new(abs_path).strip_prefix(&cwd) {
                 Ok(rel) => {
                     let mut normalized = std::path::PathBuf::new();
@@ -215,7 +306,9 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
             let branch = olaf::config::detect_git_branch(&cwd);
             olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
 
-            match olaf::index::reindex_single_file(&mut conn, &cwd, &rel_path) {
+            // Track whether an observation was actually stored (not just a body-only diff)
+            let mut obs_stored = false;
+            let kind = match olaf::index::reindex_single_file(&mut conn, &cwd, &rel_path) {
                 Ok(olaf::index::ReindexOutcome::Changed(diff)) => {
                     if let Some(content) = olaf::memory::format_structural_observation(&diff) {
                         olaf::memory::insert_auto_observation(
@@ -227,12 +320,12 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                             Some(&rel_path),
                             branch.as_deref(),
                         )?;
+                        obs_stored = true;
                     }
-                    // body-only diff → no observation
+                    // body-only diff → no observation stored, obs_stored stays false
+                    "file_change"
                 }
-                Ok(olaf::index::ReindexOutcome::Unchanged) => {
-                    // hash matched — no observation
-                }
+                Ok(olaf::index::ReindexOutcome::Unchanged) => "unchanged",
                 Ok(olaf::index::ReindexOutcome::SoftFailure(_)) => {
                     log::debug!("observe: structural diff soft failure, using basic obs");
                     let (content, kind) = make_fallback_obs(tool_name, tool_input, &rel_path);
@@ -245,6 +338,8 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                         Some(&rel_path),
                         branch.as_deref(),
                     )?;
+                    obs_stored = true;
+                    kind
                 }
                 Err(e) => {
                     log::debug!("observe: reindex_single_file hard error: {e}, using basic obs");
@@ -258,10 +353,25 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                         Some(&rel_path),
                         branch.as_deref(),
                     )?;
+                    obs_stored = true;
+                    kind
                 }
-            }
+            };
 
-            log::debug!("observe: handler completed in {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            log::debug!("observe: handler completed in {:?}", elapsed);
+
+            if monitor_active && obs_stored {
+                olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                    source: "hook",
+                    event_type: "observation",
+                    session_id: Some(payload.session_id.clone()),
+                    tool_name: Some(tool_name.to_string()),
+                    summary: format!("{tool_name} {rel_path} → {kind}"),
+                    duration_ms: Some(elapsed.as_millis() as u64),
+                    ..Default::default()
+                });
+            }
         }
 
         n if n == "mcp__olaf__get_context"
@@ -273,16 +383,15 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 None => return Ok(()),
             };
 
-            // Extract normalized subject string for dead-end detection
             let subject = if n == "mcp__olaf__get_impact" {
                 match tool_input.get("symbol_fqn").and_then(|v| v.as_str()) {
                     Some(fqn) => format!("get_impact: {fqn}"),
-                    None => return Ok(()), // malformed payload — skip
+                    None => return Ok(()),
                 }
             } else {
                 match tool_input.get("intent").and_then(|v| v.as_str()) {
                     Some(intent) => format!("get_context: {intent}"),
-                    None => return Ok(()), // malformed payload — skip
+                    None => return Ok(()),
                 }
             };
 
@@ -305,7 +414,20 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 None,
                 branch.as_deref(),
             )?;
-            log::debug!("observe: context_retrieval recorded in {:?}", start.elapsed());
+            let elapsed = start.elapsed();
+            log::debug!("observe: context_retrieval recorded in {:?}", elapsed);
+
+            if monitor_active {
+                olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                    source: "hook",
+                    event_type: "observation",
+                    session_id: Some(payload.session_id.clone()),
+                    tool_name: Some(n.to_string()),
+                    summary: format!("context_retrieval: {}", olaf::activity::truncate(&subject, 80)),
+                    duration_ms: Some(elapsed.as_millis() as u64),
+                    ..Default::default()
+                });
+            }
         }
 
         _ => {}

@@ -65,6 +65,22 @@ CREATE TABLE rule_observations (
 );
 ";
 
+const MIGRATION_007: &str = "
+CREATE TABLE activity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    session_id TEXT,
+    event_type TEXT NOT NULL,
+    tool_name TEXT,
+    summary TEXT NOT NULL,
+    duration_ms INTEGER,
+    is_error INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT
+);
+CREATE INDEX idx_activity_events_ts ON activity_events(timestamp);
+";
+
 const MIGRATION_004: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts
     USING fts5(content, content='observations', content_rowid='id', tokenize='porter ascii');
@@ -251,7 +267,7 @@ fn handle_corruption_or_propagate(
 
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 6;
+pub const MIGRATION_COUNT: i64 = 7;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -261,7 +277,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_004),
         M::up(MIGRATION_005),
         M::up(MIGRATION_006),
-        // Future migrations: append M::up(MIGRATION_007), etc. — never edit existing entries
+        M::up(MIGRATION_007),
+        // Future migrations: append M::up(MIGRATION_008), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

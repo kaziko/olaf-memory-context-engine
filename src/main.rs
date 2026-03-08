@@ -41,6 +41,21 @@ enum Commands {
         #[command(subcommand)]
         action: WorkspaceCommands,
     },
+    /// Live activity monitor — run in a separate terminal
+    Monitor {
+        /// Output events as JSON lines instead of formatted text
+        #[arg(long)]
+        json: bool,
+        /// Show last N events on startup (default: 10)
+        #[arg(long, default_value = "10")]
+        tail: usize,
+        /// Filter to specific tool name
+        #[arg(long)]
+        tool: Option<String>,
+        /// Show only errors
+        #[arg(long)]
+        errors_only: bool,
+    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -161,6 +176,9 @@ fn main() -> anyhow::Result<()> {
                 cli::workspace::run_doctor()?;
             }
         },
+        Commands::Monitor { json, tail, tool, errors_only } => {
+            cli::monitor::run(json, tail, tool, errors_only)?;
+        }
         Commands::Completions { shell } => {
             use clap::CommandFactory;
             clap_complete::generate(shell, &mut Cli::command(), "olaf", &mut std::io::stdout());
