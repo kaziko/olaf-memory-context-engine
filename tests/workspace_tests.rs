@@ -358,3 +358,61 @@ fn workspace_cli_add_and_list() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("other"), "Should list the added member");
 }
+
+#[test]
+fn workspace_retrieval_notes_include_repo_labels() {
+    let root = tempdir().unwrap();
+
+    let local = root.path().join("backend");
+    std::fs::create_dir_all(&local).unwrap();
+    create_ts_file(
+        &local,
+        "payments.ts",
+        "export class PaymentProcessor {\n  charge() { return true; }\n}\n",
+    );
+    init_repo(&local);
+
+    let remote = root.path().join("frontend");
+    std::fs::create_dir_all(&remote).unwrap();
+    create_ts_file(
+        &remote,
+        "dashboard.ts",
+        "export class DashboardRenderer {\n  render() { return false; }\n}\n",
+    );
+    init_repo(&remote);
+
+    let ws_toml = format!(
+        "[workspace]\nmembers = [\n  {{ path = \".\", label = \"backend\" }},\n  {{ path = \"{}\", label = \"frontend\" }},\n]\n",
+        remote.canonicalize().unwrap().display()
+    );
+    std::fs::write(local.join(".olaf").join("workspace.toml"), &ws_toml).unwrap();
+
+    let responses = run_mcp_requests(&local, &[
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "get_context",
+            "arguments": {
+                "intent": "payment processor and dashboard renderer",
+                "token_budget": 8000
+            }
+        }}),
+    ]);
+
+    assert!(responses.len() >= 2);
+    let text = responses[1]["result"]["content"][0]["text"].as_str().unwrap_or("");
+
+    assert!(text.contains("## Retrieval Notes"),
+        "workspace get_context must include retrieval notes; got:\n{}", &text[..text.len().min(800)]);
+
+    // Remote pivots must show the workspace label in retrieval notes
+    if text.contains("DashboardRenderer") {
+        assert!(text.contains("[frontend]"),
+            "retrieval notes must include remote repo label [frontend]; got:\n{}", &text[..text.len().min(1200)]);
+    }
+
+    // Local pivots must show local-priority strategy, remote pivots remote-round-robin
+    assert!(
+        text.contains("local-priority") || text.contains("remote-round-robin"),
+        "retrieval notes must include selection strategy annotation; got:\n{}", &text[..text.len().min(1200)]
+    );
+}

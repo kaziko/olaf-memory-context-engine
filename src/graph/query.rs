@@ -184,6 +184,27 @@ struct SymbolRow {
     signature: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SelectionReason {
+    Keyword { kw_score: usize, in_degree: i64 },
+    FileHint { hint: String },
+    CallerSupplied,
+    Fallback,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PivotScore {
+    pub id: i64,
+    pub fqn: String,
+    pub reason: SelectionReason,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaggedPivotScore {
+    pub pivot: PivotScore,
+    pub member_index: usize,
+}
+
 /// Layer 2 sensitive-file exclusion (defense-in-depth).
 /// KEEP IN SYNC with `index::is_sensitive` in src/index/mod.rs.
 /// Cannot import that function directly — would create a circular dependency.
@@ -218,7 +239,7 @@ pub(crate) fn rank_symbols_by_keywords(
     conn: &Connection,
     keywords: &[String],
     limit: usize,
-) -> Result<Vec<(i64, String)>, QueryError> {
+) -> Result<Vec<PivotScore>, QueryError> {
     let unique_words: HashSet<String> = keywords.iter()
         .filter(|w| w.len() > 3)
         .map(|w| w.to_lowercase())
@@ -270,37 +291,48 @@ pub(crate) fn rank_symbols_by_keywords(
     });
 
     let mut result = Vec::new();
-    for (id, _, _) in scored.into_iter().take(limit) {
+    for (id, kw, in_deg) in scored.into_iter().take(limit) {
         if let Some(fqn) = conn.query_row(
             "SELECT fqn FROM symbols WHERE id = ?1",
             params![id],
             |r| r.get::<_, String>(0),
         ).optional()? {
-            result.push((id, fqn));
+            result.push(PivotScore {
+                id,
+                fqn,
+                reason: SelectionReason::Keyword { kw_score: kw, in_degree: in_deg },
+            });
         }
     }
     Ok(result)
 }
 
-fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<i64>, QueryError> {
-    let mut ids: Vec<i64> = Vec::new();
+fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<PivotScore>, QueryError> {
     let mut seen: HashSet<i64> = HashSet::new();
 
-    // --- File hints branch: UNCHANGED ---
+    // --- File hints branch ---
     if !file_hints.is_empty() {
+        let mut result: Vec<PivotScore> = Vec::new();
         for hint in file_hints {
             let pattern = format!("%{hint}%");
             let mut stmt = conn.prepare(
-                "SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id
+                "SELECT s.id, s.fqn FROM symbols s JOIN files f ON f.id=s.file_id
                  WHERE f.path LIKE ?1 ORDER BY (s.end_line-s.start_line) DESC LIMIT 10"
             )?;
-            let rows: Vec<i64> = stmt.query_map(params![pattern], |r| r.get(0))?
-                .collect::<Result<_,_>>()?;
-            for id in rows {
-                if seen.insert(id) { ids.push(id); }
+            let rows: Vec<(i64, String)> = stmt.query_map(params![pattern], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?.collect::<Result<_,_>>()?;
+            for (id, fqn) in rows {
+                if seen.insert(id) {
+                    result.push(PivotScore {
+                        id,
+                        fqn,
+                        reason: SelectionReason::FileHint { hint: hint.clone() },
+                    });
+                }
             }
         }
-        if !ids.is_empty() { return Ok(ids); }
+        if !result.is_empty() { return Ok(result); }
     }
 
     // --- Keyword branch: delegate to shared ranking function ---
@@ -308,12 +340,15 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
     let ranked = rank_symbols_by_keywords(conn, &keywords, pool_size)?;
 
     if !ranked.is_empty() {
-        return Ok(ranked.into_iter().map(|(id, _)| id).collect());
+        return Ok(ranked);
     }
 
     // Fallback: no keyword matches — return first symbols in DB
-    let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id ASC LIMIT ?1")?;
-    Ok(stmt.query_map(params![pool_size as i64], |r| r.get(0))?.collect::<Result<_,_>>()?)
+    let mut stmt = conn.prepare("SELECT id, fqn FROM symbols ORDER BY id ASC LIMIT ?1")?;
+    let rows: Vec<(i64, String)> = stmt.query_map(params![pool_size as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?.collect::<Result<_,_>>()?;
+    Ok(rows.into_iter().map(|(id, fqn)| PivotScore { id, fqn, reason: SelectionReason::Fallback }).collect())
 }
 
 #[allow(clippy::type_complexity)]
@@ -424,13 +459,22 @@ fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end
     Ok(lines[start..end].join("\n"))
 }
 
-fn format_observation_entry(obs: &crate::memory::store::ObservationRow) -> String {
+fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservation) -> String {
+    let obs = &scored.obs;
+    let recency_label = if scored.relevance_score >= 0.7 {
+        "(recent)"
+    } else if scored.relevance_score >= 0.3 && !obs.is_stale {
+        "(aged)"
+    } else {
+        "(stale)"
+    };
+
     let mut entry = String::new();
     if obs.is_stale {
         let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
-        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {}\n", reason, obs.kind, obs.content));
+        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {} {}\n", reason, obs.kind, obs.content, recency_label));
     } else {
-        entry.push_str(&format!("- [{}] {}\n", obs.kind, obs.content));
+        entry.push_str(&format!("- [{}] {} {}\n", obs.kind, obs.content, recency_label));
     }
     if let Some(fqn) = &obs.symbol_fqn {
         entry.push_str(&format!("  Symbol: {}\n", fqn));
@@ -439,6 +483,68 @@ fn format_observation_entry(obs: &crate::memory::store::ObservationRow) -> Strin
         entry.push_str(&format!("  File: {}\n", fp));
     }
     entry
+}
+
+fn extract_intent_label(intent_header: &str) -> String {
+    for line in intent_header.lines() {
+        if let Some(rest) = line.strip_prefix("intent_mode: ") {
+            return rest.trim().to_string();
+        }
+    }
+    "balanced".to_string()
+}
+
+fn format_retrieval_notes(rendered_pivots: &[&PivotScore], intent_label: &str, omitted: usize) -> String {
+    if rendered_pivots.is_empty() && omitted == 0 {
+        return String::new();
+    }
+    let mut out = String::from("\n## Retrieval Notes\n");
+    for ps in rendered_pivots {
+        let short_name = ps.fqn.rsplit("::").next().unwrap_or(&ps.fqn);
+        let score_str = match &ps.reason {
+            SelectionReason::Keyword { kw_score, in_degree } => format!("kw={kw_score} deg={in_degree}"),
+            SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
+            SelectionReason::CallerSupplied => "caller-supplied".to_string(),
+            SelectionReason::Fallback => "fallback".to_string(),
+        };
+        out.push_str(&format!("- {short_name} ({}): {score_str} [{intent_label}]\n", ps.fqn));
+    }
+    if omitted > 0 {
+        out.push_str(&format!("({omitted} pivots omitted: budget/sensitive-path)\n"));
+    }
+    out
+}
+
+fn format_retrieval_notes_multi(
+    rendered_pivots: &[(&TaggedPivotScore, bool)],
+    intent_label: &str,
+    omitted: usize,
+    labels: &[(usize, &str)],
+) -> String {
+    if rendered_pivots.is_empty() && omitted == 0 {
+        return String::new();
+    }
+    let mut out = String::from("\n## Retrieval Notes\n");
+    for (tps, is_local) in rendered_pivots {
+        let ps = &tps.pivot;
+        let short_name = ps.fqn.rsplit("::").next().unwrap_or(&ps.fqn);
+        let label = labels.iter()
+            .find(|(idx, _)| *idx == tps.member_index)
+            .map(|(_, l)| *l)
+            .unwrap_or("unknown");
+        let strategy = if *is_local { "local-priority" } else { "remote-round-robin" };
+        let score_str = match &ps.reason {
+            SelectionReason::Keyword { kw_score, in_degree } => format!("kw={kw_score} deg={in_degree}"),
+            SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
+            SelectionReason::CallerSupplied => "caller-supplied".to_string(),
+            SelectionReason::Fallback => "fallback".to_string(),
+        };
+        out.push_str(&format!("- {short_name} [{label}] ({strategy}): {score_str} [{intent_label}]\n", ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!("({omitted} pivots omitted: budget/sensitive-path)\n"));
+    }
+    out
 }
 
 fn format_pivot_entry(row: &SymbolRow, source: &str) -> String {
@@ -491,18 +597,19 @@ fn build_context_brief(
     conn: &Connection,
     project_root: &Path,
     intent_header: &str,
-    pivot_ids: &[i64],
+    pivot_scores: &[PivotScore],
     policy: &TraversalPolicy,
     token_budget: usize,
-) -> Result<String, QueryError> {
+) -> Result<(String, String), QueryError> {
     let mut output = intent_header.to_string();
 
-    if pivot_ids.is_empty() {
+    if pivot_scores.is_empty() {
         output.push_str(NO_SYMBOLS_IN_INDEX);
-        return Ok(output);
+        return Ok((output, String::new()));
     }
 
-    let (pivots, supporting_with_reasons) = traverse_bfs(conn, pivot_ids, policy)?;
+    let pivot_ids: Vec<i64> = pivot_scores.iter().map(|ps| ps.id).collect();
+    let (pivots, supporting_with_reasons) = traverse_bfs(conn, &pivot_ids, policy)?;
 
     let pivot_budget = token_budget * 70 / 100;
     let skeleton_budget = token_budget * 20 / 100;
@@ -513,6 +620,7 @@ fn build_context_brief(
     let mut pivot_tokens = 0usize;
     let mut all_fqns: HashSet<String> = HashSet::new();
     let mut all_file_paths: HashSet<String> = HashSet::new();
+    let mut rendered_pivot_ids: HashSet<i64> = HashSet::new();
 
     for id in &pivots {
         let Some(row) = load_symbol_row(conn, *id)? else { continue };
@@ -533,6 +641,7 @@ fn build_context_brief(
         if pivot_tokens + entry_tokens > pivot_budget { break; }
         output.push_str(&entry);
         pivot_tokens += entry_tokens;
+        rendered_pivot_ids.insert(*id);
     }
 
     if !supporting_with_reasons.is_empty() {
@@ -567,16 +676,16 @@ fn build_context_brief(
     let file_paths: Vec<&str> = all_file_paths.iter().map(|s| s.as_str()).collect();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
-        let observations = crate::memory::store::get_observations_for_context(
+        let scored = crate::memory::store::get_scored_observations_for_context(
             conn, &fqns, &file_paths, 50,
         )
         .unwrap_or_default();
 
-        if !observations.is_empty() {
+        if !scored.is_empty() {
             let mut mem_section = String::new();
             let mut mem_tokens = 0usize;
-            for obs in &observations {
-                let entry = format_observation_entry(obs);
+            for scored_obs in &scored {
+                let entry = format_scored_observation_entry(scored_obs);
                 let entry_tokens = estimate_tokens(&entry);
                 if mem_tokens + entry_tokens > memory_budget {
                     break;
@@ -591,7 +700,15 @@ fn build_context_brief(
         }
     }
 
-    Ok(output)
+    // Build retrieval notes
+    let intent_label = extract_intent_label(intent_header);
+    let rendered: Vec<&PivotScore> = pivot_scores.iter()
+        .filter(|ps| rendered_pivot_ids.contains(&ps.id))
+        .collect();
+    let omitted = pivot_scores.len() - rendered.len();
+    let retrieval_notes = format_retrieval_notes(&rendered, &intent_label, omitted);
+
+    Ok((output, retrieval_notes))
 }
 
 pub(crate) fn get_context(
@@ -600,12 +717,28 @@ pub(crate) fn get_context(
     intent: &str,
     file_hints: &[String],
     token_budget: usize,
-) -> Result<String, QueryError> {
+) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    let pivot_ids = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief(conn, project_root, &intent_header, &pivot_ids, &policy, token_budget)
+    let pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
+}
+
+/// Build a context brief directly from caller-provided `PivotScore` values, preserving their
+/// `SelectionReason` (e.g. `Keyword` with `kw_score`/`in_degree`). Used by `analyze_failure`
+/// Path B so that keyword scores are surfaced in retrieval notes rather than reclassified.
+pub(crate) fn get_context_from_pivot_scores(
+    conn: &Connection,
+    project_root: &Path,
+    intent: &str,
+    pivot_scores: Vec<PivotScore>,
+    token_budget: usize,
+) -> Result<(String, String), QueryError> {
+    let profile = detect_intent_profile(intent);
+    let policy = derive_traversal_policy(&profile);
+    let intent_header = format_intent_header(&profile, intent);
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
 }
 
 pub(crate) fn get_context_with_pivots(
@@ -614,56 +747,53 @@ pub(crate) fn get_context_with_pivots(
     intent: &str,
     pivot_fqns: &[String],
     token_budget: usize,
-) -> Result<String, QueryError> {
+) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
 
-    let mut resolved_ids: Vec<i64> = Vec::new();
+    let mut pivot_scores: Vec<PivotScore> = Vec::new();
     for fqn in pivot_fqns {
         if let Some(id) = conn.query_row(
             "SELECT id FROM symbols WHERE fqn = ?1",
             params![fqn],
             |r| r.get::<_, i64>(0),
         ).optional()? {
-            resolved_ids.push(id);
+            pivot_scores.push(PivotScore {
+                id,
+                fqn: fqn.clone(),
+                reason: SelectionReason::CallerSupplied,
+            });
         }
     }
 
-    if resolved_ids.is_empty() {
+    if pivot_scores.is_empty() {
         let mut output = intent_header;
         output.push_str(NO_SYMBOLS_FOR_FQNS);
-        return Ok(output);
+        return Ok((output, String::new()));
     }
 
-    build_context_brief(conn, project_root, &intent_header, &resolved_ids, &policy, token_budget)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
 }
 
 // --- Workspace-aware federated queries ---
 
-/// Tagged pivot: a symbol from a specific workspace member.
-#[derive(Debug, Clone)]
-pub(crate) struct TaggedPivot {
-    pub member_index: usize,
-    pub symbol_id: i64,
-}
-
 /// Find pivot symbols across all workspace members.
-/// Tags results with `(member_index, symbol_id)`.
+/// Tags results with `(member_index, pivot_score)`.
 /// Interleaves local-first: up to 60% from local, rest round-robin from remotes.
 pub(crate) fn find_pivot_symbols_multi(
     workspace: &Workspace,
     intent: &str,
     file_hints: &[String],
     pool_size: usize,
-) -> Result<Vec<TaggedPivot>, QueryError> {
+) -> Result<Vec<TaggedPivotScore>, QueryError> {
     let members = workspace.all_read_conns();
-    let mut per_member: Vec<(usize, Vec<i64>)> = Vec::new();
+    let mut per_member: Vec<(usize, Vec<PivotScore>)> = Vec::new();
 
     for m in &members {
-        let ids = find_pivot_symbols(m.conn, intent, file_hints, pool_size)?;
-        if !ids.is_empty() {
-            per_member.push((m.index, ids));
+        let pivots = find_pivot_symbols(m.conn, intent, file_hints, pool_size)?;
+        if !pivots.is_empty() {
+            per_member.push((m.index, pivots));
         }
     }
 
@@ -672,12 +802,12 @@ pub(crate) fn find_pivot_symbols_multi(
     }
 
     // Separate local (index 0) from remotes (keep per-member grouping for round-robin)
-    let local_pivots: Vec<i64> = per_member
+    let local_pivots: Vec<&PivotScore> = per_member
         .iter()
         .filter(|(idx, _)| *idx == 0)
-        .flat_map(|(_, ids)| ids.iter().copied())
+        .flat_map(|(_, ps)| ps.iter())
         .collect();
-    let remote_groups: Vec<&(usize, Vec<i64>)> = per_member
+    let remote_groups: Vec<&(usize, Vec<PivotScore>)> = per_member
         .iter()
         .filter(|(idx, _)| *idx != 0)
         .collect();
@@ -691,16 +821,16 @@ pub(crate) fn find_pivot_symbols_multi(
         max_local.min(pool_size.saturating_sub(1))
     };
 
-    let mut result: Vec<TaggedPivot> = Vec::new();
+    let mut result: Vec<TaggedPivotScore> = Vec::new();
     let mut seen: HashSet<(usize, i64)> = HashSet::new();
 
     // Take local pivots first
-    for id in &local_pivots {
+    for ps in &local_pivots {
         if result.len() >= local_limit {
             break;
         }
-        if seen.insert((0, *id)) {
-            result.push(TaggedPivot { member_index: 0, symbol_id: *id });
+        if seen.insert((0, ps.id)) {
+            result.push(TaggedPivotScore { pivot: (*ps).clone(), member_index: 0 });
         }
     }
 
@@ -710,19 +840,19 @@ pub(crate) fn find_pivot_symbols_multi(
         let mut exhausted = 0;
         while result.len() < pool_size && exhausted < remote_groups.len() {
             exhausted = 0;
-            for (gi, (idx, ids)) in remote_groups.iter().enumerate() {
+            for (gi, (idx, pivots)) in remote_groups.iter().enumerate() {
                 let idx = *idx;
                 if result.len() >= pool_size { break; }
                 // Advance cursor for this group until we find an unseen pivot or exhaust
-                while cursors[gi] < ids.len() {
-                    let id = ids[cursors[gi]];
+                while cursors[gi] < pivots.len() {
+                    let ps = &pivots[cursors[gi]];
                     cursors[gi] += 1;
-                    if seen.insert((idx, id)) {
-                        result.push(TaggedPivot { member_index: idx, symbol_id: id });
+                    if seen.insert((idx, ps.id)) {
+                        result.push(TaggedPivotScore { pivot: ps.clone(), member_index: idx });
                         break;
                     }
                 }
-                if cursors[gi] >= ids.len() {
+                if cursors[gi] >= pivots.len() {
                     exhausted += 1;
                 }
             }
@@ -736,16 +866,16 @@ pub(crate) fn find_pivot_symbols_multi(
 pub(crate) fn build_context_brief_multi(
     workspace: &Workspace,
     intent_header: &str,
-    tagged_pivots: &[TaggedPivot],
+    tagged_pivots: &[TaggedPivotScore],
     policy: &TraversalPolicy,
     token_budget: usize,
-) -> Result<String, QueryError> {
+) -> Result<(String, String), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
 
     if tagged_pivots.is_empty() {
         output.push_str(NO_SYMBOLS_IN_INDEX);
-        return Ok(output);
+        return Ok((output, String::new()));
     }
 
     let pivot_budget = token_budget * 70 / 100;
@@ -758,6 +888,7 @@ pub(crate) fn build_context_brief_multi(
     // pollute local observation queries (story: "memory local-only").
     let mut local_fqns: HashSet<String> = HashSet::new();
     let mut local_file_paths: HashSet<String> = HashSet::new();
+    let mut rendered_pivot_ids: HashSet<(usize, i64)> = HashSet::new();
 
     for tp in tagged_pivots {
         let m = match members.iter().find(|m| m.index == tp.member_index) {
@@ -765,7 +896,7 @@ pub(crate) fn build_context_brief_multi(
             None => continue,
         };
 
-        let Some(row) = load_symbol_row(m.conn, tp.symbol_id)? else { continue };
+        let Some(row) = load_symbol_row(m.conn, tp.pivot.id)? else { continue };
         if is_output_sensitive(&row.file_path) { continue; }
 
         // Only collect identifiers from local repo for memory matching
@@ -791,6 +922,7 @@ pub(crate) fn build_context_brief_multi(
         if pivot_tokens + entry_tokens > pivot_budget { break; }
         output.push_str(&entry);
         pivot_tokens += entry_tokens;
+        rendered_pivot_ids.insert((tp.member_index, tp.pivot.id));
     }
 
     // Supporting symbols — BFS per member (local only for traversal, per story scope)
@@ -798,7 +930,7 @@ pub(crate) fn build_context_brief_multi(
     let local_pivots: Vec<i64> = tagged_pivots
         .iter()
         .filter(|tp| tp.member_index == 0)
-        .map(|tp| tp.symbol_id)
+        .map(|tp| tp.pivot.id)
         .collect();
 
     if !local_pivots.is_empty() {
@@ -838,16 +970,16 @@ pub(crate) fn build_context_brief_multi(
     let file_paths: Vec<&str> = local_file_paths.iter().map(|s| s.as_str()).collect();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
-        let observations = crate::memory::store::get_observations_for_context(
+        let scored = crate::memory::store::get_scored_observations_for_context(
             local_conn, &fqns, &file_paths, 50,
         )
         .unwrap_or_default();
 
-        if !observations.is_empty() {
+        if !scored.is_empty() {
             let mut mem_section = String::new();
             let mut mem_tokens = 0usize;
-            for obs in &observations {
-                let entry = format_observation_entry(obs);
+            for scored_obs in &scored {
+                let entry = format_scored_observation_entry(scored_obs);
                 let entry_tokens = estimate_tokens(&entry);
                 if mem_tokens + entry_tokens > memory_budget { break; }
                 mem_section.push_str(&entry);
@@ -860,7 +992,17 @@ pub(crate) fn build_context_brief_multi(
         }
     }
 
-    Ok(output)
+    // Build retrieval notes with workspace labels
+    let intent_label = extract_intent_label(intent_header);
+    let labels: Vec<(usize, &str)> = members.iter().map(|m| (m.index, m.label)).collect();
+    let rendered: Vec<(&TaggedPivotScore, bool)> = tagged_pivots.iter()
+        .filter(|tp| rendered_pivot_ids.contains(&(tp.member_index, tp.pivot.id)))
+        .map(|tp| (tp, tp.member_index == 0))
+        .collect();
+    let omitted = tagged_pivots.len() - rendered.len();
+    let retrieval_notes = format_retrieval_notes_multi(&rendered, &intent_label, omitted, &labels);
+
+    Ok((output, retrieval_notes))
 }
 
 /// Top-level workspace-aware context retrieval.
@@ -869,7 +1011,7 @@ pub(crate) fn get_context_workspace(
     intent: &str,
     file_hints: &[String],
     token_budget: usize,
-) -> Result<String, QueryError> {
+) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
@@ -1196,7 +1338,7 @@ mod tests {
         ).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let result = get_context(&conn, root, "fix the crash", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000).unwrap();
         assert!(result.contains("intent_mode: bug-fix\n"), "get_context output must include intent_mode header line");
         assert!(result.contains("intent_confidence:"), "get_context output must include intent_confidence");
         assert!(result.contains("intent_signals:"), "get_context output must include intent_signals");
@@ -1414,7 +1556,7 @@ mod tests {
         conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
         conn.execute("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)", []).unwrap();
 
-        let result = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000).unwrap();
 
         assert!(result.contains("```"), "AC1: pivot output must contain fenced code block");
         assert!(result.contains("fn my_pivot"), "AC1: pivot source body must appear in output");
@@ -1430,7 +1572,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let result = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC2: supporting section must contain Signature line");
@@ -1447,7 +1589,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let result = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC3: Signature line must be present when sig is set");
@@ -1469,7 +1611,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let result = get_context(&conn, root, "implement pivot", &[], 50).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50).unwrap();
 
         // Pivot must be present — proves pivot-first ordering was honoured
         assert!(result.contains("## pivot"), "AC4: pivot symbol must appear in output");
@@ -1491,7 +1633,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (3,1,4,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let result = get_context(&conn, root, "implement pivot", &[], 50000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
 
@@ -1534,7 +1676,7 @@ mod tests {
 
         let result = find_pivot_symbols(&conn, "build context pipeline", &[], 5).unwrap();
         assert!(!result.is_empty(), "must return results");
-        assert_eq!(result[0], 1, "X (kw_score=2) must rank before Y (kw_score=1) despite Y having higher in_degree");
+        assert_eq!(result[0].id, 1, "X (kw_score=2) must rank before Y (kw_score=1) despite Y having higher in_degree");
     }
 
     #[test]
@@ -1558,7 +1700,7 @@ mod tests {
         // Only "processor" yields matches; "data" yields none.
         let result = find_pivot_symbols(&conn, "processor data", &[], 5).unwrap();
         assert_eq!(result.len(), 2, "both processor symbols must be returned");
-        assert_eq!(result[0], 2, "processor_v2 (in_degree=5) must rank before processor (in_degree=0)");
+        assert_eq!(result[0].id, 2, "processor_v2 (in_degree=5) must rank before processor (in_degree=0)");
     }
 
     #[test]
@@ -1570,7 +1712,8 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (1,1,'auth::authenticate_handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
 
         let result = find_pivot_symbols(&conn, "authenticate users", &[], 5).unwrap();
-        assert!(result.contains(&1), "symbol must be found via FQN LIKE match on 'authenticate'");
+        let ids: Vec<i64> = result.iter().map(|ps| ps.id).collect();
+        assert!(ids.contains(&1), "symbol must be found via FQN LIKE match on 'authenticate'");
     }
 
     #[test]
@@ -1583,8 +1726,9 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (2,2,'pkg::other_sym','other_sym','fn',1,10,NULL,NULL,NULL)", []).unwrap();
 
         let result = find_pivot_symbols(&conn, "other build context", &["specific_file.rs".to_string()], 5).unwrap();
-        assert!(result.contains(&1), "symbol from hinted file must be present");
-        assert!(!result.contains(&2), "symbol from non-hinted file must be absent when file hints are given");
+        let ids: Vec<i64> = result.iter().map(|ps| ps.id).collect();
+        assert!(ids.contains(&1), "symbol from hinted file must be present");
+        assert!(!ids.contains(&2), "symbol from non-hinted file must be absent when file hints are given");
     }
 
     #[test]
@@ -1607,10 +1751,12 @@ mod tests {
         let result_single = find_pivot_symbols(&conn, "build", &[], 5).unwrap();
         let result_triple = find_pivot_symbols(&conn, "Build BUILD build", &[], 5).unwrap();
 
+        let ids_single: Vec<i64> = result_single.iter().map(|ps| ps.id).collect();
+        let ids_triple: Vec<i64> = result_triple.iter().map(|ps| ps.id).collect();
         // Both must return C (id=3) first because in_degree=2 > in_degree=0 at equal kw_score
-        assert_eq!(result_single[0], 3, "debug_build (in_degree=2) must rank first for 'build'");
-        assert_eq!(result_triple[0], 3, "debug_build must still rank first for 'Build BUILD build' (dedup must prevent inflation)");
-        assert_eq!(result_single, result_triple, "both calls must return identical ordering");
+        assert_eq!(ids_single[0], 3, "debug_build (in_degree=2) must rank first for 'build'");
+        assert_eq!(ids_triple[0], 3, "debug_build must still rank first for 'Build BUILD build' (dedup must prevent inflation)");
+        assert_eq!(ids_single, ids_triple, "both calls must return identical ordering");
     }
 
     #[test]
@@ -1625,7 +1771,7 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (20,1,'pkg::context_b','context_b','fn',21,30,NULL,NULL,NULL)", []).unwrap();
 
         let result = find_pivot_symbols(&conn, "context data", &[], 10).unwrap();
-        let ctx_ids: Vec<i64> = result.into_iter().filter(|&id| id == 10 || id == 20 || id == 30).collect();
+        let ctx_ids: Vec<i64> = result.iter().map(|ps| ps.id).filter(|&id| id == 10 || id == 20 || id == 30).collect();
         assert_eq!(ctx_ids, vec![10, 20, 30], "symbols with equal score must be ordered by id ASC");
     }
 
@@ -1718,7 +1864,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("auth.rs"), "fn login() { todo!() }\n").unwrap();
 
-        let result = get_context_with_pivots(
+        let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix login bug",
             &["src/auth.rs::login".to_string()], 4000,
         ).unwrap();
@@ -1730,7 +1876,7 @@ mod tests {
     fn get_context_with_pivots_no_match() {
         let conn = build_test_db();
         let tmpdir = tempfile::tempdir().unwrap();
-        let result = get_context_with_pivots(
+        let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix bug",
             &["nonexistent::symbol".to_string()], 4000,
         ).unwrap();
@@ -1768,7 +1914,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
-        let result = get_context_with_pivots(
+        let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix error",
             &["src/a.rs::handler".to_string()], 4000,
         ).unwrap();
@@ -1796,8 +1942,8 @@ mod tests {
         let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
         assert_eq!(result.len(), 2, "both symbols match 'auth'");
         // Same kw_score (1 each), so in_degree breaks tie: symbol 2 has in_degree=1
-        assert_eq!(result[0].0, 2, "higher in-degree symbol first");
-        assert_eq!(result[1].0, 1);
+        assert_eq!(result[0].id, 2, "higher in-degree symbol first");
+        assert_eq!(result[1].id, 1);
     }
 
     #[test]
@@ -1806,5 +1952,118 @@ mod tests {
         let keywords = vec!["nonexistent_keyword_xyz".to_string()];
         let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
         assert!(result.is_empty(), "no match must return empty vec (no first-in-DB fallback)");
+    }
+
+    // ─── Story 9.8: Score explainability tests ──────
+
+    #[test]
+    fn selection_reason_keyword_path() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let result = find_pivot_symbols(&conn, "handler request", &[], 5).unwrap();
+        assert!(!result.is_empty());
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { .. }), "keyword path must produce Keyword reason");
+        if let SelectionReason::Keyword { kw_score, .. } = &result[0].reason {
+            assert!(*kw_score >= 1, "kw_score must be at least 1");
+        }
+    }
+
+    #[test]
+    fn selection_reason_file_hint_path() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/auth.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'auth::login','login','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let result = find_pivot_symbols(&conn, "anything", &["auth.rs".to_string()], 5).unwrap();
+        assert!(!result.is_empty());
+        assert!(matches!(result[0].reason, SelectionReason::FileHint { .. }), "file-hint path must produce FileHint reason");
+        if let SelectionReason::FileHint { hint } = &result[0].reason {
+            assert_eq!(hint, "auth.rs");
+        }
+    }
+
+    #[test]
+    fn selection_reason_fallback_path() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::something','something','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        // Use a keyword that won't match any symbol
+        let result = find_pivot_symbols(&conn, "zzzz_nomatch_zzzz", &[], 5).unwrap();
+        assert!(!result.is_empty(), "fallback must return at least one symbol");
+        assert!(matches!(result[0].reason, SelectionReason::Fallback), "fallback path must produce Fallback reason");
+    }
+
+    #[test]
+    fn selection_reason_caller_supplied_path() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::target','target','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (_, notes) = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000,
+        ).unwrap();
+        assert!(notes.contains("caller-supplied"), "CallerSupplied pivots must show 'caller-supplied' in retrieval notes");
+    }
+
+    #[test]
+    fn retrieval_notes_contain_rendered_pivots_only() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000).unwrap();
+        assert!(result.contains("Pivot Symbols"), "brief must have pivots");
+        assert!(notes.contains("## Retrieval Notes"), "retrieval notes must be generated");
+        assert!(notes.contains("handler"), "rendered pivot must appear in retrieval notes");
+    }
+
+    #[test]
+    fn observation_recency_labels_appended() {
+        use crate::memory::store::{ObservationRow, ScoredObservation};
+
+        // Recent observation (score >= 0.7)
+        let recent = ScoredObservation {
+            obs: ObservationRow {
+                id: 1, session_id: "s1".to_string(), created_at: 0,
+                kind: "discovery".to_string(), content: "found pattern".to_string(),
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            },
+            relevance_score: 0.85,
+        };
+        let entry = format_scored_observation_entry(&recent);
+        assert!(entry.contains("(recent)"), "score >= 0.7 must get (recent) label");
+        assert!(entry.contains("found pattern"), "content must be preserved");
+
+        // Aged observation (0.3 <= score < 0.7)
+        let aged = ScoredObservation {
+            obs: ObservationRow {
+                id: 2, session_id: "s1".to_string(), created_at: 0,
+                kind: "note".to_string(), content: "old note".to_string(),
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            },
+            relevance_score: 0.5,
+        };
+        let entry = format_scored_observation_entry(&aged);
+        assert!(entry.contains("(aged)"), "0.3 <= score < 0.7 must get (aged) label");
+
+        // Stale observation (is_stale = true)
+        let stale = ScoredObservation {
+            obs: ObservationRow {
+                id: 3, session_id: "s1".to_string(), created_at: 0,
+                kind: "bug".to_string(), content: "stale finding".to_string(),
+                symbol_fqn: None, file_path: None, is_stale: true,
+                stale_reason: Some("symbol changed".to_string()),
+            },
+            relevance_score: 0.5,
+        };
+        let entry = format_scored_observation_entry(&stale);
+        assert!(entry.contains("(stale)"), "is_stale=true must get (stale) label regardless of score");
+        assert!(entry.contains("STALE"), "stale marker must be preserved");
+        assert!(entry.contains("symbol changed"), "stale_reason must be preserved");
     }
 }

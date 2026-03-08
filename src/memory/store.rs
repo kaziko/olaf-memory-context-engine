@@ -281,6 +281,18 @@ pub(crate) fn get_observations_for_context(
         .collect())
 }
 
+pub(crate) fn get_scored_observations_for_context(
+    conn: &Connection,
+    symbol_fqns: &[&str],
+    file_paths: &[&str],
+    limit: usize,
+) -> Result<Vec<ScoredObservation>, StoreError> {
+    let observations = get_observations_for_context(conn, symbol_fqns, file_paths, limit)?;
+    let mut scored = score_observations(observations);
+    scored.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+    Ok(scored)
+}
+
 #[derive(Debug)]
 pub struct SessionSummary {
     pub session_id: String,

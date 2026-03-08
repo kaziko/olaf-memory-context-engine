@@ -12,6 +12,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 - **Multi-language indexing** — TypeScript, JavaScript, Python, Rust, PHP, Go
 - **Intent-aware context** — classifies your task (bug-fix, refactor, implementation) and adjusts retrieval depth and direction
+- **Score-explainable retrieval** — every context brief includes a `## Retrieval Notes` section showing why each pivot symbol was selected (keyword scores, file hints, fallback) and a recency label on each memory observation
 - **Token-budgeted briefs** — context fits within your budget, not a dump of every file
 - **Impact analysis** — traces callers, implementors, and type-usage edges for any symbol
 - **Execution path tracing** — find how symbol A reaches symbol B through the call graph

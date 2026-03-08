@@ -626,12 +626,15 @@ fn handle_analyze_failure(
 
     let mut output = String::new();
 
+    let retrieval_notes;
+
     if !resolution.pivot_fqns.is_empty() {
-        // Path A: Pivots resolved from trace
+        // Path A: Pivots resolved from trace (CallerSupplied — FQNs from stack-trace resolution)
         let intent = format!("fix error: {}", extraction.error_summary);
-        let brief = crate::graph::query::get_context_with_pivots(
+        let (brief, notes) = crate::graph::query::get_context_with_pivots(
             conn, project_root, &intent, &resolution.pivot_fqns, token_budget
         ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+        retrieval_notes = notes;
 
         output.push_str("## Failure Analysis\n\n");
         output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
@@ -667,12 +670,12 @@ fn handle_analyze_failure(
         }
 
         if !keyword_pivots.is_empty() {
-            // Path B: keywords matched symbols
-            let pivot_fqns: Vec<String> = keyword_pivots.into_iter().map(|(_, fqn)| fqn).collect();
+            // Path B: keywords matched symbols — pass PivotScores directly to preserve kw/deg scores
             let intent = format!("fix error: {}", extraction.error_summary);
-            let brief = crate::graph::query::get_context_with_pivots(
-                conn, project_root, &intent, &pivot_fqns, token_budget
+            let (brief, notes) = crate::graph::query::get_context_from_pivot_scores(
+                conn, project_root, &intent, keyword_pivots, token_budget
             ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+            retrieval_notes = notes;
 
             output.push_str("## Failure Analysis\n\n");
             output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
@@ -683,6 +686,7 @@ fn handle_analyze_failure(
             output.push_str(&brief);
         } else {
             // Path C: No pivots, no keywords
+            retrieval_notes = String::new();
             output.push_str("## Failure Analysis\n\n");
             output.push_str(&format!("**Error:** {}\n", extraction.error_summary));
             output.push_str("Could not resolve input to indexed code.\n");
@@ -699,7 +703,9 @@ fn handle_analyze_failure(
         }
     }
 
+    // Truncate, then append retrieval notes budget-exempt
     truncate_to_budget(&mut output, token_budget);
+    output.push_str(&retrieval_notes);
     Ok(output)
 }
 
@@ -719,7 +725,7 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
         crate::index::run_incremental(conn, root)?;
     }
 
-    let mut result = if ws.has_remotes() {
+    let (mut result, retrieval_notes) = if ws.has_remotes() {
         crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
@@ -730,6 +736,8 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
 
     // Append workspace warnings (budget-exempt)
     result.push_str(&ws.format_warnings_with_freshness());
+    // Append retrieval notes (budget-exempt)
+    result.push_str(&retrieval_notes);
     Ok(result)
 }
 
@@ -1123,7 +1131,7 @@ fn handle_get_brief(
 
     // 2.3 Compute context budget — use workspace-aware path when remotes exist
     let ctx_budget = token_budget * 80 / 100;
-    let context_output = if ws.has_remotes() {
+    let (context_output, retrieval_notes) = if ws.has_remotes() {
         crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
@@ -1151,6 +1159,8 @@ fn handle_get_brief(
         output.push_str("\n_Impact analysis: local repo only. Memory: local repo only._\n");
     }
     output.push_str(&ws.format_warnings_with_freshness());
+    // Append retrieval notes (budget-exempt)
+    output.push_str(&retrieval_notes);
 
     Ok(output)
 }

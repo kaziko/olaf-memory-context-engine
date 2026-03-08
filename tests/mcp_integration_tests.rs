@@ -1485,3 +1485,73 @@ fn test_trace_flow_includes_lsp_edges() {
         .unwrap_or_else(|| panic!("no text in trace_flow response: {}", serde_json::to_string_pretty(trace_resp).unwrap()));
     assert!(trace_text.contains("downstream"), "trace_flow must traverse LSP edge to reach downstream. Output:\n{trace_text}");
 }
+
+// ─── Story 9.8: Retrieval notes integration tests ────────────────────────────
+
+#[test]
+fn test_get_context_retrieval_notes_with_scores() {
+    let tmpdir = prepare_indexed_tmpdir();
+    // Use "counter" (6 chars) as keyword — passes the >3 char filter in rank_symbols_by_keywords
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":900,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"intent":"fix counter implementation"}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    assert!(r["result"].is_object(), "must return result; got: {}", r);
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("## Retrieval Notes"), "get_context must include retrieval notes section; got: {text}");
+    // Keyword pivot must show kw= and deg= scores
+    assert!(text.contains("kw="), "retrieval notes must include kw_score; got: {text}");
+    assert!(text.contains("deg="), "retrieval notes must include in_degree; got: {text}");
+}
+
+#[test]
+fn test_get_context_retrieval_notes_file_hint() {
+    let tmpdir = prepare_indexed_tmpdir();
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":901,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"intent":"anything","file_hints":["lib.rs"]}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("## Retrieval Notes"), "must include retrieval notes");
+    assert!(text.contains("file-hint"), "file-hint pivots must show file-hint reason; got: {text}");
+}
+
+#[test]
+fn test_get_context_retrieval_notes_fallback() {
+    let tmpdir = prepare_indexed_tmpdir();
+    // Use intent with no matching keywords to trigger fallback
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":902,"method":"tools/call",
+        "params":{"name":"get_context","arguments":{"intent":"zzzz_nomatch_qqqq"}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("## Retrieval Notes"), "must include retrieval notes even for fallback");
+    assert!(text.contains("fallback"), "fallback pivots must show fallback reason; got: {text}");
+}
+
+#[test]
+fn test_get_brief_retrieval_notes_after_truncation() {
+    let tmpdir = prepare_indexed_tmpdir();
+    // Use a very small budget to force truncation
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":903,"method":"tools/call",
+        "params":{"name":"get_brief","arguments":{"intent":"implement add","token_budget":150}}
+    });
+    let responses = run_requests_in(tmpdir.path(), &[req]);
+    let r = &responses[0];
+    let text = r["result"]["content"][0]["text"].as_str().expect("text");
+    // Retrieval notes must appear even when budget is tight (budget-exempt)
+    assert!(text.contains("## Retrieval Notes"), "retrieval notes must appear even with tight budget; got: {text}");
+    // Verify notes come AFTER the truncation marker if present
+    if text.contains("truncated to fit") {
+        let trunc_pos = text.find("truncated to fit").unwrap();
+        let notes_pos = text.find("## Retrieval Notes").unwrap();
+        assert!(notes_pos > trunc_pos, "retrieval notes must appear after truncation marker");
+    }
+}
