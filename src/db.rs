@@ -17,6 +17,33 @@ const MIGRATION_002: &str = "
 ALTER TABLE edges ADD COLUMN source_origin TEXT NOT NULL DEFAULT 'static';
 ";
 
+const MIGRATION_003: &str = "
+ALTER TABLE observations ADD COLUMN confidence REAL DEFAULT NULL;
+";
+
+const MIGRATION_004: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts
+    USING fts5(content, content='observations', content_rowid='id', tokenize='porter ascii');
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_ai
+    AFTER INSERT ON observations BEGIN
+        INSERT INTO observations_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_ad
+    AFTER DELETE ON observations BEGIN
+        INSERT INTO observations_fts(observations_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    END;
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_au
+    AFTER UPDATE OF content ON observations BEGIN
+        INSERT INTO observations_fts(observations_fts, rowid, content) VALUES ('delete', old.id, old.content);
+        INSERT INTO observations_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+
+INSERT INTO observations_fts(observations_fts) VALUES('rebuild');
+";
+
 const MIGRATION_001: &str = "
 CREATE TABLE IF NOT EXISTS files (
     id              INTEGER PRIMARY KEY,
@@ -180,13 +207,15 @@ fn handle_corruption_or_propagate(
 
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 2;
+pub const MIGRATION_COUNT: i64 = 4;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
         M::up(MIGRATION_001),
         M::up(MIGRATION_002),
-        // Future migrations: append M::up(MIGRATION_003), etc. — never edit existing entries
+        M::up(MIGRATION_003),
+        M::up(MIGRATION_004),
+        // Future migrations: append M::up(MIGRATION_005), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

@@ -461,20 +461,29 @@ fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end
 
 fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservation) -> String {
     let obs = &scored.obs;
-    let recency_label = if scored.relevance_score >= 0.7 {
-        "(recent)"
-    } else if scored.relevance_score >= 0.3 && !obs.is_stale {
-        "(aged)"
-    } else {
+    let confidence_val = obs.confidence.unwrap_or(0.5);
+    let signal_label = if scored.primary_signal == "stale" || obs.is_stale {
         "(stale)"
+    } else {
+        let conf_tag = if confidence_val >= 0.7 { "high confidence" } else if confidence_val < 0.4 { "low confidence" } else { "" };
+        let age_tag = if scored.relevance_score >= 0.5 { "recent" } else { "aged" };
+        if conf_tag.is_empty() {
+            if age_tag == "recent" { "(recent)" } else { "(aged)" }
+        } else if age_tag == "recent" {
+            if conf_tag == "high confidence" { "(recent · high confidence)" } else { "(recent · low confidence)" }
+        } else if conf_tag == "low confidence" {
+            "(aged · low confidence)"
+        } else {
+            "(aged)"
+        }
     };
 
     let mut entry = String::new();
     if obs.is_stale {
         let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
-        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {} {}\n", reason, obs.kind, obs.content, recency_label));
+        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {} {}\n", reason, obs.kind, obs.content, signal_label));
     } else {
-        entry.push_str(&format!("- [{}] {} {}\n", obs.kind, obs.content, recency_label));
+        entry.push_str(&format!("- [{}] {} {}\n", obs.kind, obs.content, signal_label));
     }
     if let Some(fqn) = &obs.symbol_fqn {
         entry.push_str(&format!("  Symbol: {}\n", fqn));
@@ -600,6 +609,7 @@ fn build_context_brief(
     pivot_scores: &[PivotScore],
     policy: &TraversalPolicy,
     token_budget: usize,
+    intent_query: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let mut output = intent_header.to_string();
 
@@ -677,7 +687,7 @@ fn build_context_brief(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            conn, &fqns, &file_paths, 50,
+            conn, &fqns, &file_paths, 50, intent_query,
         )
         .unwrap_or_default();
 
@@ -722,7 +732,7 @@ pub(crate) fn get_context(
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
     let pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
 }
 
 /// Build a context brief directly from caller-provided `PivotScore` values, preserving their
@@ -738,7 +748,7 @@ pub(crate) fn get_context_from_pivot_scores(
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
 }
 
 pub(crate) fn get_context_with_pivots(
@@ -773,7 +783,7 @@ pub(crate) fn get_context_with_pivots(
         return Ok((output, String::new()));
     }
 
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
 }
 
 // --- Workspace-aware federated queries ---
@@ -869,6 +879,7 @@ pub(crate) fn build_context_brief_multi(
     tagged_pivots: &[TaggedPivotScore],
     policy: &TraversalPolicy,
     token_budget: usize,
+    intent_query: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
@@ -971,7 +982,7 @@ pub(crate) fn build_context_brief_multi(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            local_conn, &fqns, &file_paths, 50,
+            local_conn, &fqns, &file_paths, 50, intent_query,
         )
         .unwrap_or_default();
 
@@ -1016,7 +1027,7 @@ pub(crate) fn get_context_workspace(
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
     let tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget)
+    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent))
 }
 
 /// Private helper: query candidate file paths from the files table.
@@ -2026,40 +2037,43 @@ mod tests {
     fn observation_recency_labels_appended() {
         use crate::memory::store::{ObservationRow, ScoredObservation};
 
-        // Recent observation (score >= 0.7)
+        // Recent observation (primary_signal=recency, score >= 0.7)
         let recent = ScoredObservation {
             obs: ObservationRow {
                 id: 1, session_id: "s1".to_string(), created_at: 0,
                 kind: "discovery".to_string(), content: "found pattern".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: Some(0.8),
             },
             relevance_score: 0.85,
+            primary_signal: "recency".to_string(),
         };
         let entry = format_scored_observation_entry(&recent);
-        assert!(entry.contains("(recent)"), "score >= 0.7 must get (recent) label");
+        assert!(entry.contains("(recent"), "score >= 0.7 must get a (recent…) label");
         assert!(entry.contains("found pattern"), "content must be preserved");
 
-        // Aged observation (0.3 <= score < 0.7)
+        // Aged observation (primary_signal=recency, score < 0.7)
         let aged = ScoredObservation {
             obs: ObservationRow {
                 id: 2, session_id: "s1".to_string(), created_at: 0,
                 kind: "note".to_string(), content: "old note".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None,
             },
-            relevance_score: 0.5,
+            relevance_score: 0.3,
+            primary_signal: "recency".to_string(),
         };
         let entry = format_scored_observation_entry(&aged);
-        assert!(entry.contains("(aged)"), "0.3 <= score < 0.7 must get (aged) label");
+        assert!(entry.contains("(aged)"), "low-score non-stale recency must get (aged) label");
 
-        // Stale observation (is_stale = true)
+        // Stale observation (primary_signal=stale)
         let stale = ScoredObservation {
             obs: ObservationRow {
                 id: 3, session_id: "s1".to_string(), created_at: 0,
                 kind: "bug".to_string(), content: "stale finding".to_string(),
                 symbol_fqn: None, file_path: None, is_stale: true,
-                stale_reason: Some("symbol changed".to_string()),
+                stale_reason: Some("symbol changed".to_string()), confidence: None,
             },
-            relevance_score: 0.5,
+            relevance_score: 0.0,
+            primary_signal: "stale".to_string(),
         };
         let entry = format_scored_observation_entry(&stale);
         assert!(entry.contains("(stale)"), "is_stale=true must get (stale) label regardless of score");

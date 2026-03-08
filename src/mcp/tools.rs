@@ -855,7 +855,7 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
     }
 
     let total = observations.len();
-    let scored = crate::memory::store::score_observations(observations);
+    let scored = crate::memory::store::score_observations(conn, observations, None);
     let capped = total.min(200);
 
     match sort_mode {
@@ -912,13 +912,13 @@ fn format_session_mode(
                 stale_count += 1;
                 let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
                 output.push_str(&format!(
-                    "- \u{26a0} [STALE \u{2014} {}] [{}] [score: {:.2}] {}\n",
-                    reason, so.obs.kind, so.relevance_score, so.obs.content
+                    "- \u{26a0} [STALE \u{2014} {}] [{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    reason, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             } else {
                 output.push_str(&format!(
-                    "- [{}] [score: {:.2}] {}\n",
-                    so.obs.kind, so.relevance_score, so.obs.content
+                    "- [{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             }
             if let Some(fqn) = &so.obs.symbol_fqn {
@@ -989,13 +989,13 @@ fn format_relevance_mode(
             stale_count += 1;
             let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
             output.push_str(&format!(
-                "{}. [score: {:.2}] \u{26a0} [STALE \u{2014} {}] [{}] {}\n",
-                i + 1, so.relevance_score, reason, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] \u{26a0} [STALE \u{2014} {}] [{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, reason, so.obs.kind, so.obs.content
             ));
         } else {
             output.push_str(&format!(
-                "{}. [score: {:.2}] [{}] {}\n",
-                i + 1, so.relevance_score, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] [{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, so.obs.kind, so.obs.content
             ));
         }
         if let Some(fqn) = &so.obs.symbol_fqn {

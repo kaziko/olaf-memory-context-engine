@@ -1666,7 +1666,9 @@ fn test_relevance_mode_flat_ranked_no_session_headers() {
         .filter_map(|l| {
             let start = l.find("[score: ")?;
             let rest = &l[start + 8..];
-            rest[..rest.find(']').unwrap_or(0)].parse::<f64>().ok()
+            // Score ends at first space (before " · signal]") or "]"
+            let end = rest.find([' ', ']']).unwrap_or(rest.len());
+            rest[..end].parse::<f64>().ok()
         })
         .collect();
     for pair in scores.windows(2) {
@@ -2256,4 +2258,75 @@ fn test_context_retrieval_malformed_payload_skipped() {
         )
         .unwrap();
     assert_eq!(count, 0, "malformed payloads must not produce observations");
+}
+
+// ─── Story 10.2 Integration Tests ────────────────────────────────────────────
+
+#[test]
+fn test_get_context_bm25_ranking_with_intent() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Single file with one symbol — both observations link to same symbol/file
+    // so they both appear in Session Memory regardless of pivot selection
+    std::fs::write(tmpdir.path().join("app.ts"), "function handler() { return true; }\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+
+    // Save two observations on the same symbol: one matches the intent, one does not
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "cache invalidation causes stale reads in production", Some("app.ts::handler"), None),
+        save_obs_request(2, "insight", "authentication uses JWT tokens with refresh rotation", Some("app.ts::handler"), None),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "get_context",
+                "arguments": {
+                    "intent": "fix authentication JWT token refresh bug",
+                    "file_hints": ["app.ts"],
+                    "token_budget": 8000
+                }
+            }
+        }),
+    ]);
+    let text = extract_text(&responses[2]);
+    // Session Memory must exist and contain both observations
+    assert!(text.contains("## Session Memory"), "must include Session Memory section; got: {text}");
+    assert!(text.contains("authentication uses JWT"), "must include auth observation; got: {text}");
+    assert!(text.contains("cache invalidation"), "must include cache observation; got: {text}");
+
+    // BM25 must rank auth observation above cache observation for auth-related intent
+    let auth_pos = text.find("authentication uses JWT").unwrap();
+    let cache_pos = text.find("cache invalidation").unwrap();
+    assert!(auth_pos < cache_pos,
+        "BM25 must rank auth observation above cache observation for auth-related intent; auth@{auth_pos} cache@{cache_pos}");
+}
+
+#[test]
+fn test_get_session_history_includes_signal_label() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "signal format test", Some("f::foo"), None),
+        get_history_request_with_sort(2, None, None, None, Some("session")),
+    ]);
+    let text = extract_text(&responses[1]);
+    // Output must contain the "· signal" format: [score: X.XX · recency] or similar
+    assert!(text.contains("\u{00b7}"), "session mode must include · signal separator; got: {text}");
+    // Must contain one of the valid signal types
+    let has_signal = text.contains("recency") || text.contains("confidence") || text.contains("fts") || text.contains("stale");
+    assert!(has_signal, "session mode must include a primary signal label; got: {text}");
+}
+
+#[test]
+fn test_relevance_mode_includes_signal_label() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let responses = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "relevance signal test", Some("f::bar"), None),
+        get_history_request_with_sort(2, None, None, None, Some("relevance")),
+    ]);
+    let text = extract_text(&responses[1]);
+    assert!(text.contains("\u{00b7}"), "relevance mode must include · signal separator; got: {text}");
+    let has_signal = text.contains("recency") || text.contains("confidence") || text.contains("fts") || text.contains("stale");
+    assert!(has_signal, "relevance mode must include a primary signal label; got: {text}");
 }
