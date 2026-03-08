@@ -225,6 +225,13 @@ fn estimate_tokens(s: &str) -> usize {
     s.len().div_ceil(4)
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Select pivot symbols from the graph for the given intent.
 ///
 /// Scoring: `rank = (kw_score DESC, in_degree DESC, id ASC)`
@@ -624,7 +631,7 @@ fn build_context_brief(
 
     let pivot_budget = token_budget * 70 / 100;
     let skeleton_budget = token_budget * 20 / 100;
-    let memory_budget = token_budget * 10 / 100;
+    // Rules budget probe — allocated dynamically after traversal
 
     output.push_str("\n## Pivot Symbols\n\n");
 
@@ -682,9 +689,20 @@ fn build_context_brief(
         }
     }
 
-    // Memory injection — 10% budget
+    // Memory + Rules injection — 10% budget total
+    let fqns_vec: Vec<String> = all_fqns.iter().cloned().collect();
+    let file_paths_vec: Vec<String> = all_file_paths.iter().cloned().collect();
     let fqns: Vec<&str> = all_fqns.iter().map(|s| s.as_str()).collect();
     let file_paths: Vec<&str> = all_file_paths.iter().map(|s| s.as_str()).collect();
+
+    // Probe for active rules to determine budget split
+    let rules = crate::memory::rules::get_active_rules(conn, &fqns_vec, &file_paths_vec, branch, 5)
+        .unwrap_or_default();
+    let (rules_budget, memory_budget) = if rules.is_empty() {
+        (0, token_budget * 10 / 100)
+    } else {
+        (std::cmp::min(token_budget * 5 / 100, 300), token_budget * 5 / 100)
+    };
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
@@ -708,6 +726,36 @@ fn build_context_brief(
                 output.push_str("## Session Memory\n\n");
                 output.push_str(&mem_section);
             }
+        }
+    }
+
+    // Rules injection
+    if !rules.is_empty() && rules_budget > 0 {
+        let mut rules_section = String::new();
+        let mut rules_tokens = 0usize;
+        for rule in &rules {
+            let age_secs = now_secs() - rule.last_seen_at;
+            let age_label = if age_secs < 3600 {
+                format!("{}m ago", age_secs / 60)
+            } else if age_secs < 86400 {
+                format!("{}h ago", age_secs / 3600)
+            } else {
+                format!("{}d ago", age_secs / 86400)
+            };
+            let entry = format!(
+                "- {} [{} obs · {} sessions · last seen {}]\n",
+                rule.content, rule.support_count, rule.session_count, age_label
+            );
+            let entry_tokens = estimate_tokens(&entry);
+            if rules_tokens + entry_tokens > rules_budget {
+                break;
+            }
+            rules_section.push_str(&entry);
+            rules_tokens += entry_tokens;
+        }
+        if !rules_section.is_empty() {
+            output.push_str("## Project Rules\n\n");
+            output.push_str(&rules_section);
         }
     }
 
@@ -979,11 +1027,21 @@ pub(crate) fn build_context_brief_multi(
         }
     }
 
-    // Memory injection — local only (10% budget)
-    let memory_budget = token_budget * 10 / 100;
+    // Memory + Rules injection — local only (10% budget total)
     let local_conn = &members[0].conn;
+    let fqns_vec: Vec<String> = local_fqns.iter().cloned().collect();
+    let file_paths_vec: Vec<String> = local_file_paths.iter().cloned().collect();
     let fqns: Vec<&str> = local_fqns.iter().map(|s| s.as_str()).collect();
     let file_paths: Vec<&str> = local_file_paths.iter().map(|s| s.as_str()).collect();
+
+    // Rules are local-only — do NOT query remote workspace DBs
+    let rules = crate::memory::rules::get_active_rules(local_conn, &fqns_vec, &file_paths_vec, branch, 5)
+        .unwrap_or_default();
+    let (rules_budget, memory_budget) = if rules.is_empty() {
+        (0, token_budget * 10 / 100)
+    } else {
+        (std::cmp::min(token_budget * 5 / 100, 300), token_budget * 5 / 100)
+    };
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
@@ -1005,6 +1063,34 @@ pub(crate) fn build_context_brief_multi(
                 output.push_str("## Session Memory\n\n");
                 output.push_str(&mem_section);
             }
+        }
+    }
+
+    // Rules injection — local only
+    if !rules.is_empty() && rules_budget > 0 {
+        let mut rules_section = String::new();
+        let mut rules_tokens = 0usize;
+        for rule in &rules {
+            let age_secs = now_secs() - rule.last_seen_at;
+            let age_label = if age_secs < 3600 {
+                format!("{}m ago", age_secs / 60)
+            } else if age_secs < 86400 {
+                format!("{}h ago", age_secs / 3600)
+            } else {
+                format!("{}d ago", age_secs / 86400)
+            };
+            let entry = format!(
+                "- {} [{} obs · {} sessions · last seen {}]\n",
+                rule.content, rule.support_count, rule.session_count, age_label
+            );
+            let entry_tokens = estimate_tokens(&entry);
+            if rules_tokens + entry_tokens > rules_budget { break; }
+            rules_section.push_str(&entry);
+            rules_tokens += entry_tokens;
+        }
+        if !rules_section.is_empty() {
+            output.push_str("## Project Rules\n\n");
+            output.push_str(&rules_section);
         }
     }
 

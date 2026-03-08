@@ -2451,3 +2451,261 @@ fn test_branch_filter_with_null_branch_visible() {
     let text = extract_text(&responses[0]);
     assert!(text.contains("legacy global note"), "NULL-branch obs must be visible under any branch filter");
 }
+
+// ─── Story 10.4: Auto-Generated Project Rules Integration Tests ──────────────
+
+fn insert_insight_obs(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    content: &str,
+    file_path: Option<&str>,
+    symbol_fqn: Option<&str>,
+) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO observations (session_id, created_at, kind, content, file_path, symbol_fqn) \
+         VALUES (?1, ?2, 'insight', ?3, ?4, ?5)",
+        rusqlite::params![session_id, now, content, file_path, symbol_fqn],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+#[test]
+fn test_rules_generated_on_session_end() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let content = "always check middleware chain before modifying authentication routes handler";
+
+    // Create 3+ insights, overlapping, 3+ sessions
+    for (i, sid) in ["rs1", "rs2", "rs3"].iter().enumerate() {
+        conn.execute(
+            "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
+            rusqlite::params![sid, 1000 + i as i64],
+        )
+        .unwrap();
+        insert_insight_obs(&conn, sid, content, Some("src/auth.rs"), None);
+    }
+    drop(conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    // Trigger session-end for the last session
+    let payload = make_session_end_payload("rs3", cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(
+        output.status.success(),
+        "session-end must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify rule stored in project_rules with is_active = 0 (pending)
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (count, is_active): (i64, i32) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MIN(is_active), 0) FROM project_rules",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(count >= 1, "at least 1 rule should be generated");
+    assert_eq!(is_active, 0, "new rule should be pending (is_active=0)");
+}
+
+#[test]
+fn test_rules_promoted_after_reinforcement() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let content = "always check middleware chain before modifying authentication routes handler";
+
+    // Create initial 3 sessions with qualifying observations
+    for (i, sid) in ["rp1", "rp2", "rp3"].iter().enumerate() {
+        conn.execute(
+            "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
+            rusqlite::params![sid, 1000 + i as i64],
+        )
+        .unwrap();
+        insert_insight_obs(&conn, sid, content, Some("src/auth.rs"), None);
+    }
+    drop(conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    // First session-end: creates pending rule
+    let output = run_observe_event("session-end", &tmpdir, &make_session_end_payload("rp3", cwd));
+    assert!(output.status.success());
+
+    // Add 4th session with reinforcing observation
+    let conn = olaf::db::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, started_at) VALUES ('rp4', 2000)",
+        [],
+    )
+    .unwrap();
+    insert_insight_obs(&conn, "rp4", content, Some("src/auth.rs"), None);
+    drop(conn);
+
+    // Second session-end: should promote to active
+    let output = run_observe_event("session-end", &tmpdir, &make_session_end_payload("rp4", cwd));
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let is_active: i32 = conn
+        .query_row(
+            "SELECT is_active FROM project_rules LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(is_active, 1, "rule should be promoted to active after 4th session");
+}
+
+#[test]
+fn test_active_rules_injected_in_context_brief() {
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Create a real file for indexing
+    std::fs::write(tmpdir.path().join("auth.ts"), "function checkAuth() { return true; }\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    // Get the actual FQN
+    let fqn: String = conn
+        .query_row("SELECT fqn FROM symbols WHERE name = 'checkAuth'", [], |r| r.get(0))
+        .unwrap();
+
+    // Insert an active rule linked to this symbol
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO project_rules (content, scope_fingerprint, support_count, session_count, \
+         last_seen_at, is_active, created_at, updated_at) \
+         VALUES ('Always verify auth token before route handler', 'fp_test_inject', 5, 4, ?1, 1, ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .unwrap();
+    let rule_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, ?2)",
+        rusqlite::params![rule_id, fqn],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Call get_context via MCP
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": { "intent": "checkAuth authentication", "file_hints": ["auth.ts"] } }
+    })]);
+    let text = extract_text(&responses[0]);
+    assert!(
+        text.contains("Project Rules"),
+        "context brief must contain Project Rules section; got: {text}"
+    );
+    assert!(
+        text.contains("Always verify auth token before route handler"),
+        "context brief must contain the rule content; got: {text}"
+    );
+}
+
+#[test]
+fn test_no_rules_section_when_none_active() {
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Create a real file for indexing
+    std::fs::write(tmpdir.path().join("app.ts"), "function handler() { return true; }\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+
+    let responses = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": { "intent": "handler function", "file_hints": ["app.ts"] } }
+    })]);
+    let text = extract_text(&responses[0]);
+    assert!(
+        !text.contains("Project Rules"),
+        "context brief must NOT contain Project Rules when no active rules exist; got: {text}"
+    );
+}
+
+#[test]
+fn test_rules_invalidation_on_reindex() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+
+    // Create a fixture file
+    let fixture_dir = tmpdir.path().join("src");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    std::fs::write(fixture_dir.join("auth.rs"), "pub fn check_auth() {}\n").unwrap();
+
+    // Index the project
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "initial index must succeed");
+
+    // Create an active rule linked to the symbol
+    let conn = olaf::db::open(&db_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO project_rules (content, scope_fingerprint, support_count, session_count, \
+         last_seen_at, is_active, created_at, updated_at) \
+         VALUES ('Always verify auth token', 'fp_reindex_test', 5, 4, ?1, 1, ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .unwrap();
+    let rule_id = conn.last_insert_rowid();
+    // Get the actual FQN stored
+    let fqn: String = conn
+        .query_row("SELECT fqn FROM symbols WHERE name = 'check_auth'", [], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, ?2)",
+        rusqlite::params![rule_id, fqn],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Modify the fixture file: change the function signature
+    std::fs::write(fixture_dir.join("auth.rs"), "pub fn check_auth(token: &str) -> bool { true }\n").unwrap();
+
+    // Re-index
+    let output = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "re-index must succeed");
+
+    // Verify rule is now inactive
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let is_active: i32 = conn
+        .query_row(
+            "SELECT is_active FROM project_rules WHERE id = ?1",
+            rusqlite::params![rule_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(is_active, -1, "rule must be marked inactive after signature change");
+}

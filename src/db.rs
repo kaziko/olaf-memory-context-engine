@@ -26,6 +26,45 @@ ALTER TABLE observations ADD COLUMN branch TEXT DEFAULT NULL;
 CREATE INDEX idx_observations_branch ON observations(branch);
 ";
 
+const MIGRATION_006: &str = "
+CREATE TABLE project_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    scope_fingerprint TEXT NOT NULL,
+    support_count INTEGER NOT NULL DEFAULT 1,
+    session_count INTEGER NOT NULL DEFAULT 1,
+    last_seen_at INTEGER NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT DEFAULT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    branch TEXT DEFAULT NULL
+);
+CREATE INDEX idx_project_rules_active ON project_rules(is_active);
+CREATE INDEX idx_project_rules_branch ON project_rules(branch);
+CREATE UNIQUE INDEX idx_project_rules_identity ON project_rules(scope_fingerprint, COALESCE(branch, ''));
+
+CREATE TABLE rule_symbols (
+    rule_id INTEGER NOT NULL REFERENCES project_rules(id) ON DELETE CASCADE,
+    symbol_fqn TEXT NOT NULL,
+    PRIMARY KEY (rule_id, symbol_fqn)
+);
+CREATE INDEX idx_rule_symbols_fqn ON rule_symbols(symbol_fqn);
+
+CREATE TABLE rule_files (
+    rule_id INTEGER NOT NULL REFERENCES project_rules(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    PRIMARY KEY (rule_id, file_path)
+);
+CREATE INDEX idx_rule_files_path ON rule_files(file_path);
+
+CREATE TABLE rule_observations (
+    rule_id INTEGER NOT NULL REFERENCES project_rules(id) ON DELETE CASCADE,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    PRIMARY KEY (rule_id, observation_id)
+);
+";
+
 const MIGRATION_004: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts
     USING fts5(content, content='observations', content_rowid='id', tokenize='porter ascii');
@@ -212,7 +251,7 @@ fn handle_corruption_or_propagate(
 
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 5;
+pub const MIGRATION_COUNT: i64 = 6;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -221,7 +260,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_003),
         M::up(MIGRATION_004),
         M::up(MIGRATION_005),
-        // Future migrations: append M::up(MIGRATION_006), etc. — never edit existing entries
+        M::up(MIGRATION_006),
+        // Future migrations: append M::up(MIGRATION_007), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

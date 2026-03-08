@@ -1,12 +1,14 @@
 pub(crate) mod antipattern;
 pub(crate) mod capture;
 pub(crate) mod compression;
+pub(crate) mod rules;
 pub(crate) mod staleness;
 pub(crate) mod store;
 
 pub use antipattern::detect_and_write_anti_patterns;
 pub use capture::{HookPayload, PostToolUseResult, format_structural_observation, parse_post_tool_use};
 pub use compression::{run_compression, DEFAULT_COMPRESSION_THRESHOLD_SECS, DEFAULT_PURGE_THRESHOLD_SECS};
+pub use rules::detect_and_write_rules;
 pub use store::{
     SessionSummary, get_session_observations, insert_auto_observation, is_sensitive_path,
     list_sessions, mark_session_ended, upsert_session,

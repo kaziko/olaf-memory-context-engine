@@ -29,7 +29,13 @@ pub(crate) fn mark_stale_for_removed_symbols(
         return Ok(());
     }
     let reason = "Symbol no longer exists in index";
-    batch_mark_stale(tx, removed_fqns, reason)
+    batch_mark_stale(tx, removed_fqns, reason)?;
+    // Also invalidate project rules linked to removed symbols.
+    // branch=None: indexer doesn't know the current branch, so stale all matching rules.
+    // This is consistent with observation staleness which is also branch-blind.
+    super::rules::mark_rules_stale(tx, removed_fqns, "Linked symbol removed", None)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    Ok(())
 }
 
 /// Mark observations stale based on a structural diff result.
@@ -50,12 +56,27 @@ pub(crate) fn mark_stale_for_structural_diff(
         );
         batch_mark_stale(tx, std::slice::from_ref(fqn), &reason)?;
     }
+
+    // Invalidate rules for signature-changed symbols
+    if !diff.signature_changed.is_empty() {
+        let sig_fqns: Vec<String> = diff.signature_changed.iter().map(|(f, _, _)| f.clone()).collect();
+        super::rules::mark_rules_stale(tx, &sig_fqns, "Linked symbol signature changed", None)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    }
+
     mark_stale_for_removed_symbols(tx, &diff.removed)?;
 
     // Renamed symbols: mark observations on old FQN as stale
     for (old_fqn, new_fqn) in &diff.renamed {
         let reason = format!("Symbol renamed to '{}'", new_fqn);
         batch_mark_stale(tx, std::slice::from_ref(old_fqn), &reason)?;
+    }
+
+    // Invalidate rules for renamed symbols (match against OLD FQN stored in rule_symbols)
+    if !diff.renamed.is_empty() {
+        let old_fqns: Vec<String> = diff.renamed.iter().map(|(old, _)| old.clone()).collect();
+        super::rules::mark_rules_stale(tx, &old_fqns, "Linked symbol renamed", None)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     }
 
     // File-path observation text scanning (AC #2):
@@ -719,5 +740,99 @@ mod tests {
         // Both appear, sorted alphabetically
         assert_eq!(result[0], "a.rs::render");
         assert_eq!(result[1], "b.rs::render");
+    }
+
+    // --- Story 10.4: rule staleness integration ---
+
+    fn insert_active_rule_with_symbol(conn: &rusqlite::Connection, symbol_fqn: &str) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO project_rules (content, scope_fingerprint, support_count, session_count, \
+             last_seen_at, is_active, created_at, updated_at) VALUES ('test rule', 'fp_test', 3, 4, ?1, 1, ?1, ?1)",
+            params![now],
+        ).unwrap();
+        let rule_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, ?2)",
+            params![rule_id, symbol_fqn],
+        ).unwrap();
+        rule_id
+    }
+
+    fn get_rule_active_status(conn: &rusqlite::Connection, rule_id: i64) -> (i32, Option<String>) {
+        conn.query_row(
+            "SELECT is_active, stale_reason FROM project_rules WHERE id = ?1",
+            params![rule_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap()
+    }
+
+    #[test]
+    fn test_structural_diff_signature_invalidates_rules() {
+        use crate::index::diff::StructuralDiff;
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let _obs_id = insert_observation(&conn, "s1", Some("f.rs::foo"), None);
+        let rule_id = insert_active_rule_with_symbol(&conn, "f.rs::foo");
+
+        let diff = StructuralDiff {
+            file_path: "f.rs".into(),
+            added: vec![],
+            removed: vec![],
+            signature_changed: vec![("f.rs::foo".into(), "fn foo()".into(), "fn foo(x: i32)".into())],
+            body_only: vec![],
+            renamed: vec![],
+        };
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
+        tx.commit().unwrap();
+
+        let (is_active, reason) = get_rule_active_status(&conn, rule_id);
+        assert_eq!(is_active, -1, "rule must be marked inactive");
+        assert_eq!(reason.unwrap(), "Linked symbol signature changed");
+    }
+
+    #[test]
+    fn test_structural_diff_rename_invalidates_rules() {
+        use crate::index::diff::StructuralDiff;
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let rule_id = insert_active_rule_with_symbol(&conn, "f.rs::old_name");
+
+        let diff = StructuralDiff {
+            file_path: "f.rs".into(),
+            added: vec![],
+            removed: vec![],
+            signature_changed: vec![],
+            body_only: vec![],
+            renamed: vec![("f.rs::old_name".into(), "f.rs::new_name".into())],
+        };
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_structural_diff(&tx, &diff).unwrap();
+        tx.commit().unwrap();
+
+        let (is_active, reason) = get_rule_active_status(&conn, rule_id);
+        assert_eq!(is_active, -1, "rule must be marked inactive on rename");
+        assert_eq!(reason.unwrap(), "Linked symbol renamed");
+    }
+
+    #[test]
+    fn test_removed_symbols_invalidates_rules() {
+        let mut conn = open_test_db();
+        insert_session(&conn, "s1");
+        let rule_id = insert_active_rule_with_symbol(&conn, "f.rs::gone");
+
+        let tx = conn.transaction().unwrap();
+        mark_stale_for_removed_symbols(&tx, &["f.rs::gone".into()]).unwrap();
+        tx.commit().unwrap();
+
+        let (is_active, reason) = get_rule_active_status(&conn, rule_id);
+        assert_eq!(is_active, -1, "rule must be marked inactive on removal");
+        assert_eq!(reason.unwrap(), "Linked symbol removed");
     }
 }

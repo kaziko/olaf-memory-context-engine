@@ -109,6 +109,14 @@ fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()>
     let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id, branch.as_deref())?;
     if !ran {
         log::debug!("observe session-end: session already compressed, skipping");
+    } else {
+        // Rule detection runs in its own DEFERRED transaction, OUTSIDE the IMMEDIATE lock,
+        // to avoid holding write locks during cross-session clustering.
+        // Only runs when the pipeline actually ran (skip on duplicate/no-op SessionEnd events).
+        let rule_count = olaf::memory::detect_and_write_rules(&mut conn, branch.as_deref())?;
+        if rule_count > 0 {
+            log::debug!("Generated {} new project rule(s)", rule_count);
+        }
     }
     // FR22: cleanup restore points older than 7 days, protecting current-session snapshots
     let protect_ms = {

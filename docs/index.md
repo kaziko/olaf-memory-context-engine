@@ -219,6 +219,8 @@ Each line shows the pivot symbol, its fully-qualified name, why it was selected,
 
 If any selected pivots were dropped (sensitive path or token budget exhausted), an omission count is appended: `(N pivots omitted: budget/sensitive-path)`.
 
+If active project rules match the query's symbols or files, they appear in a `## Project Rules` section with evidence metadata (observation count, session count, recency).
+
 Session memory observations also carry a recency label — `(recent)`, `(aged)`, or `(stale)` — based on age and staleness, so Claude knows how much to trust each past observation. Observations are sorted by relevance score before budget fitting, so the most current and non-stale entries survive on tight budgets.
 
 In multi-repo workspace mode, each retrieval note also shows the source repo label and selection strategy:
@@ -292,6 +294,57 @@ Use get_session_history filtered to src/db/connection_pool.rs
 
 Most observations are captured automatically by the PostToolUse hook — you only need `save_observation` for high-level decisions or insights that Claude wouldn't otherwise record.
 
+### Project rules (auto-generated)
+
+Individual observations decay over time — they age, get compressed at session end, and are eventually purged after 90 days. A critical insight from session 3 may not survive to session 30 because it lost the budget race to newer observations. Project rules solve this by detecting patterns that keep recurring and promoting them to durable, always-present context.
+
+**How it works:**
+
+1. At the end of each session, Olaf scans all `insight` and `decision` observations from the last 90 days
+2. Observations are grouped by the file or symbol they're linked to
+3. Within each group, Olaf looks for content overlap using keyword similarity — observations that say similar things about the same code area form a cluster
+4. A cluster becomes a **rule candidate** when it contains 3+ observations from 3+ distinct sessions
+5. New candidates start as **pending** — they are not injected into context briefs yet
+6. When the pattern is reinforced by a 4th distinct session, the rule **auto-promotes to active**
+7. Active rules appear in a `## Project Rules` section in every context brief where the rule's linked symbols or files are relevant
+
+**What project rules are good for:**
+
+Rules capture code-level lessons that emerge from repeated work in the same area:
+
+- "Always check middleware chain before modifying auth routes" — an insight Claude recorded multiple times while working on `src/auth/`
+- "The connection pool retry logic masks timeout errors" — a decision linked to `ConnectionPool` that kept coming up across sessions
+- "Database column names must use snake_case" — a pattern linked to model files that Claude learned through repeated corrections
+
+These are things Claude discovers about **your code** through hands-on work, not things you tell it upfront.
+
+**What project rules are NOT for:**
+
+Rules only form from `insight` and `decision` observations that are linked to specific files or symbols in your codebase. They will **not** capture:
+
+- **Workflow preferences** — "always format summaries as lists, not tables" has no file or symbol scope
+- **General coding style** — "use 2-space indentation" is not tied to a specific code area
+- **Tool usage preferences** — "always run tests before committing" is a process rule, not a code insight
+- **One-off instructions** — something you said once in one session won't cluster
+
+For workflow preferences and project-wide conventions, use your project's `CLAUDE.md` file instead — Claude reads it as system instructions on every session. Project rules and `CLAUDE.md` serve different purposes:
+
+| | CLAUDE.md | Project Rules |
+|-|-|-|
+| Created by | You, manually | Olaf, automatically from recurring observations |
+| Scope | Entire project | Specific files and symbols |
+| Content | Conventions, workflow preferences | Code-level insights and decisions |
+| When applied | Every conversation | Only when querying related code |
+| Lifespan | Until you change it | Until linked code changes structurally |
+
+**Rule lifecycle:**
+
+- **Pending** — detected pattern, not yet shown in briefs. Prevents false positives from coincidental clusters
+- **Active** — confirmed by 4+ sessions. Injected into context briefs within a dedicated token budget
+- **Inactive** — automatically invalidated when a linked symbol is renamed, removed, or has its signature changed. Inactive rules are not reactivated automatically — the pattern must re-emerge naturally from new observations
+
+Rules are branch-scoped: observations from different branches never cluster together, so feature-branch experiments don't produce rules that leak into `main`.
+
 **Branch-scoped memory:** observations are automatically tagged with the current git branch at capture time. When you retrieve context or session history, only observations from the current branch (plus branch-less legacy observations) are returned by default. To see everything across all branches, pass `branch: "all"` to `get_session_history`, `get_context`, or `get_brief`. This keeps feature-branch experiments from polluting `main` memory and vice versa.
 
 ### Multi-repo workspaces
@@ -323,7 +376,7 @@ Three hooks run silently in the background during every Claude Code session:
 
 - **PostToolUse** — records every file edit and shell command as an observation
 - **PreToolUse** — creates a snapshot before every AI edit (enables `undo_change`)
-- **SessionEnd** — compresses session history to retain key insights
+- **SessionEnd** — compresses session history, detects recurring patterns across sessions, and promotes them to project rules
 
 You never need to ask for these — they fire on their own.
 
