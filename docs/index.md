@@ -292,6 +292,8 @@ Use get_session_history filtered to src/db/connection_pool.rs
 
 Most observations are captured automatically by the PostToolUse hook — you only need `save_observation` for high-level decisions or insights that Claude wouldn't otherwise record.
 
+**Branch-scoped memory:** observations are automatically tagged with the current git branch at capture time. When you retrieve context or session history, only observations from the current branch (plus branch-less legacy observations) are returned by default. To see everything across all branches, pass `branch: "all"` to `get_session_history`, `get_context`, or `get_brief`. This keeps feature-branch experiments from polluting `main` memory and vice versa.
+
 ### Multi-repo workspaces
 
 If you work across multiple repositories (e.g. backend + frontend + shared-types), Olaf can search for context across all of them at once.
@@ -335,8 +337,8 @@ Once connected, Claude can use these tools:
 
 | Tool | Description |
 |-|-|
-| `get_brief` | Start here. Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Use `get_context` or `get_impact` for fine-grained control |
-| `get_context` | Token-budgeted context brief for a task; triggers incremental re-index |
+| `get_brief` | Start here. Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Use `get_context` or `get_impact` for fine-grained control. Accepts optional `branch` param (`"all"` for cross-branch). |
+| `get_context` | Token-budgeted context brief for a task; triggers incremental re-index. Accepts optional `branch` param (`"all"` for cross-branch). |
 | `get_impact` | Find symbols that call, extend, implement, or use a given symbol FQN as a type |
 | `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies) |
 | `analyze_failure` | Parse a stack trace or error output and return a context brief focused on the failure path |
@@ -346,7 +348,7 @@ Once connected, Claude can use these tools:
 | Tool | Description |
 |-|-|
 | `save_observation` | Record a decision, insight, or error linked to a symbol FQN or file path |
-| `get_session_history` | Observations from recent sessions, filterable by file or symbol; supports relevance-ranked retrieval |
+| `get_session_history` | Observations from recent sessions, filterable by file or symbol; supports relevance-ranked retrieval. Pass `branch: "all"` to include observations from all branches. |
 
 **Code navigation & status**
 

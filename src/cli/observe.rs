@@ -105,7 +105,8 @@ fn handle_session_end(payload: &olaf::memory::HookPayload) -> anyhow::Result<()>
     // AC3/AC7: atomic detect+compress in a single BEGIN IMMEDIATE transaction.
     // IMMEDIATE acquires the write lock before the compressed check, preventing
     // concurrent processes from both passing the guard and writing duplicate anti_pattern obs.
-    let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id)?;
+    let branch = olaf::config::detect_git_branch(&cwd);
+    let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id, branch.as_deref())?;
     if !ran {
         log::debug!("observe session-end: session already compressed, skipping");
     }
@@ -149,6 +150,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                     return Ok(());
                 }
             };
+            let branch = olaf::config::detect_git_branch(&cwd);
             olaf::memory::upsert_session(&conn, &result.session_id, "claude-code")?;
             olaf::memory::insert_auto_observation(
                 &conn,
@@ -157,6 +159,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 &result.content,
                 None,
                 result.file_path.as_deref(),
+                branch.as_deref(),
             )?;
             log::debug!("observe: handler completed in {:?}", start.elapsed());
         }
@@ -201,6 +204,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 }
             };
 
+            let branch = olaf::config::detect_git_branch(&cwd);
             olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
 
             match olaf::index::reindex_single_file(&mut conn, &cwd, &rel_path) {
@@ -213,6 +217,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                             &content,
                             None,
                             Some(&rel_path),
+                            branch.as_deref(),
                         )?;
                     }
                     // body-only diff → no observation
@@ -230,6 +235,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                         &content,
                         None,
                         Some(&rel_path),
+                        branch.as_deref(),
                     )?;
                 }
                 Err(e) => {
@@ -242,6 +248,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                         &content,
                         None,
                         Some(&rel_path),
+                        branch.as_deref(),
                     )?;
                 }
             }
@@ -279,6 +286,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                     return Ok(());
                 }
             };
+            let branch = olaf::config::detect_git_branch(&cwd);
             olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
             olaf::memory::insert_auto_observation(
                 &conn,
@@ -287,6 +295,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload) -> anyhow::Result<(
                 &subject,
                 None,
                 None,
+                branch.as_deref(),
             )?;
             log::debug!("observe: context_retrieval recorded in {:?}", start.elapsed());
         }

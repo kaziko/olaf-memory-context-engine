@@ -610,6 +610,7 @@ fn build_context_brief(
     policy: &TraversalPolicy,
     token_budget: usize,
     intent_query: Option<&str>,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let mut output = intent_header.to_string();
 
@@ -687,7 +688,7 @@ fn build_context_brief(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            conn, &fqns, &file_paths, 50, intent_query,
+            conn, &fqns, &file_paths, 50, intent_query, branch,
         )
         .unwrap_or_default();
 
@@ -727,12 +728,13 @@ pub(crate) fn get_context(
     intent: &str,
     file_hints: &[String],
     token_budget: usize,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
     let pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
 }
 
 /// Build a context brief directly from caller-provided `PivotScore` values, preserving their
@@ -744,11 +746,12 @@ pub(crate) fn get_context_from_pivot_scores(
     intent: &str,
     pivot_scores: Vec<PivotScore>,
     token_budget: usize,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
 }
 
 pub(crate) fn get_context_with_pivots(
@@ -757,6 +760,7 @@ pub(crate) fn get_context_with_pivots(
     intent: &str,
     pivot_fqns: &[String],
     token_budget: usize,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
@@ -783,7 +787,7 @@ pub(crate) fn get_context_with_pivots(
         return Ok((output, String::new()));
     }
 
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent))
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
 }
 
 // --- Workspace-aware federated queries ---
@@ -880,6 +884,7 @@ pub(crate) fn build_context_brief_multi(
     policy: &TraversalPolicy,
     token_budget: usize,
     intent_query: Option<&str>,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
@@ -982,7 +987,7 @@ pub(crate) fn build_context_brief_multi(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            local_conn, &fqns, &file_paths, 50, intent_query,
+            local_conn, &fqns, &file_paths, 50, intent_query, branch,
         )
         .unwrap_or_default();
 
@@ -1022,12 +1027,13 @@ pub(crate) fn get_context_workspace(
     intent: &str,
     file_hints: &[String],
     token_budget: usize,
+    branch: Option<&str>,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
     let tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent))
+    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent), branch)
 }
 
 /// Private helper: query candidate file paths from the files table.
@@ -1349,7 +1355,7 @@ mod tests {
         ).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000, None).unwrap();
         assert!(result.contains("intent_mode: bug-fix\n"), "get_context output must include intent_mode header line");
         assert!(result.contains("intent_confidence:"), "get_context output must include intent_confidence");
         assert!(result.contains("intent_signals:"), "get_context output must include intent_signals");
@@ -1567,7 +1573,7 @@ mod tests {
         conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
         conn.execute("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)", []).unwrap();
 
-        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000, None).unwrap();
 
         assert!(result.contains("```"), "AC1: pivot output must contain fenced code block");
         assert!(result.contains("fn my_pivot"), "AC1: pivot source body must appear in output");
@@ -1583,7 +1589,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC2: supporting section must contain Signature line");
@@ -1600,7 +1606,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC3: Signature line must be present when sig is set");
@@ -1622,7 +1628,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50, None).unwrap();
 
         // Pivot must be present — proves pivot-first ordering was honoured
         assert!(result.contains("## pivot"), "AC4: pivot symbol must appear in output");
@@ -1644,7 +1650,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (3,1,4,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000, None).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
 
@@ -1877,7 +1883,7 @@ mod tests {
 
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix login bug",
-            &["src/auth.rs::login".to_string()], 4000,
+            &["src/auth.rs::login".to_string()], 4000, None,
         ).unwrap();
         assert!(result.contains("login"), "pivot symbol must appear in output");
         assert!(result.contains("Pivot Symbols"), "must have pivot section");
@@ -1889,7 +1895,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix bug",
-            &["nonexistent::symbol".to_string()], 4000,
+            &["nonexistent::symbol".to_string()], 4000, None,
         ).unwrap();
         assert!(result.contains("No symbols found matching provided FQNs"),
             "must indicate no match; got: {result}");
@@ -1927,7 +1933,7 @@ mod tests {
 
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix error",
-            &["src/a.rs::handler".to_string()], 4000,
+            &["src/a.rs::handler".to_string()], 4000, None,
         ).unwrap();
         assert!(result.contains("previous bug fix attempt failed"),
             "observation must appear in output; got: {result}");
@@ -2015,7 +2021,7 @@ mod tests {
 
         let tmpdir = tempfile::tempdir().unwrap();
         let (_, notes) = get_context_with_pivots(
-            &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000,
+            &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000, None,
         ).unwrap();
         assert!(notes.contains("caller-supplied"), "CallerSupplied pivots must show 'caller-supplied' in retrieval notes");
     }
@@ -2027,7 +2033,7 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000).unwrap();
+        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000, None).unwrap();
         assert!(result.contains("Pivot Symbols"), "brief must have pivots");
         assert!(notes.contains("## Retrieval Notes"), "retrieval notes must be generated");
         assert!(notes.contains("handler"), "rendered pivot must appear in retrieval notes");
@@ -2042,7 +2048,7 @@ mod tests {
             obs: ObservationRow {
                 id: 1, session_id: "s1".to_string(), created_at: 0,
                 kind: "discovery".to_string(), content: "found pattern".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: Some(0.8),
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: Some(0.8), branch: None,
             },
             relevance_score: 0.85,
             primary_signal: "recency".to_string(),
@@ -2056,7 +2062,7 @@ mod tests {
             obs: ObservationRow {
                 id: 2, session_id: "s1".to_string(), created_at: 0,
                 kind: "note".to_string(), content: "old note".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None,
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None,
             },
             relevance_score: 0.3,
             primary_signal: "recency".to_string(),
@@ -2070,7 +2076,7 @@ mod tests {
                 id: 3, session_id: "s1".to_string(), created_at: 0,
                 kind: "bug".to_string(), content: "stale finding".to_string(),
                 symbol_fqn: None, file_path: None, is_stale: true,
-                stale_reason: Some("symbol changed".to_string()), confidence: None,
+                stale_reason: Some("symbol changed".to_string()), confidence: None, branch: None,
             },
             relevance_score: 0.0,
             primary_signal: "stale".to_string(),

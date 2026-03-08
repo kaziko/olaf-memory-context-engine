@@ -92,6 +92,7 @@ pub fn detect_file_thrashing(
 pub fn detect_and_write_anti_patterns(
     conn: &Connection,
     session_id: &str,
+    branch: Option<&str>,
 ) -> Result<(), StoreError> {
     // Dead-end detection
     let dead_ends = detect_dead_end(conn, session_id)?;
@@ -101,7 +102,7 @@ pub fn detect_and_write_anti_patterns(
              insight, decision, or file changes. Repeated: {}",
             dead_ends.join(", ")
         );
-        insert_auto_observation(conn, session_id, "anti_pattern", &content, None, None)?;
+        insert_auto_observation(conn, session_id, "anti_pattern", &content, None, None, branch)?;
     }
 
     // File thrashing detection
@@ -114,6 +115,7 @@ pub fn detect_and_write_anti_patterns(
             &format!("File thrashing detected: {} modified {} times in 5 minutes", path, cnt),
             None,
             Some(path.as_str()),
+            branch,
         )?;
     }
 
@@ -239,7 +241,7 @@ mod tests {
         for t in [0i64, 60, 120, 180] {
             insert_file_change(&conn, "s1", "src/main.rs", t);
         }
-        detect_and_write_anti_patterns(&conn, "s1").unwrap();
+        detect_and_write_anti_patterns(&conn, "s1", None).unwrap();
 
         let (kind, content, file_path, auto_gen): (String, String, Option<String>, i64) = conn
             .query_row(
@@ -364,7 +366,7 @@ mod tests {
                 [],
             ).unwrap();
         }
-        detect_and_write_anti_patterns(&conn, "s1").unwrap();
+        detect_and_write_anti_patterns(&conn, "s1", None).unwrap();
 
         let content: String = conn
             .query_row(

@@ -1432,7 +1432,7 @@ fn test_session_end_compression_deletes_ephemeral_retains_insight() {
     let session_id = "se-sess-3";
     olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
     // Insert an insight (should be retained) and a file_change (should be deleted)
-    olaf::memory::insert_auto_observation(&conn, session_id, "insight", "important finding", None, None).unwrap();
+    olaf::memory::insert_auto_observation(&conn, session_id, "insight", "important finding", None, None, None).unwrap();
     insert_file_change_at(&conn, session_id, "src/a.rs", 100);
     drop(conn);
 
@@ -2329,4 +2329,125 @@ fn test_relevance_mode_includes_signal_label() {
     assert!(text.contains("\u{00b7}"), "relevance mode must include · signal separator; got: {text}");
     let has_signal = text.contains("recency") || text.contains("confidence") || text.contains("fts") || text.contains("stale");
     assert!(has_signal, "relevance mode must include a primary signal label; got: {text}");
+}
+
+// ─── Story 10.3 Integration Tests ────────────────────────────────────────────
+
+/// Create a fake git repo in `dir` with HEAD pointing to `branch`.
+/// The server reads `.git/HEAD` directly on each request, so this controls
+/// the branch tag stored with observations saved after this call.
+fn init_git_branch(dir: &Path, branch: &str) {
+    let git_dir = dir.join(".git");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(
+        git_dir.join("HEAD"),
+        format!("ref: refs/heads/{}\n", branch),
+    ).unwrap();
+}
+
+fn get_history_with_branch(id: i64, branch: Option<&str>) -> serde_json::Value {
+    let mut args = serde_json::json!({});
+    if let Some(b) = branch {
+        args["branch"] = serde_json::json!(b);
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "get_session_history", "arguments": args }
+    })
+}
+
+/// Branch detection is per-request: server reads `.git/HEAD` on every call.
+/// Switching HEAD between requests simulates switching branches mid-session.
+#[test]
+fn test_branch_scoped_observation_retrieval() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Save obs on "main" branch
+    init_git_branch(tmpdir.path(), "main");
+    let responses1 = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "main branch work", Some("f::main_fn"), None),
+    ]);
+    assert!(responses1[0]["result"].is_object(), "save on main must succeed");
+
+    // Query with branch="main" → obs appears
+    let responses2 = run_requests_in(tmpdir.path(), &[
+        get_history_with_branch(1, Some("main")),
+    ]);
+    let text = extract_text(&responses2[0]);
+    assert!(text.contains("main branch work"), "main-branch obs must appear when filtering by main");
+
+    // Query with branch="feature/x" → obs excluded (stored as "main", not NULL)
+    let responses3 = run_requests_in(tmpdir.path(), &[
+        get_history_with_branch(1, Some("feature/x")),
+    ]);
+    let text3 = extract_text(&responses3[0]);
+    assert!(!text3.contains("main branch work"), "main-branch obs must not appear when filtering by feature/x");
+}
+
+#[test]
+fn test_session_history_branch_all() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    init_git_branch(tmpdir.path(), "main");
+    let _save = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "main-tagged observation", Some("f::foo"), None),
+    ]);
+    // branch="all" disables filtering → obs must appear regardless of stored branch
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_with_branch(1, Some("all")),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("main-tagged observation"), "branch=all must show observations from any branch");
+}
+
+#[test]
+fn test_context_brief_branch_aware() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Create and index a source file so symbols exist in the graph
+    std::fs::write(tmpdir.path().join("lib.ts"), "function compute() { return 42; }\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["index"])
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("index must succeed");
+    // Set git branch to "main" so observations are tagged with "main"
+    init_git_branch(tmpdir.path(), "main");
+    let _save = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "main branch compute insight", Some("lib.ts::compute"), None),
+    ]);
+    // Query get_context with branch="main" → obs must appear
+    let match_resp = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "get_context",
+            "arguments": { "intent": "compute function", "file_hints": ["lib.ts"], "branch": "main" }
+        }
+    })]);
+    let text = extract_text(&match_resp[0]);
+    assert!(text.contains("main branch compute insight"), "main-branch obs must appear when branch matches; got: {text}");
+
+    // Query get_context with branch="other-branch" → obs excluded (obs is tagged "main", not NULL)
+    let no_match_resp = run_requests_in(tmpdir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "get_context",
+            "arguments": { "intent": "compute function", "file_hints": ["lib.ts"], "branch": "other-branch" }
+        }
+    })]);
+    let text2 = extract_text(&no_match_resp[0]);
+    assert!(!text2.contains("main branch compute insight"), "main-branch obs must not appear when filtering by other-branch");
+}
+
+/// NULL-branch observations (no git repo) are globally visible in any branch-filtered query.
+#[test]
+fn test_branch_filter_with_null_branch_visible() {
+    // No git repo → observations stored with branch=NULL
+    let tmpdir = tempfile::tempdir().unwrap();
+    let _save = run_requests_in(tmpdir.path(), &[
+        save_obs_request(1, "insight", "legacy global note", Some("f::legacy"), None),
+    ]);
+    // Filtering by any branch must still surface NULL-branch observations
+    let responses = run_requests_in(tmpdir.path(), &[
+        get_history_with_branch(1, Some("main")),
+    ]);
+    let text = extract_text(&responses[0]);
+    assert!(text.contains("legacy global note"), "NULL-branch obs must be visible under any branch filter");
 }

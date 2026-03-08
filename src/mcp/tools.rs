@@ -47,6 +47,10 @@ pub(crate) fn list() -> Vec<Value> {
                     "depth": {
                         "type": "integer",
                         "description": "Impact traversal depth (default: 3, max: 10)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch filter for session memory. Omit to auto-detect current branch, 'all' for cross-branch."
                     }
                 },
                 "required": ["intent"]
@@ -70,6 +74,10 @@ pub(crate) fn list() -> Vec<Value> {
                     "token_budget": {
                         "type": "integer",
                         "description": "Maximum tokens for the response (default: 4000)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch filter for session memory. Omit to auto-detect current branch, 'all' for cross-branch."
                     }
                 },
                 "required": ["intent"]
@@ -189,6 +197,10 @@ pub(crate) fn list() -> Vec<Value> {
                         "type": "string",
                         "description": "Presentation mode: 'session' (default, grouped by session) or 'relevance' (flat ranked by relevance score)",
                         "enum": ["session", "relevance"]
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Filter by git branch. Omit for current branch, 'all' for cross-branch."
                     }
                 }
             }
@@ -269,8 +281,8 @@ pub(crate) fn dispatch(ws: &mut crate::workspace::Workspace, session_id: &str, p
         "get_impact"       => handle_get_impact(ws.local_conn(), args),
         "get_file_skeleton" => handle_get_file_skeleton(ws.local_conn(), args),
         "index_status"     => handle_index_status(ws.local_conn()),
-        "save_observation"     => handle_save_observation(ws.local_conn(), session_id, args),
-        "get_session_history"  => handle_get_session_history(ws.local_conn(), args),
+        "save_observation"     => { let (c, r) = ws.local_parts(); handle_save_observation(c, r, session_id, args) }
+        "get_session_history"  => { let (c, r) = ws.local_parts(); handle_get_session_history(c, r, args) }
         "list_restore_points"  => handle_list_restore_points(ws.local_root(), args),
         "undo_change"          => { let (c, r) = ws.local_parts(); handle_undo_change(c, r, session_id, args) }
         "trace_flow"           => handle_trace_flow(ws.local_conn(), args),
@@ -621,6 +633,8 @@ fn handle_analyze_failure(
 
     crate::index::run_incremental(conn, project_root)?;
 
+    let branch = crate::config::detect_git_branch(project_root);
+
     let extraction = parse_trace(trace, project_root);
     let resolution = resolve_trace_pivots(conn, &extraction)?;
 
@@ -632,7 +646,7 @@ fn handle_analyze_failure(
         // Path A: Pivots resolved from trace (CallerSupplied — FQNs from stack-trace resolution)
         let intent = format!("fix error: {}", extraction.error_summary);
         let (brief, notes) = crate::graph::query::get_context_with_pivots(
-            conn, project_root, &intent, &resolution.pivot_fqns, token_budget
+            conn, project_root, &intent, &resolution.pivot_fqns, token_budget, branch.as_deref()
         ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
         retrieval_notes = notes;
 
@@ -673,7 +687,7 @@ fn handle_analyze_failure(
             // Path B: keywords matched symbols — pass PivotScores directly to preserve kw/deg scores
             let intent = format!("fix error: {}", extraction.error_summary);
             let (brief, notes) = crate::graph::query::get_context_from_pivot_scores(
-                conn, project_root, &intent, keyword_pivots, token_budget
+                conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref()
             ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
             retrieval_notes = notes;
 
@@ -725,12 +739,22 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
         crate::index::run_incremental(conn, root)?;
     }
 
+    // Resolve branch: explicit "all" → None, explicit name → Some, omitted → auto-detect
+    let branch: Option<String> = match args.get("branch").and_then(|v| v.as_str()) {
+        Some("all") => None,
+        Some(b) => Some(b.to_string()),
+        None => {
+            let (_, root) = ws.local_parts();
+            crate::config::detect_git_branch(root)
+        }
+    };
+
     let (mut result, retrieval_notes) = if ws.has_remotes() {
-        crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget)
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget, branch.as_deref())
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         let (conn, root) = ws.local_parts();
-        crate::graph::query::get_context(conn, root, intent, &file_hints, token_budget)
+        crate::graph::query::get_context(conn, root, intent, &file_hints, token_budget, branch.as_deref())
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
@@ -772,7 +796,7 @@ fn handle_index_status(conn: &rusqlite::Connection) -> Result<String, ToolError>
 
 const VALID_KINDS: &[&str] = &["insight", "decision", "error", "tool_call", "file_change", "anti_pattern"];
 
-fn handle_save_observation(conn: &mut rusqlite::Connection, session_id: &str, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path, session_id: &str, args: Option<&Value>) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
@@ -813,15 +837,16 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, session_id: &str, ar
         ));
     }
 
+    let branch = crate::config::detect_git_branch(project_root);
     crate::memory::store::upsert_session(conn, session_id, "claude-code")
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
-    let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path)
+    let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path, branch.as_deref())
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     Ok(format!("Observation saved (id={id}, kind={kind})."))
 }
 
-fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
@@ -840,14 +865,22 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
         ));
     }
 
-    let session_ids = crate::memory::store::get_recent_session_ids(conn, sessions_back)
+    // Resolve branch: "all" → None (no filter), explicit name → Some, omitted → auto-detect
+    let branch: Option<String> = match args.get("branch").and_then(|v| v.as_str()) {
+        Some("all") => None,
+        Some(b) => Some(b.to_string()),
+        None => crate::config::detect_git_branch(project_root),
+    };
+    let branch_all_mode = args.get("branch").and_then(|v| v.as_str()) == Some("all");
+
+    let session_ids = crate::memory::store::get_recent_session_ids(conn, sessions_back, branch.as_deref())
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     if session_ids.is_empty() {
         return Ok("No sessions found.".into());
     }
 
-    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path)
+    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path, branch.as_deref())
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     if observations.is_empty() {
@@ -859,8 +892,8 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, args: Option<&Val
     let capped = total.min(200);
 
     match sort_mode {
-        "relevance" => format_relevance_mode(&scored, capped, total),
-        _ => format_session_mode(conn, &scored, capped, total, &session_ids),
+        "relevance" => format_relevance_mode(&scored, capped, total, branch_all_mode),
+        _ => format_session_mode(conn, &scored, capped, total, &session_ids, branch_all_mode),
     }
 }
 
@@ -870,6 +903,7 @@ fn format_session_mode(
     capped: usize,
     total: usize,
     session_ids: &[String],
+    show_branch_labels: bool,
 ) -> Result<String, ToolError> {
     let mut session_order: Vec<String> = Vec::new();
     let mut by_session: std::collections::HashMap<String, Vec<&crate::memory::store::ScoredObservation>> =
@@ -908,17 +942,26 @@ fn format_session_mode(
             min_score = min_score.min(so.relevance_score);
             max_score = max_score.max(so.relevance_score);
 
+            let branch_label = if show_branch_labels {
+                match so.obs.branch.as_deref() {
+                    Some(b) => format!("[{}] ", b),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
             if so.obs.is_stale {
                 stale_count += 1;
                 let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
                 output.push_str(&format!(
-                    "- \u{26a0} [STALE \u{2014} {}] [{}] [score: {:.2} \u{00b7} {}] {}\n",
-                    reason, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
+                    "- \u{26a0} [STALE \u{2014} {}] {}[{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    reason, branch_label, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             } else {
                 output.push_str(&format!(
-                    "- [{}] [score: {:.2} \u{00b7} {}] {}\n",
-                    so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
+                    "- {}[{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    branch_label, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             }
             if let Some(fqn) = &so.obs.symbol_fqn {
@@ -960,6 +1003,7 @@ fn format_relevance_mode(
     scored: &[crate::memory::store::ScoredObservation],
     capped: usize,
     total: usize,
+    show_branch_labels: bool,
 ) -> Result<String, ToolError> {
     // Sort ALL scored observations by relevance first, THEN take top `capped`.
     // This ensures relevance mode surfaces the most relevant from the full fetched set,
@@ -985,17 +1029,26 @@ fn format_relevance_mode(
         min_score = min_score.min(so.relevance_score);
         max_score = max_score.max(so.relevance_score);
 
+        let branch_label = if show_branch_labels {
+            match so.obs.branch.as_deref() {
+                Some(b) => format!("[{}] ", b),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         if so.obs.is_stale {
             stale_count += 1;
             let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
             output.push_str(&format!(
-                "{}. [score: {:.2} \u{00b7} {}] \u{26a0} [STALE \u{2014} {}] [{}] {}\n",
-                i + 1, so.relevance_score, so.primary_signal, reason, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] \u{26a0} [STALE \u{2014} {}] {}[{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, reason, branch_label, so.obs.kind, so.obs.content
             ));
         } else {
             output.push_str(&format!(
-                "{}. [score: {:.2} \u{00b7} {}] [{}] {}\n",
-                i + 1, so.relevance_score, so.primary_signal, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] {}[{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, branch_label, so.obs.kind, so.obs.content
             ));
         }
         if let Some(fqn) = &so.obs.symbol_fqn {
@@ -1086,12 +1139,13 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
         })?;
 
     // Write a persistent decision observation (non-auto, survives compression)
+    let branch = crate::config::detect_git_branch(project_root);
     crate::memory::store::upsert_session(conn, session_id, "claude-code")
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
     crate::memory::store::insert_observation(
         conn, session_id, "decision",
         &format!("Reverted {} — restore point {} applied", rel, snapshot_id),
-        None, Some(&rel),
+        None, Some(&rel), branch.as_deref(),
     ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     Ok(format!("Restored {} to snapshot {}.", rel, snapshot_id))
@@ -1129,14 +1183,24 @@ fn handle_get_brief(
         crate::index::run_incremental(conn, root)?;
     }
 
+    // Resolve branch: explicit "all" → None, explicit name → Some, omitted → auto-detect
+    let branch: Option<String> = match args.get("branch").and_then(|v| v.as_str()) {
+        Some("all") => None,
+        Some(b) => Some(b.to_string()),
+        None => {
+            let (_, root) = ws.local_parts();
+            crate::config::detect_git_branch(root)
+        }
+    };
+
     // 2.3 Compute context budget — use workspace-aware path when remotes exist
     let ctx_budget = token_budget * 80 / 100;
     let (context_output, retrieval_notes) = if ws.has_remotes() {
-        crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget)
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget, branch.as_deref())
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         let (conn, root) = ws.local_parts();
-        crate::graph::query::get_context(conn, root, intent, &file_hints, ctx_budget)
+        crate::graph::query::get_context(conn, root, intent, &file_hints, ctx_budget, branch.as_deref())
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 

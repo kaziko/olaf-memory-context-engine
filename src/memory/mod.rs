@@ -19,6 +19,7 @@ pub use store::{
 pub fn run_session_end_pipeline(
     conn: &mut rusqlite::Connection,
     session_id: &str,
+    branch: Option<&str>,
 ) -> Result<bool, store::StoreError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // Re-check compressed inside the write-locked transaction (prevents TOCTOU race)
@@ -35,7 +36,7 @@ pub fn run_session_end_pipeline(
         return Ok(false); // tx rolled back on drop
     }
     // Deref coercion: &Transaction → &Connection for functions expecting &Connection
-    antipattern::detect_and_write_anti_patterns(&tx, session_id)?;
+    antipattern::detect_and_write_anti_patterns(&tx, session_id, branch)?;
     store::compress_session(&tx, session_id)?;
     tx.commit()?;
     Ok(true)

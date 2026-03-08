@@ -21,6 +21,11 @@ const MIGRATION_003: &str = "
 ALTER TABLE observations ADD COLUMN confidence REAL DEFAULT NULL;
 ";
 
+const MIGRATION_005: &str = "
+ALTER TABLE observations ADD COLUMN branch TEXT DEFAULT NULL;
+CREATE INDEX idx_observations_branch ON observations(branch);
+";
+
 const MIGRATION_004: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts
     USING fts5(content, content='observations', content_rowid='id', tokenize='porter ascii');
@@ -207,7 +212,7 @@ fn handle_corruption_or_propagate(
 
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 4;
+pub const MIGRATION_COUNT: i64 = 5;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -215,7 +220,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_002),
         M::up(MIGRATION_003),
         M::up(MIGRATION_004),
-        // Future migrations: append M::up(MIGRATION_005), etc. — never edit existing entries
+        M::up(MIGRATION_005),
+        // Future migrations: append M::up(MIGRATION_006), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;
