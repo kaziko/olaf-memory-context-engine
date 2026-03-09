@@ -5,7 +5,9 @@ hide:
 
 # Olaf
 
+<div style="text-align: center" markdown>
 ![Olaf](assets/hero.png){ width="600" }
+</div>
 
 **Codebase context engine and session memory for Claude Code.**
 
@@ -15,37 +17,37 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 ---
 
-## Why Olaf
+## Why Olaf?
 
 Claude Code reads files. A lot of them. On every request it may scan dozens of source files to understand your codebase — burning tokens, slowing responses, and often still missing the right context. Olaf replaces that with a pre-built symbol and dependency graph. Claude asks Olaf, Olaf returns exactly what's relevant, and the rest of your codebase stays out of the way.
 
 <div class="grid cards" markdown>
 
--   **Free with no limits**
+- **Free**
 
-    ---
+---
 
     Because why not. Olaf is open source and runs entirely on your machine.
 
--   **Built specifically for Claude Code**
+- **Built specifically for Claude Code**
 
     ---
 
     `olaf init` wires everything up in one command — MCP server, hooks, index. No manual config.
 
--   **Session memory across conversations**
+- **Session memory across conversations**
 
     ---
 
     Decisions, errors, and file changes persist. Claude knows what was tried before and why.
 
--   **Undo any AI edit instantly**
+- **Undo any AI edit instantly**
 
     ---
 
     Before every file change, Olaf creates a shadow snapshot. Restore with one command — no git required.
 
--   **Your code never leaves your machine**
+- **Your code never leaves your machine**
 
     ---
 
