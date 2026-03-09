@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::graph::skeleton::skeletonize;
+use crate::policy::ContentPolicy;
 use crate::workspace::Workspace;
 
 #[derive(Debug, thiserror::Error)]
@@ -619,6 +620,7 @@ fn build_context_brief(
     token_budget: usize,
     intent_query: Option<&str>,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let mut output = intent_header.to_string();
 
@@ -644,14 +646,19 @@ fn build_context_brief(
     for id in &pivots {
         let Some(row) = load_symbol_row(conn, *id)? else { continue };
         if is_output_sensitive(&row.file_path) { continue; }
+        if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
         all_fqns.insert(row.fqn.clone());
         all_file_paths.insert(row.file_path.clone());
 
-        let source = match read_symbol_source(project_root, &row.file_path, row.start_line, row.end_line) {
-            Ok(s) if !s.is_empty() => s,
-            _ => {
-                row.signature.as_deref().unwrap_or("(source unavailable)").to_string()
+        let source = if content_policy.is_redacted(&row.file_path, Some(&row.fqn)) {
+            format!("{}\n  [redacted by policy]", row.signature.as_deref().unwrap_or("(signature unavailable)"))
+        } else {
+            match read_symbol_source(project_root, &row.file_path, row.start_line, row.end_line) {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    row.signature.as_deref().unwrap_or("(source unavailable)").to_string()
+                }
             }
         };
 
@@ -669,6 +676,7 @@ fn build_context_brief(
         for (id, reason) in &supporting_with_reasons {
             let Some(row) = load_symbol_row(conn, *id)? else { continue };
             if is_output_sensitive(&row.file_path) { continue; }
+            if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
             all_fqns.insert(row.fqn.clone());
             all_file_paths.insert(row.file_path.clone());
@@ -707,7 +715,7 @@ fn build_context_brief(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            conn, &fqns, &file_paths, 50, intent_query, branch,
+            conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
         )
         .unwrap_or_default();
 
@@ -778,17 +786,20 @@ pub(crate) fn get_context(
     file_hints: &[String],
     token_budget: usize,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    let pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
+    let mut pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+    pivot_scores.retain(|ps| !content_policy.is_denied_by_fqn(&ps.fqn));
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy)
 }
 
 /// Build a context brief directly from caller-provided `PivotScore` values, preserving their
 /// `SelectionReason` (e.g. `Keyword` with `kw_score`/`in_degree`). Used by `analyze_failure`
 /// Path B so that keyword scores are surfaced in retrieval notes rather than reclassified.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_context_from_pivot_scores(
     conn: &Connection,
     project_root: &Path,
@@ -796,13 +807,18 @@ pub(crate) fn get_context_from_pivot_scores(
     pivot_scores: Vec<PivotScore>,
     token_budget: usize,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
+    let filtered: Vec<PivotScore> = pivot_scores.into_iter()
+        .filter(|ps| !content_policy.is_denied_by_fqn(&ps.fqn))
+        .collect();
+    build_context_brief(conn, project_root, &intent_header, &filtered, &policy, token_budget, Some(intent), branch, content_policy)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_context_with_pivots(
     conn: &Connection,
     project_root: &Path,
@@ -810,6 +826,7 @@ pub(crate) fn get_context_with_pivots(
     pivot_fqns: &[String],
     token_budget: usize,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
@@ -817,6 +834,7 @@ pub(crate) fn get_context_with_pivots(
 
     let mut pivot_scores: Vec<PivotScore> = Vec::new();
     for fqn in pivot_fqns {
+        if content_policy.is_denied_by_fqn(fqn) { continue; }
         if let Some(id) = conn.query_row(
             "SELECT id FROM symbols WHERE fqn = ?1",
             params![fqn],
@@ -836,7 +854,7 @@ pub(crate) fn get_context_with_pivots(
         return Ok((output, String::new()));
     }
 
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy)
 }
 
 // --- Workspace-aware federated queries ---
@@ -926,6 +944,7 @@ pub(crate) fn find_pivot_symbols_multi(
 }
 
 /// Build context brief from tagged pivots across workspace members.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_context_brief_multi(
     workspace: &Workspace,
     intent_header: &str,
@@ -934,6 +953,7 @@ pub(crate) fn build_context_brief_multi(
     token_budget: usize,
     intent_query: Option<&str>,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
@@ -963,6 +983,7 @@ pub(crate) fn build_context_brief_multi(
 
         let Some(row) = load_symbol_row(m.conn, tp.pivot.id)? else { continue };
         if is_output_sensitive(&row.file_path) { continue; }
+        if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
         // Only collect identifiers from local repo for memory matching
         if tp.member_index == 0 {
@@ -970,9 +991,13 @@ pub(crate) fn build_context_brief_multi(
             local_file_paths.insert(row.file_path.clone());
         }
 
-        let source = match read_symbol_source(m.project_root, &row.file_path, row.start_line, row.end_line) {
-            Ok(s) if !s.is_empty() => s,
-            _ => row.signature.as_deref().unwrap_or("(source unavailable)").to_string(),
+        let source = if content_policy.is_redacted(&row.file_path, Some(&row.fqn)) {
+            format!("{}\n  [redacted by policy]", row.signature.as_deref().unwrap_or("(signature unavailable)"))
+        } else {
+            match read_symbol_source(m.project_root, &row.file_path, row.start_line, row.end_line) {
+                Ok(s) if !s.is_empty() => s,
+                _ => row.signature.as_deref().unwrap_or("(source unavailable)").to_string(),
+            }
         };
 
         let entry = if tp.member_index != 0 {
@@ -1007,6 +1032,7 @@ pub(crate) fn build_context_brief_multi(
             for (id, reason) in &supporting_with_reasons {
                 let Some(row) = load_symbol_row(local.conn, *id)? else { continue };
                 if is_output_sensitive(&row.file_path) { continue; }
+                if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
                 local_fqns.insert(row.fqn.clone());
                 local_file_paths.insert(row.file_path.clone());
@@ -1046,7 +1072,7 @@ pub(crate) fn build_context_brief_multi(
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
-            local_conn, &fqns, &file_paths, 50, intent_query, branch,
+            local_conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
         )
         .unwrap_or_default();
 
@@ -1115,12 +1141,14 @@ pub(crate) fn get_context_workspace(
     file_hints: &[String],
     token_budget: usize,
     branch: Option<&str>,
+    content_policy: &ContentPolicy,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    let tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
-    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent), branch)
+    let mut tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
+    tagged_pivots.retain(|tp| !content_policy.is_denied_by_fqn(&tp.pivot.fqn));
+    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent), branch, content_policy)
 }
 
 /// Private helper: query candidate file paths from the files table.
@@ -1136,10 +1164,15 @@ fn query_file_candidates(
     Ok(paths)
 }
 
-pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str) -> Result<String, QueryError> {
+pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy) -> Result<String, QueryError> {
     // Input-level sensitive check — returns "not permitted" to the caller
     if is_output_sensitive(file_path) {
         return Ok(format!("Access to sensitive file '{file_path}' is not permitted.\n"));
+    }
+
+    // Content policy deny — return "not found" so denied files are invisible
+    if content_policy.is_denied(file_path, None) {
+        return Ok(format!("No file found matching: {file_path}\n\nEnsure the file is indexed with `olaf index`.\n"));
     }
 
     // Stage 1: exact file match
@@ -1153,6 +1186,9 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str) -> Result<St
 
     // Sensitive filter on candidates: silently remove — don't reveal that sensitive paths exist
     candidates.retain(|p| !is_output_sensitive(p));
+
+    // Content policy deny filter on candidates
+    candidates.retain(|p| !content_policy.is_denied(p, None));
 
     if candidates.is_empty() {
         return Ok(format!(
@@ -1184,6 +1220,19 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str) -> Result<St
 
     let mut output = format!("# File Skeleton: {resolved_path}\n\n");
     for id in symbol_ids {
+        // Check per-symbol redaction by loading the FQN
+        if let Some(row) = load_symbol_row(conn, id)? {
+            if content_policy.is_denied(resolved_path, Some(&row.fqn)) {
+                continue;
+            }
+            if content_policy.is_redacted(resolved_path, Some(&row.fqn)) {
+                output.push_str(&format!(
+                    "{}\n  [redacted by policy]\n\n",
+                    row.signature.as_deref().unwrap_or(&row.fqn)
+                ));
+                continue;
+            }
+        }
         output.push_str(&crate::graph::skeleton::skeletonize(conn, id)?);
     }
     Ok(output)
@@ -1212,7 +1261,13 @@ pub(crate) fn get_impact(
     conn: &Connection,
     symbol_fqn: &str,
     depth: usize,
+    content_policy: &ContentPolicy,
 ) -> Result<String, QueryError> {
+    // Direct-query guard: denied FQN (by fqn_prefix or path rules) returns "not found"
+    if content_policy.is_denied_by_fqn(symbol_fqn) {
+        return Ok(format!("Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."));
+    }
+
     let depth = depth.min(MAX_IMPACT_DEPTH);
     let symbol_id: Option<i64> = conn.query_row(
         "SELECT id FROM symbols WHERE fqn = ?1",
@@ -1249,7 +1304,7 @@ pub(crate) fn get_impact(
         for (id, fqn, name, path, kind) in rows {
             if visited.insert(id) {
                 queue.push_back((id, current_depth + 1));
-                if !is_output_sensitive(&path) {
+                if !is_output_sensitive(&path) && !content_policy.is_denied(&path, Some(&fqn)) {
                     results.push((fqn, name, path, kind, current_depth + 1));
                 }
             }
@@ -1442,7 +1497,7 @@ mod tests {
         ).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000, None).unwrap();
+        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000, None, &ContentPolicy::default()).unwrap();
         assert!(result.contains("intent_mode: bug-fix\n"), "get_context output must include intent_mode header line");
         assert!(result.contains("intent_confidence:"), "get_context output must include intent_confidence");
         assert!(result.contains("intent_signals:"), "get_context output must include intent_signals");
@@ -1660,7 +1715,7 @@ mod tests {
         conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
         conn.execute("INSERT INTO symbols VALUES (1,1,'crate::my_pivot','my_pivot','fn',1,4,NULL,NULL,NULL)", []).unwrap();
 
-        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000, None).unwrap();
+        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         assert!(result.contains("```"), "AC1: pivot output must contain fenced code block");
         assert!(result.contains("fn my_pivot"), "AC1: pivot source body must appear in output");
@@ -1676,7 +1731,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC2: supporting section must contain Signature line");
@@ -1693,7 +1748,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC3: Signature line must be present when sig is set");
@@ -1715,7 +1770,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50, None).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50, None, &ContentPolicy::default()).unwrap();
 
         // Pivot must be present — proves pivot-first ordering was honoured
         assert!(result.contains("## pivot"), "AC4: pivot symbol must appear in output");
@@ -1737,7 +1792,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (3,1,4,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000, None).unwrap();
+        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
 
@@ -1888,7 +1943,7 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (2,2,'src/handler.ts::handleRequest','handleRequest','fn',1,5,NULL,NULL,NULL)", []).unwrap();
         conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::MyInterface", 2).unwrap();
+        let result = get_impact(&conn, "src/types.ts::MyInterface", 2, &ContentPolicy::default()).unwrap();
         assert!(result.contains("handleRequest"), "type user must appear in impact results");
         assert!(result.contains("uses_type"), "edge kind must be shown in output");
     }
@@ -1902,7 +1957,7 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (2,2,'src/other.ts::Ref','Ref','fn',1,5,NULL,NULL,NULL)", []).unwrap();
         conn.execute("INSERT INTO edges VALUES (1,2,1,'references')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::Target", 2).unwrap();
+        let result = get_impact(&conn, "src/types.ts::Target", 2, &ContentPolicy::default()).unwrap();
         assert!(!result.contains("Ref"), "references edge must NOT appear in impact results");
     }
 
@@ -1921,7 +1976,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
         conn.execute("INSERT INTO edges VALUES (2,3,2,'calls')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::A", 3).unwrap();
+        let result = get_impact(&conn, "src/types.ts::A", 3, &ContentPolicy::default()).unwrap();
         assert!(result.contains("B"), "B (uses_type A) must appear at depth 1");
         assert!(result.contains("C"), "C (calls B) must appear at depth 2");
         assert!(result.contains("uses_type"), "uses_type edge kind must be shown");
@@ -1949,7 +2004,7 @@ mod tests {
             ).unwrap();
         }
 
-        let result = get_impact(&conn, "src/types.ts::Target", 1).unwrap();
+        let result = get_impact(&conn, "src/types.ts::Target", 1, &ContentPolicy::default()).unwrap();
         assert!(result.contains("Results truncated"), "truncation warning must appear when >100 dependents");
     }
 
@@ -1970,7 +2025,7 @@ mod tests {
 
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix login bug",
-            &["src/auth.rs::login".to_string()], 4000, None,
+            &["src/auth.rs::login".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
         assert!(result.contains("login"), "pivot symbol must appear in output");
         assert!(result.contains("Pivot Symbols"), "must have pivot section");
@@ -1982,7 +2037,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix bug",
-            &["nonexistent::symbol".to_string()], 4000, None,
+            &["nonexistent::symbol".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
         assert!(result.contains("No symbols found matching provided FQNs"),
             "must indicate no match; got: {result}");
@@ -2020,7 +2075,7 @@ mod tests {
 
         let (result, _notes) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix error",
-            &["src/a.rs::handler".to_string()], 4000, None,
+            &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
         assert!(result.contains("previous bug fix attempt failed"),
             "observation must appear in output; got: {result}");
@@ -2108,7 +2163,7 @@ mod tests {
 
         let tmpdir = tempfile::tempdir().unwrap();
         let (_, notes) = get_context_with_pivots(
-            &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000, None,
+            &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
         assert!(notes.contains("caller-supplied"), "CallerSupplied pivots must show 'caller-supplied' in retrieval notes");
     }
@@ -2120,7 +2175,7 @@ mod tests {
         conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::handler','handler','fn',1,10,NULL,NULL,NULL)", []).unwrap();
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000, None).unwrap();
+        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000, None, &ContentPolicy::default()).unwrap();
         assert!(result.contains("Pivot Symbols"), "brief must have pivots");
         assert!(notes.contains("## Retrieval Notes"), "retrieval notes must be generated");
         assert!(notes.contains("handler"), "rendered pivot must appear in retrieval notes");

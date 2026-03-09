@@ -319,6 +319,7 @@ pub(crate) fn get_observations_filtered(
     symbol_fqn: Option<&str>,
     file_path: Option<&str>,
     branch: Option<&str>,
+    content_policy: &crate::policy::ContentPolicy,
 ) -> Result<Vec<ObservationRow>, StoreError> {
     if session_ids.is_empty() {
         return Ok(Vec::new());
@@ -385,6 +386,10 @@ pub(crate) fn get_observations_filtered(
 
     Ok(rows.into_iter().filter(|r| {
         r.file_path.as_deref().is_none_or(|p| !is_sensitive_path(p))
+            && r.file_path.as_deref().is_none_or(|p| !content_policy.is_denied(p, None))
+            && r.symbol_fqn.as_deref().is_none_or(|fqn| {
+                !content_policy.is_denied(fqn.split("::").next().unwrap_or(""), Some(fqn))
+            })
     }).collect())
 }
 
@@ -394,6 +399,7 @@ pub(crate) fn get_observations_for_context(
     file_paths: &[&str],
     limit: usize,
     branch: Option<&str>,
+    content_policy: &crate::policy::ContentPolicy,
 ) -> Result<Vec<ObservationRow>, StoreError> {
     if symbol_fqns.is_empty() && file_paths.is_empty() {
         return Ok(Vec::new());
@@ -465,7 +471,13 @@ pub(crate) fn get_observations_for_context(
 
     // Filter sensitive paths in Rust after fetch, then apply final limit.
     Ok(rows.into_iter()
-        .filter(|r| r.file_path.as_deref().is_none_or(|p| !is_sensitive_path(p)))
+        .filter(|r| {
+            r.file_path.as_deref().is_none_or(|p| !is_sensitive_path(p))
+                && r.file_path.as_deref().is_none_or(|p| !content_policy.is_denied(p, None))
+                && r.symbol_fqn.as_deref().is_none_or(|fqn| {
+                    !content_policy.is_denied(fqn.split("::").next().unwrap_or(""), Some(fqn))
+                })
+        })
         .take(limit)
         .collect())
 }
@@ -477,8 +489,9 @@ pub(crate) fn get_scored_observations_for_context(
     limit: usize,
     intent: Option<&str>,
     branch: Option<&str>,
+    content_policy: &crate::policy::ContentPolicy,
 ) -> Result<Vec<ScoredObservation>, StoreError> {
-    let observations = get_observations_for_context(conn, symbol_fqns, file_paths, limit, branch)?;
+    let observations = get_observations_for_context(conn, symbol_fqns, file_paths, limit, branch, content_policy)?;
     let mut scored = score_observations(conn, observations, intent);
     scored.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
     Ok(scored)
@@ -631,6 +644,7 @@ pub fn list_sessions(
 pub fn get_session_observations(
     conn: &Connection,
     session_id: &str,
+    content_policy: &crate::policy::ContentPolicy,
 ) -> Result<Option<Vec<ObservationRow>>, StoreError> {
     // Check session exists — distinguish "no rows" from real DB errors
     let exists = match conn.query_row(
@@ -675,6 +689,10 @@ pub fn get_session_observations(
                     && r.symbol_fqn.as_deref().is_none_or(|fqn| {
                         // Extract file component from FQN (e.g., ".env::DB_PASSWORD" → ".env")
                         fqn.split("::").next().is_none_or(|f| !is_sensitive_path(f))
+                    })
+                    && r.file_path.as_deref().is_none_or(|p| !content_policy.is_denied(p, None))
+                    && r.symbol_fqn.as_deref().is_none_or(|fqn| {
+                        !content_policy.is_denied(fqn.split("::").next().unwrap_or(""), Some(fqn))
                     })
             })
             .collect(),
@@ -886,7 +904,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "about foo", Some("f::foo"), None, None).unwrap();
         insert_observation(&conn, "s1", "decision", "about bar", Some("f::bar"), None, None).unwrap();
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], Some("f::foo"), None, None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], Some("f::foo"), None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol_fqn.as_deref(), Some("f::foo"));
     }
@@ -898,7 +916,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "about src", None, Some("src/a.rs"), None).unwrap();
         insert_observation(&conn, "s1", "insight", "about lib", None, Some("src/b.rs"), None).unwrap();
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, Some("src/a.rs"), None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, Some("src/a.rs"), None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path.as_deref(), Some("src/a.rs"));
     }
@@ -910,7 +928,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "one", Some("f::a"), None, None).unwrap();
         insert_observation(&conn, "s1", "decision", "two", None, Some("src/b.rs"), None).unwrap();
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -922,7 +940,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "by path", None, Some("src/a.rs"), None).unwrap();
         insert_observation(&conn, "s1", "insight", "unrelated", Some("f::bar"), Some("src/z.rs"), None).unwrap();
 
-        let rows = get_observations_for_context(&conn, &["f::foo"], &["src/a.rs"], 50, None).unwrap();
+        let rows = get_observations_for_context(&conn, &["f::foo"], &["src/a.rs"], 50, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2);
         let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
         assert!(contents.contains(&"by fqn"));
@@ -937,7 +955,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "secret", None, Some(".env"), None).unwrap();
         insert_observation(&conn, "s1", "insight", "key", None, Some("certs/server.pem"), None).unwrap();
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "safe");
     }
@@ -1004,7 +1022,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "finding", Some("f::x"), None, None).unwrap();
         insert_observation(&conn, "s1", "decision", "chose A", None, Some("src/a.rs"), None).unwrap();
 
-        let obs = get_session_observations(&conn, "s1").unwrap();
+        let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap();
         assert!(obs.is_some());
         let obs = obs.unwrap();
         assert_eq!(obs.len(), 2);
@@ -1013,7 +1031,7 @@ mod tests {
     #[test]
     fn test_get_session_observations_invalid_session() {
         let (conn, _dir) = open_test_db();
-        let obs = get_session_observations(&conn, "nonexistent").unwrap();
+        let obs = get_session_observations(&conn, "nonexistent", &crate::policy::ContentPolicy::default()).unwrap();
         assert!(obs.is_none());
     }
 
@@ -1025,7 +1043,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "secret obs", None, Some(".env"), None).unwrap();
         insert_observation(&conn, "s1", "insight", "key obs", None, Some("certs/server.pem"), None).unwrap();
 
-        let obs = get_session_observations(&conn, "s1").unwrap().unwrap();
+        let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap().unwrap();
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].content, "safe obs");
     }
@@ -1475,7 +1493,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main")).unwrap();
         insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/y")).unwrap();
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main")).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "on main");
     }
@@ -1488,7 +1506,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main")).unwrap();
 
         // NULL-branch obs is visible when filtering by "main"
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main")).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2, "NULL-branch obs must appear in any branch-filtered query");
     }
 
@@ -1500,7 +1518,7 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/z")).unwrap();
 
         // No branch filter → all observations returned
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -1512,11 +1530,11 @@ mod tests {
         insert_observation(&conn, "s1", "insight", "work on dev", None, None, Some("dev")).unwrap();
         insert_observation(&conn, "s1", "insight", "generic note", None, None, None).unwrap();
 
-        let main_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main")).unwrap();
+        let main_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
         // main + NULL = 2
         assert_eq!(main_rows.len(), 2);
 
-        let dev_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("dev")).unwrap();
+        let dev_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("dev"), &crate::policy::ContentPolicy::default()).unwrap();
         // dev + NULL = 2
         assert_eq!(dev_rows.len(), 2);
     }
@@ -1538,7 +1556,7 @@ mod tests {
         let id2 = insert_observation(&conn, "s1", "insight", "consolidated obs", Some("f::x"), None, None).unwrap();
         mark_consolidated(&conn, id2, id1);
 
-        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None).unwrap();
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id1);
     }
@@ -1551,7 +1569,7 @@ mod tests {
         let id2 = insert_observation(&conn, "s1", "insight", "merged context", None, Some("src/a.rs"), None).unwrap();
         mark_consolidated(&conn, id2, id1);
 
-        let rows = get_observations_for_context(&conn, &[], &["src/a.rs"], 10, None).unwrap();
+        let rows = get_observations_for_context(&conn, &[], &["src/a.rs"], 10, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id1);
     }
@@ -1592,7 +1610,7 @@ mod tests {
         let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None).unwrap();
         mark_consolidated(&conn, id2, id1);
 
-        let obs = get_session_observations(&conn, "s1").unwrap().unwrap();
+        let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap().unwrap();
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].id, id1);
     }

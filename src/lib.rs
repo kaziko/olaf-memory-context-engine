@@ -5,6 +5,7 @@ pub mod graph;
 pub mod index;
 pub mod mcp;
 pub mod memory;
+pub mod policy;
 pub mod parser;
 pub mod restore;
 pub mod workspace;

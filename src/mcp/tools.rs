@@ -4,6 +4,8 @@ use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
+use crate::policy::ContentPolicy;
+
 /// Error types for tool dispatch — maps to MCP error codes in server.rs.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolError {
@@ -278,14 +280,14 @@ pub(crate) fn dispatch(ws: &mut crate::workspace::Workspace, session_id: &str, p
         "get_context"          => handle_get_context(ws, args),
         // Local-only tools
         "analyze_failure"  => { let (c, r) = ws.local_parts(); handle_analyze_failure(c, r, session_id, args) }
-        "get_impact"       => handle_get_impact(ws.local_conn(), args),
-        "get_file_skeleton" => handle_get_file_skeleton(ws.local_conn(), args),
+        "get_impact"       => { let cp = ContentPolicy::load(ws.local_root()); handle_get_impact(ws.local_conn(), args, &cp) }
+        "get_file_skeleton" => { let cp = ContentPolicy::load(ws.local_root()); handle_get_file_skeleton(ws.local_conn(), args, &cp) }
         "index_status"     => handle_index_status(ws.local_conn()),
         "save_observation"     => { let (c, r) = ws.local_parts(); handle_save_observation(c, r, session_id, args) }
-        "get_session_history"  => { let (c, r) = ws.local_parts(); handle_get_session_history(c, r, args) }
+        "get_session_history"  => { let cp = ContentPolicy::load(ws.local_root()); let (c, r) = ws.local_parts(); handle_get_session_history(c, r, args, &cp) }
         "list_restore_points"  => handle_list_restore_points(ws.local_root(), args),
         "undo_change"          => { let (c, r) = ws.local_parts(); handle_undo_change(c, r, session_id, args) }
-        "trace_flow"           => handle_trace_flow(ws.local_conn(), args),
+        "trace_flow"           => { let cp = ContentPolicy::load(ws.local_root()); handle_trace_flow(ws.local_conn(), args, &cp) }
         "submit_lsp_edges"     => handle_submit_lsp_edges(ws.local_conn(), args),
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
@@ -539,7 +541,7 @@ fn resolve_trace_pivots(conn: &rusqlite::Connection, extraction: &TraceExtractio
 
 // ─── trace sanitization ─────────────────────────────────────────────────────
 
-fn sanitize_trace_output(raw: &str) -> String {
+fn sanitize_trace_output(raw: &str, content_policy: &ContentPolicy) -> String {
     let lines: Vec<&str> = raw.lines().collect();
 
     // Head/tail truncation
@@ -568,6 +570,9 @@ fn sanitize_trace_output(raw: &str) -> String {
 
     let mut output_lines: Vec<String> = Vec::with_capacity(truncated.len());
 
+    // Regex to extract relative file paths from trace lines (e.g., "src/foo.rs:42")
+    let re_rel_path = Regex::new(r"(?:^|\s|at\s+|in\s+|from\s+)([a-zA-Z0-9_./\\-]+\.[a-zA-Z]{1,5})(?::\d+)?").unwrap();
+
     for line in &truncated {
         // Check for sensitive content
         if re_env.is_match(line) || re_pem.is_match(line) || re_p12.is_match(line)
@@ -575,6 +580,22 @@ fn sanitize_trace_output(raw: &str) -> String {
         {
             output_lines.push("[redacted: sensitive content]".to_string());
             continue;
+        }
+
+        // Check for policy-denied file paths in the line
+        if !content_policy.is_empty() {
+            let mut line_denied = false;
+            for cap in re_rel_path.captures_iter(line) {
+                let path = &cap[1];
+                if content_policy.is_denied(path, None) {
+                    line_denied = true;
+                    break;
+                }
+            }
+            if line_denied {
+                output_lines.push("[redacted: sensitive content]".to_string());
+                continue;
+            }
         }
 
         // Strip absolute paths
@@ -598,9 +619,15 @@ fn sanitize_trace_output(raw: &str) -> String {
 
 // ─── frame resolution table ─────────────────────────────────────────────────
 
-fn format_frame_table(details: &[FrameResolution]) -> String {
+fn format_frame_table(details: &[FrameResolution], content_policy: &ContentPolicy) -> String {
     let mut table = String::from("### Frame Resolution\n| # | Path | Line | Resolved Symbol | Method |\n|-|-|-|-|-|\n");
     for (i, fr) in details.iter().enumerate() {
+        // Skip frames that match deny rules
+        let path_denied = fr.file_path.as_deref().is_some_and(|p| content_policy.is_denied(p, None));
+        let fqn_denied = fr.resolved_fqn.as_deref().is_some_and(|fqn| content_policy.is_denied_by_fqn(fqn));
+        if path_denied || fqn_denied {
+            continue;
+        }
         let path = fr.file_path.as_deref().unwrap_or("\u{2014}");
         let line = fr.line.map(|l| l.to_string()).unwrap_or_else(|| "\u{2014}".to_string());
         let fqn = fr.resolved_fqn.as_deref().unwrap_or("\u{2014}");
@@ -637,23 +664,30 @@ fn handle_analyze_failure(
 
     let extraction = parse_trace(trace, project_root);
     let resolution = resolve_trace_pivots(conn, &extraction)?;
+    let content_policy = ContentPolicy::load(project_root);
+
+    // Filter denied FQNs from pivots so they don't enter context building
+    let allowed_pivot_fqns: Vec<String> = resolution.pivot_fqns.iter()
+        .filter(|fqn| !content_policy.is_denied_by_fqn(fqn))
+        .cloned()
+        .collect();
 
     let mut output = String::new();
 
     let retrieval_notes;
 
-    if !resolution.pivot_fqns.is_empty() {
+    if !allowed_pivot_fqns.is_empty() {
         // Path A: Pivots resolved from trace (CallerSupplied — FQNs from stack-trace resolution)
         let intent = format!("fix error: {}", extraction.error_summary);
         let (brief, notes) = crate::graph::query::get_context_with_pivots(
-            conn, project_root, &intent, &resolution.pivot_fqns, token_budget, branch.as_deref()
+            conn, project_root, &intent, &allowed_pivot_fqns, token_budget, branch.as_deref(), &content_policy
         ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
         retrieval_notes = notes;
 
         output.push_str("## Failure Analysis\n\n");
         output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
         if !resolution.frame_details.is_empty() {
-            output.push_str(&format_frame_table(&resolution.frame_details));
+            output.push_str(&format_frame_table(&resolution.frame_details, &content_policy));
             output.push('\n');
         }
         output.push_str(&brief);
@@ -687,14 +721,14 @@ fn handle_analyze_failure(
             // Path B: keywords matched symbols — pass PivotScores directly to preserve kw/deg scores
             let intent = format!("fix error: {}", extraction.error_summary);
             let (brief, notes) = crate::graph::query::get_context_from_pivot_scores(
-                conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref()
+                conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref(), &content_policy
             ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
             retrieval_notes = notes;
 
             output.push_str("## Failure Analysis\n\n");
             output.push_str(&format!("**Error:** {}\n\n", extraction.error_summary));
             if !resolution.frame_details.is_empty() {
-                output.push_str(&format_frame_table(&resolution.frame_details));
+                output.push_str(&format_frame_table(&resolution.frame_details, &content_policy));
                 output.push('\n');
             }
             output.push_str(&brief);
@@ -708,11 +742,11 @@ fn handle_analyze_failure(
             output.push_str("unindexed code, or input without parseable structure.\n");
             output.push_str("The raw input is preserved below.\n\n");
             if !resolution.frame_details.is_empty() {
-                output.push_str(&format_frame_table(&resolution.frame_details));
+                output.push_str(&format_frame_table(&resolution.frame_details, &content_policy));
                 output.push('\n');
             }
             output.push_str("### Raw Trace\n```\n");
-            output.push_str(&sanitize_trace_output(trace));
+            output.push_str(&sanitize_trace_output(trace, &content_policy));
             output.push_str("\n```\n");
         }
     }
@@ -749,12 +783,17 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
         }
     };
 
+    let content_policy = {
+        let (_, root) = ws.local_parts();
+        ContentPolicy::load(root)
+    };
+
     let (mut result, retrieval_notes) = if ws.has_remotes() {
-        crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget, branch.as_deref())
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         let (conn, root) = ws.local_parts();
-        crate::graph::query::get_context(conn, root, intent, &file_hints, token_budget, branch.as_deref())
+        crate::graph::query::get_context(conn, root, intent, &file_hints, token_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
@@ -765,18 +804,18 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
     Ok(result)
 }
 
-fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
     let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: symbol_fqn".to_string()))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(3);
 
-    crate::graph::query::get_impact(conn, symbol_fqn, depth)
+    crate::graph::query::get_impact(conn, symbol_fqn, depth, content_policy)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
 }
 
-fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
     let file_path = args.get("file_path").and_then(|v| v.as_str())
@@ -785,7 +824,7 @@ fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>) -
     if file_path.is_empty() {
         return Err(ToolError::InvalidParams("file_path must not be empty".to_string()));
     }
-    crate::graph::query::get_file_skeleton(conn, file_path)
+    crate::graph::query::get_file_skeleton(conn, file_path, content_policy)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
 }
 
@@ -846,7 +885,7 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
     Ok(format!("Observation saved (id={id}, kind={kind})."))
 }
 
-fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
@@ -880,7 +919,7 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Pa
         return Ok("No sessions found.".into());
     }
 
-    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path, branch.as_deref())
+    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path, branch.as_deref(), content_policy)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     if observations.is_empty() {
@@ -1194,19 +1233,23 @@ fn handle_get_brief(
     };
 
     // 2.3 Compute context budget — use workspace-aware path when remotes exist
+    let content_policy = {
+        let (_, root) = ws.local_parts();
+        ContentPolicy::load(root)
+    };
     let ctx_budget = token_budget * 80 / 100;
     let (context_output, retrieval_notes) = if ws.has_remotes() {
-        crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget, branch.as_deref())
+        crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         let (conn, root) = ws.local_parts();
-        crate::graph::query::get_context(conn, root, intent, &file_hints, ctx_budget, branch.as_deref())
+        crate::graph::query::get_context(conn, root, intent, &file_hints, ctx_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
     // 2.4 Build impact section (local-only)
     let impact_output = if let Some(fqn) = symbol_fqn {
-        crate::graph::query::get_impact(ws.local_conn(), fqn, depth)
+        crate::graph::query::get_impact(ws.local_conn(), fqn, depth, &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
         "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
@@ -1229,7 +1272,7 @@ fn handle_get_brief(
     Ok(output)
 }
 
-fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>) -> Result<String, ToolError> {
+fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
@@ -1266,7 +1309,7 @@ fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>) -> Resul
     let result = crate::graph::trace::trace_flow(conn, source_id, target_id, max_paths)
         .map_err(anyhow::Error::from)?;
 
-    Ok(crate::graph::trace::format_trace_result(source_fqn, target_fqn, &result))
+    Ok(crate::graph::trace::format_trace_result(source_fqn, target_fqn, &result, content_policy))
 }
 
 /// Truncates `s` so that `s.len().div_ceil(4) <= token_budget` after appending the note.
@@ -1420,7 +1463,7 @@ mod tests {
     fn test_trace_flow_missing_source_fqn() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let args = serde_json::json!({ "target_fqn": "src/b.rs::bar" });
-        let result = handle_trace_flow(&conn, Some(&args));
+        let result = handle_trace_flow(&conn, Some(&args), &ContentPolicy::default());
         assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
@@ -1428,7 +1471,7 @@ mod tests {
     fn test_trace_flow_missing_target_fqn() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let args = serde_json::json!({ "source_fqn": "src/a.rs::foo" });
-        let result = handle_trace_flow(&conn, Some(&args));
+        let result = handle_trace_flow(&conn, Some(&args), &ContentPolicy::default());
         assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
@@ -1769,7 +1812,7 @@ mod tests {
     #[test]
     fn sanitize_redacts_sensitive_lines() {
         let input = "normal line\nloading .env file\npassword = \"hunter2\"\napi_token = \"abc\"\ntoken_budget = 100\napi_token.rs:42\n";
-        let output = sanitize_trace_output(input);
+        let output = sanitize_trace_output(input, &ContentPolicy::default());
         assert!(output.contains("[redacted: sensitive content]"), "sensitive lines must be redacted");
         assert!(output.contains("token_budget"), "token_budget must NOT be redacted");
         assert!(output.contains("api_token.rs"), "api_token.rs must NOT be redacted");
@@ -1779,7 +1822,7 @@ mod tests {
     #[test]
     fn sanitize_strips_absolute_unix_paths() {
         let input = "error at /var/log/app/src/main.rs:42\n";
-        let output = sanitize_trace_output(input);
+        let output = sanitize_trace_output(input, &ContentPolicy::default());
         assert!(output.contains("<abs>/main.rs:42"), "must strip to <abs>/filename; got: {output}");
         assert!(!output.contains("/var/log"), "raw absolute path must be stripped");
     }
@@ -1787,7 +1830,7 @@ mod tests {
     #[test]
     fn sanitize_strips_absolute_windows_paths() {
         let input = "error at C:\\code\\src\\main.rs:10\n";
-        let output = sanitize_trace_output(input);
+        let output = sanitize_trace_output(input, &ContentPolicy::default());
         assert!(output.contains("<abs>\\main.rs:10"), "must strip to <abs>\\filename; got: {output}");
         assert!(!output.contains("C:\\code"), "raw absolute path must be stripped");
     }
@@ -1795,7 +1838,7 @@ mod tests {
     #[test]
     fn sanitize_strips_midline_paths() {
         let input = "    at /home/user/project/src/app.ts:10:5\n  File \"/usr/lib/python/views.py\", line 42\n";
-        let output = sanitize_trace_output(input);
+        let output = sanitize_trace_output(input, &ContentPolicy::default());
         assert!(output.contains("<abs>/app.ts:10:5"), "must strip mid-line unix path");
         assert!(output.contains("<abs>/views.py\""), "must strip mid-line python path");
         assert!(!output.contains("/home/user"), "raw home path must be stripped");
@@ -1807,7 +1850,7 @@ mod tests {
         for i in 0..200 {
             input.push_str(&format!("line {i}\n"));
         }
-        let output = sanitize_trace_output(&input);
+        let output = sanitize_trace_output(&input, &ContentPolicy::default());
         assert!(output.contains("lines omitted"), "must have omission marker");
         let output_lines: Vec<&str> = output.lines().collect();
         // 80 head + 1 marker + 20 tail = 101

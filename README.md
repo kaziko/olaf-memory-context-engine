@@ -22,6 +22,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 - **Observation consolidation** — near-duplicate observations are automatically merged, keeping memory concise without losing information
 - **Auto-generated project rules** — when the same code-level insight or decision recurs across 3+ sessions for the same file or symbol, Olaf promotes it to a standing rule that appears in every relevant context brief. Not for workflow preferences (use CLAUDE.md for those) — for lessons Claude learns about your code through repeated work
 - **Live activity monitor** — run `olaf monitor` in a separate terminal to see MCP tool calls, hook events, session lifecycle, and index operations in real time. Supports `--json`, `--tool`, `--errors-only` filters
+- **Content policy filtering** — define deny and redact rules in `.olaf/policy.toml` to silently exclude sensitive modules from all MCP output, or redact implementation bodies while preserving signatures for navigation
 - **Pre-edit snapshots** — undo any AI edit instantly, no git required
 - **LSP edge injection** — enrich the graph with type-resolved edges from language servers
 - **Failure analysis** — parse stack traces and get context briefs focused on the error path

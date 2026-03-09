@@ -40,7 +40,8 @@ pub(crate) fn run_show(id: &str) -> anyhow::Result<()> {
     let db_path = cwd.join(".olaf/index.db");
     let conn = olaf::db::open(&db_path).context("failed to open database")?;
 
-    let observations = match olaf::memory::get_session_observations(&conn, id)? {
+    let content_policy = olaf::policy::ContentPolicy::load(&cwd);
+    let observations = match olaf::memory::get_session_observations(&conn, id, &content_policy)? {
         None => {
             eprintln!("Session not found: {id}");
             return Err(anyhow::anyhow!("session not found"));
