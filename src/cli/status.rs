@@ -1,5 +1,5 @@
 use anyhow::Context;
-use crate::cli::setup::{check_hooks_installed, check_mcp_registered, print_branding};
+use crate::cli::setup::{check_hooks_installed, check_mcp_registered, check_tool_rules, print_branding, RulesFileStatus};
 
 pub(crate) fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -57,6 +57,20 @@ fn print_diagnostics(cwd: &std::path::Path) -> anyhow::Result<()> {
     println!(
         "Hook SessionEnd:    {}",
         if session { "installed" } else { "missing" }
+    );
+
+    let rules_status = check_tool_rules(cwd)?;
+    println!(
+        "Tool preferences:   {}",
+        match &rules_status {
+            RulesFileStatus::Current => "current".to_string(),
+            RulesFileStatus::Outdated { detected_hash } => {
+                let short: String = detected_hash.chars().take(8).collect();
+                format!("outdated (hash: {}…)", short)
+            }
+            RulesFileStatus::Missing => "missing".to_string(),
+            RulesFileStatus::Malformed { reason } => format!("malformed ({})", reason),
+        }
     );
 
     Ok(())

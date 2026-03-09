@@ -2,6 +2,167 @@ use anyhow::Context;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+// ---------------------------------------------------------------------------
+// Tool-preference rules template (Task 1)
+// ---------------------------------------------------------------------------
+
+/// Instruction template for `.claude/rules/olaf-tools.md`.
+/// The `{HASH}` placeholder is replaced at render time with a blake3 hash of
+/// the template body (with placeholder blanked) so that staleness detection
+/// works purely on content, independent of version numbers.
+const OLAF_RULES_TEMPLATE: &str = r#"<!-- olaf-tools {HASH} -->
+## Olaf Context Engine
+
+This project uses Olaf for intelligent codebase context.
+
+### REQUIRED: Load Olaf tools before first use
+
+Olaf MCP tools are deferred. Before first use each session, call:
+ToolSearch("select:mcp__olaf__get_brief,mcp__olaf__get_context,mcp__olaf__get_file_skeleton,mcp__olaf__get_impact,mcp__olaf__trace_flow,mcp__olaf__analyze_failure,mcp__olaf__save_observation,mcp__olaf__index_status")
+
+### Tool routing — prefer Olaf over native tools
+
+| Task | Olaf tool | Instead of | Notes |
+|-|-|-|-|
+| Explore codebase (start here) | `get_brief` | Multiple Grep + Read | Auto-reindexes; broad entry point |
+| Fine-grained context control | `get_context` | Multiple Grep + Read | Auto-reindexes |
+| Quick file structure overview | `get_file_skeleton` | Reading entire file | Fast, does NOT reindex |
+| Analyze dependencies/impact | `get_impact` | Grep for usages | Does NOT reindex |
+| Trace execution paths | `trace_flow` | Manual file-by-file tracing | Does NOT reindex |
+| Diagnose errors/failures | `analyze_failure` | Ad-hoc investigation | Auto-reindexes local repo |
+| Persist important findings | `save_observation` | (no equivalent) | |
+
+### Freshness after edits
+
+`get_brief`, `get_context`, and `analyze_failure` auto-reindex the local repo before returning results.
+In workspace mode, remote members are NOT reindexed on demand — freshness warnings are advisory.
+Other tools (`get_file_skeleton`, `get_impact`, `trace_flow`) do NOT reindex.
+If results seem stale after edits: call `get_brief` or `get_context` to trigger a local reindex, or run `olaf index` from CLI.
+`index_status` is diagnostic only — it reports freshness but does not reindex.
+
+### When to use native tools instead
+
+- **Editing files**: always use Edit/Write (Olaf is read-only)
+- **Running commands**: always use Bash
+- **Reading a specific known file path**: Read is fine for targeted reads
+- **Simple keyword search in 1-2 files**: Grep is fine for narrow searches
+"#;
+
+// ---------------------------------------------------------------------------
+// Hash / render helpers (Task 2)
+// ---------------------------------------------------------------------------
+
+/// Compute blake3 hash of the rendered template body (with `{HASH}` blanked).
+fn compute_rules_hash() -> String {
+    let body = OLAF_RULES_TEMPLATE.replace("{HASH}", "");
+    blake3::hash(body.as_bytes()).to_hex().to_string()
+}
+
+/// Render the template with the actual hash substituted in.
+fn render_rules() -> String {
+    let hash = compute_rules_hash();
+    OLAF_RULES_TEMPLATE.replace("{HASH}", &hash)
+}
+
+// ---------------------------------------------------------------------------
+// Rules file reconcile + check (Task 3 & Task 5)
+// ---------------------------------------------------------------------------
+
+const RULES_REL_PATH: &str = ".claude/rules/olaf-tools.md";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RulesFileStatus {
+    Current,
+    Outdated { detected_hash: String },
+    Missing,
+    Malformed { reason: String },
+}
+
+/// Reconcile `.claude/rules/olaf-tools.md` — create, update, or leave as-is.
+pub(crate) fn reconcile_tool_rules(cwd: &Path) -> anyhow::Result<ReconcileAction> {
+    let rules_path = cwd.join(RULES_REL_PATH);
+
+    // Ensure directory exists
+    if let Some(parent) = rules_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let rendered = render_rules();
+
+    if !rules_path.exists() {
+        atomic_write(&rules_path, &rendered)?;
+        return Ok(ReconcileAction::Created);
+    }
+
+    let existing = std::fs::read_to_string(&rules_path)?;
+
+    // Full-content hash comparison — catches header edits, body edits, everything.
+    let existing_hash = blake3::hash(existing.as_bytes()).to_hex().to_string();
+    let rendered_hash = blake3::hash(rendered.as_bytes()).to_hex().to_string();
+
+    if existing_hash == rendered_hash {
+        return Ok(ReconcileAction::AlreadyCurrent);
+    }
+
+    atomic_write(&rules_path, &rendered)?;
+    Ok(ReconcileAction::Updated)
+}
+
+/// Check state of `.claude/rules/olaf-tools.md` without modifying anything.
+pub(crate) fn check_tool_rules(cwd: &Path) -> anyhow::Result<RulesFileStatus> {
+    let rules_path = cwd.join(RULES_REL_PATH);
+
+    if !rules_path.exists() {
+        return Ok(RulesFileStatus::Missing);
+    }
+
+    let existing = std::fs::read_to_string(&rules_path)?;
+
+    // Check for hash marker presence
+    if !existing.starts_with("<!-- olaf-tools ") {
+        return Ok(RulesFileStatus::Malformed {
+            reason: "missing olaf-tools marker on first line".to_string(),
+        });
+    }
+
+    // Extract detected hash from marker
+    let first_line = existing.lines().next().unwrap_or("");
+    let detected_hash = first_line
+        .strip_prefix("<!-- olaf-tools ")
+        .and_then(|s| s.strip_suffix(" -->"))
+        .unwrap_or("");
+
+    if detected_hash.is_empty()
+        || detected_hash.contains(' ')
+        || !detected_hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Ok(RulesFileStatus::Malformed {
+            reason: "hash marker is malformed".to_string(),
+        });
+    }
+
+    // Full-content comparison
+    let rendered = render_rules();
+    let existing_full_hash = blake3::hash(existing.as_bytes()).to_hex().to_string();
+    let rendered_full_hash = blake3::hash(rendered.as_bytes()).to_hex().to_string();
+
+    if existing_full_hash == rendered_full_hash {
+        Ok(RulesFileStatus::Current)
+    } else {
+        Ok(RulesFileStatus::Outdated {
+            detected_hash: detected_hash.to_string(),
+        })
+    }
+}
+
+/// Atomic write via tmp + rename.
+fn atomic_write(path: &Path, content: &str) -> anyhow::Result<()> {
+    let tmp_path = path.with_extension("md.tmp");
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReconcileAction {
     Created,
@@ -324,4 +485,157 @@ pub(crate) fn check_hooks_installed(cwd: &Path) -> anyhow::Result<[bool; 3]> {
         check("PreToolUse"),
         check("SessionEnd"),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // 6.1 — Hash is deterministic across calls
+    #[test]
+    fn test_rules_hash_stable() {
+        let h1 = compute_rules_hash();
+        let h2 = compute_rules_hash();
+        assert_eq!(h1, h2);
+        assert!(!h1.is_empty());
+    }
+
+    // 6.2 — Rendered output contains hash, no {HASH} literal
+    #[test]
+    fn test_render_no_placeholder() {
+        let rendered = render_rules();
+        assert!(!rendered.contains("{HASH}"), "rendered output must not contain {{HASH}} placeholder");
+        let hash = compute_rules_hash();
+        assert!(rendered.contains(&hash), "rendered output must contain the computed hash");
+    }
+
+    // 6.3 — Creates fresh file in empty tempdir
+    #[test]
+    fn test_reconcile_creates_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let action = reconcile_tool_rules(tmp.path()).unwrap();
+        assert_eq!(action, ReconcileAction::Created);
+        let path = tmp.path().join(RULES_REL_PATH);
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("<!-- olaf-tools "));
+        assert!(!content.contains("{HASH}"));
+    }
+
+    // 6.4 — Second call returns AlreadyCurrent
+    #[test]
+    fn test_reconcile_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        reconcile_tool_rules(tmp.path()).unwrap();
+        let action = reconcile_tool_rules(tmp.path()).unwrap();
+        assert_eq!(action, ReconcileAction::AlreadyCurrent);
+    }
+
+    // 6.5 — Stale hash triggers update
+    #[test]
+    fn test_reconcile_updates_stale_hash() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<!-- olaf-tools deadbeef -->\nold content\n").unwrap();
+        let action = reconcile_tool_rules(tmp.path()).unwrap();
+        assert_eq!(action, ReconcileAction::Updated);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&compute_rules_hash()));
+    }
+
+    // 6.6 — Malformed header triggers update
+    #[test]
+    fn test_reconcile_malformed_header() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "no marker at all\njust random content\n").unwrap();
+        let action = reconcile_tool_rules(tmp.path()).unwrap();
+        assert_eq!(action, ReconcileAction::Updated);
+    }
+
+    // 6.7 — check_tool_rules returns Missing on empty dir
+    #[test]
+    fn test_check_missing() {
+        let tmp = TempDir::new().unwrap();
+        let status = check_tool_rules(tmp.path()).unwrap();
+        assert_eq!(status, RulesFileStatus::Missing);
+    }
+
+    // 6.8 — check_tool_rules returns Outdated with detected hash
+    #[test]
+    fn test_check_outdated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<!-- olaf-tools abc123def456 -->\nold body\n").unwrap();
+        let status = check_tool_rules(tmp.path()).unwrap();
+        match status {
+            RulesFileStatus::Outdated { detected_hash } => {
+                assert_eq!(detected_hash, "abc123def456");
+            }
+            other => panic!("expected Outdated, got {:?}", other),
+        }
+    }
+
+    // 6.9 — check_tool_rules returns Malformed with reason
+    #[test]
+    fn test_check_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "totally not a rules file\n").unwrap();
+        let status = check_tool_rules(tmp.path()).unwrap();
+        match status {
+            RulesFileStatus::Malformed { reason } => {
+                assert!(reason.contains("marker"), "reason should mention marker: {}", reason);
+            }
+            other => panic!("expected Malformed, got {:?}", other),
+        }
+    }
+
+    // 6.10 — check_tool_rules returns Current for valid file
+    #[test]
+    fn test_check_current() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, render_rules()).unwrap();
+        let status = check_tool_rules(tmp.path()).unwrap();
+        assert_eq!(status, RulesFileStatus::Current);
+    }
+
+    // 6.9b — Non-hex marker reported as Malformed, not Outdated
+    #[test]
+    fn test_check_non_hex_marker_is_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<!-- olaf-tools 中中中 -->\nbody\n").unwrap();
+        let status = check_tool_rules(tmp.path()).unwrap();
+        match status {
+            RulesFileStatus::Malformed { reason } => {
+                assert!(reason.contains("malformed"), "reason: {}", reason);
+            }
+            other => panic!("expected Malformed for non-hex marker, got {:?}", other),
+        }
+    }
+
+    // 6.11 — Body edit detected via full-content hash comparison
+    #[test]
+    fn test_reconcile_detects_body_edit() {
+        let tmp = TempDir::new().unwrap();
+        // First create the correct file
+        reconcile_tool_rules(tmp.path()).unwrap();
+        let path = tmp.path().join(RULES_REL_PATH);
+        // Now modify the body but keep the header hash intact
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("\n<!-- user added this line -->\n");
+        std::fs::write(&path, &content).unwrap();
+        // Reconcile should detect the change
+        let action = reconcile_tool_rules(tmp.path()).unwrap();
+        assert_eq!(action, ReconcileAction::Updated);
+    }
 }

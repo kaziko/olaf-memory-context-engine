@@ -413,6 +413,42 @@ fn test_bare_invocation_shows_usage_error() {
 }
 
 #[test]
+fn test_init_creates_tool_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_init(dir.path());
+    assert!(out.status.success(), "olaf init failed: {:?}", out);
+
+    let rules_path = dir.path().join(".claude/rules/olaf-tools.md");
+    assert!(rules_path.exists(), ".claude/rules/olaf-tools.md must be created by init");
+
+    let content = fs::read_to_string(&rules_path).unwrap();
+    assert!(content.starts_with("<!-- olaf-tools "), "rules file must start with hash marker");
+    assert!(content.contains("get_brief"), "rules file must mention get_brief");
+    assert!(content.contains("ToolSearch"), "rules file must mention ToolSearch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tool preferences"),
+        "init output must contain 'tool preferences' line; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_init_idempotent_tool_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    run_init(dir.path());
+    let out = run_init(dir.path());
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Second run should say "Everything is up-to-date" (all_current includes rules)
+    assert!(
+        stdout.contains("up-to-date"),
+        "second init must show up-to-date; got:\n{stdout}"
+    );
+}
+
+#[test]
 fn test_completions_bash() {
     let out = olaf()
         .args(["completions", "bash"])

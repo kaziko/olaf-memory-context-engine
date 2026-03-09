@@ -1,6 +1,6 @@
 use crate::cli::setup::{
     ensure_gitignore_entry, ensure_olaf_dir, print_branding, reconcile_hooks, reconcile_mcp_entry,
-    ReconcileAction,
+    reconcile_tool_rules, ReconcileAction,
 };
 
 pub(crate) fn run() -> anyhow::Result<()> {
@@ -12,6 +12,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let gitignore_added = ensure_gitignore_entry(&cwd)?;
     let mcp_action = reconcile_mcp_entry(&cwd, &binary)?;
     let hook_actions = reconcile_hooks(&cwd, &binary)?;
+    let rules_action = reconcile_tool_rules(&cwd)?;
 
     // --- Full index ---
     let db_path = cwd.join(".olaf/index.db");
@@ -24,7 +25,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let all_current = !olaf_dir_created
         && !gitignore_added
         && mcp_action == ReconcileAction::AlreadyCurrent
-        && hook_actions.iter().all(|(_, a)| *a == ReconcileAction::AlreadyCurrent);
+        && hook_actions.iter().all(|(_, a)| *a == ReconcileAction::AlreadyCurrent)
+        && rules_action == ReconcileAction::AlreadyCurrent;
 
     if all_current {
         println!("Everything is up-to-date.");
@@ -41,6 +43,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         for (event, action) in &hook_actions {
             println!("  hook {:<15} {}", event, action_label(action));
         }
+        println!("  tool preferences    {}", action_label(&rules_action));
     }
 
     println!(

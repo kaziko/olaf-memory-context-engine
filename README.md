@@ -2,7 +2,7 @@
 
 ![Olaf](docs/hero.png)
 
-**Codebase context engine for Claude Code & Codex (soon).**
+**Codebase context engine for Claude Code.**
 
 Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP, Go), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request.
 
@@ -30,17 +30,17 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 ## Install
 
-### Via cargo
-
-```sh
-cargo install olaf
-```
-
-### Homebrew (macOS)
+### Homebrew (macOS) (recommended)
 
 ```sh
 brew tap kaziko/olaf
 brew install olaf
+```
+
+### Via cargo
+
+```sh
+cargo install olaf
 ```
 
 ### Pre-built binaries
