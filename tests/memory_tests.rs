@@ -2709,3 +2709,123 @@ fn test_rules_invalidation_on_reindex() {
         .unwrap();
     assert_eq!(is_active, -1, "rule must be marked inactive after signature change");
 }
+
+// ─── Story 10.5: Consolidation integration tests ────────────────────────────
+
+#[test]
+fn test_consolidation_runs_on_session_end() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let session_id = "consol-sess";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    // Insert duplicate auto-generated insight observations (non-ephemeral, survives compression)
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    for _ in 0..3 {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, file_path, auto_generated) \
+             VALUES (?1, ?2, 'insight', 'function parse_config reads configuration from disk validates schema correctly', 'src/config.rs', 1)",
+            rusqlite::params![session_id, now],
+        ).unwrap();
+    }
+    drop(conn);
+
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_session_end_payload(session_id, cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(output.status.success(), "session-end must exit 0; stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let consolidated_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE consolidated_into IS NOT NULL AND session_id = ?1",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(consolidated_count >= 1, "at least one observation should be consolidated, got {consolidated_count}");
+
+    // Survivor should have consolidation_count > 0
+    let max_consol: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(consolidation_count), 0) FROM observations WHERE session_id = ?1 AND consolidated_into IS NULL",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(max_consol > 0, "survivor must have consolidation_count > 0");
+}
+
+#[test]
+fn test_manual_observations_preserved_through_consolidation() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let mut conn = olaf::db::open(&db_path).unwrap();
+
+    let session_id = "manual-preserve";
+    olaf::memory::upsert_session(&conn, session_id, "test").unwrap();
+    // Insert identical manual observations (auto_generated = 0)
+    for _ in 0..3 {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, file_path, auto_generated) \
+             VALUES (?1, 1000, 'insight', 'function parse_config reads configuration from disk validates schema', 'src/config.rs', 0)",
+            rusqlite::params![session_id],
+        ).unwrap();
+    }
+
+    let count = olaf::memory::consolidate_observations(&mut conn, None).unwrap();
+    assert_eq!(count, 0, "manual observations must not be consolidated");
+
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND consolidated_into IS NULL",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(total, 3, "all manual observations must remain");
+}
+
+#[test]
+fn test_consolidation_before_rules() {
+    // Verify consolidation runs before rule detection so duplicates don't inflate rule evidence.
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    // Create 3 sessions with identical insight observations on the same scope.
+    // Without consolidation, rule detection would see 9 supporting observations.
+    // With consolidation, the duplicate count is reduced, and rule detection is cleaner.
+    let content = "always validate input before calling parse_config handler function module";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    for i in 1..=3 {
+        let sid = format!("rule-consol-s{i}");
+        olaf::memory::upsert_session(&conn, &sid, "test").unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO observations (session_id, created_at, kind, content, file_path, auto_generated, branch) \
+                 VALUES (?1, ?2, 'insight', ?3, 'src/config.rs', 1, NULL)",
+                rusqlite::params![sid, now + i, content],
+            ).unwrap();
+        }
+    }
+    drop(conn);
+
+    // Trigger session-end which runs consolidation then rules
+    let cwd = tmpdir.path().to_str().unwrap();
+    let payload = make_session_end_payload("rule-consol-s3", cwd);
+    let output = run_observe_event("session-end", &tmpdir, &payload);
+    assert!(output.status.success(), "session-end must exit 0");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    // Consolidation should have merged duplicates within each session
+    let consolidated: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE consolidated_into IS NOT NULL",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(consolidated > 0, "consolidation must have merged some observations");
+
+    // Key guarantee: consolidated observations must not inflate rule evidence
+    let rule_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_rules",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(rule_count, 0, "no rules should be created when duplicates are consolidated away");
+}

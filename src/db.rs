@@ -81,6 +81,24 @@ CREATE TABLE activity_events (
 CREATE INDEX idx_activity_events_ts ON activity_events(timestamp);
 ";
 
+const MIGRATION_008: &str = "
+ALTER TABLE observations ADD COLUMN consolidated_into INTEGER DEFAULT NULL REFERENCES observations(id) ON DELETE SET NULL;
+ALTER TABLE observations ADD COLUMN consolidation_count INTEGER DEFAULT 0;
+CREATE INDEX idx_observations_consolidated ON observations(consolidated_into);
+";
+
+// Fix purge-resurrection bug: when a survivor observation is deleted, its consolidated
+// duplicates must also be deleted (not resurrected via SET NULL). SQLite cannot alter FK
+// constraints, so we use a trigger to cascade-delete consolidated duplicates.
+const MIGRATION_009: &str = "
+CREATE TRIGGER IF NOT EXISTS observations_cascade_consolidated
+    BEFORE DELETE ON observations
+    WHEN old.consolidation_count > 0
+    BEGIN
+        DELETE FROM observations WHERE consolidated_into = old.id;
+    END;
+";
+
 const MIGRATION_004: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts
     USING fts5(content, content='observations', content_rowid='id', tokenize='porter ascii');
@@ -267,7 +285,7 @@ fn handle_corruption_or_propagate(
 
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 7;
+pub const MIGRATION_COUNT: i64 = 9;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -278,7 +296,9 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_005),
         M::up(MIGRATION_006),
         M::up(MIGRATION_007),
-        // Future migrations: append M::up(MIGRATION_008), etc. — never edit existing entries
+        M::up(MIGRATION_008),
+        M::up(MIGRATION_009),
+        // Future migrations: append M::up(MIGRATION_010), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

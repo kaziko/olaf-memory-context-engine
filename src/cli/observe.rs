@@ -171,6 +171,22 @@ fn handle_session_end(payload: &olaf::memory::HookPayload, monitor_active: bool)
             });
         }
 
+        let consolidation_start = std::time::Instant::now();
+        let consolidated = olaf::memory::consolidate_observations(&mut conn, branch.as_deref())?;
+        if consolidated > 0 {
+            log::debug!("Consolidated {} duplicate observation(s)", consolidated);
+        }
+        if monitor_active && consolidated > 0 {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "consolidation",
+                session_id: Some(payload.session_id.clone()),
+                summary: format!("Consolidated {consolidated} duplicate(s)"),
+                duration_ms: Some(consolidation_start.elapsed().as_millis() as u64),
+                ..Default::default()
+            });
+        }
+
         let rule_start = std::time::Instant::now();
         let rule_count = olaf::memory::detect_and_write_rules(&mut conn, branch.as_deref())?;
         if rule_count > 0 {

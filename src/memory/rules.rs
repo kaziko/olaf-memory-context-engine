@@ -43,7 +43,7 @@ pub(crate) struct RuleCandidate {
 }
 
 // ~50 common English stop words
-const STOP_WORDS: &[&str] = &[
+pub(crate) const STOP_WORDS: &[&str] = &[
     "the", "and", "for", "that", "with", "this", "from", "have", "been",
     "will", "would", "could", "should", "about", "into", "when", "where",
     "which", "their", "there", "then", "than", "other", "some", "only",
@@ -69,7 +69,7 @@ pub(crate) fn compute_scope_fingerprint(file_paths: &[String], content_tokens: &
 }
 
 /// Extract content tokens from text for Jaccard similarity.
-fn extract_tokens(content: &str) -> Vec<String> {
+pub(crate) fn extract_tokens(content: &str) -> Vec<String> {
     let stop_set: HashSet<&str> = STOP_WORDS.iter().copied().collect();
     let mut freq: HashMap<String, usize> = HashMap::new();
 
@@ -92,7 +92,7 @@ fn extract_tokens(content: &str) -> Vec<String> {
 }
 
 /// Compute Jaccard similarity between two token sets.
-fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+pub(crate) fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 0.0;
     }
@@ -126,6 +126,7 @@ fn detect_rule_candidates(
              FROM observations \
              WHERE kind IN ('insight', 'decision') \
                AND is_stale = 0 \
+               AND consolidated_into IS NULL \
                AND created_at > ?1 \
                AND (branch = ?2 OR branch IS NULL)"
                 .to_string(),
@@ -137,6 +138,7 @@ fn detect_rule_candidates(
              FROM observations \
              WHERE kind IN ('insight', 'decision') \
                AND is_stale = 0 \
+               AND consolidated_into IS NULL \
                AND created_at > ?1"
                 .to_string(),
             vec![Box::new(ninety_days_ago)],
@@ -439,14 +441,16 @@ fn write_rule_candidates(
             let support_count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM rule_observations ro \
                  JOIN observations o ON o.id = ro.observation_id \
-                 WHERE ro.rule_id = ?1",
+                 WHERE ro.rule_id = ?1 \
+                   AND o.consolidated_into IS NULL",
                 params![rule_id],
                 |r| r.get(0),
             )?;
             let session_count: i64 = conn.query_row(
                 "SELECT COUNT(DISTINCT o.session_id) FROM rule_observations ro \
                  JOIN observations o ON o.id = ro.observation_id \
-                 WHERE ro.rule_id = ?1",
+                 WHERE ro.rule_id = ?1 \
+                   AND o.consolidated_into IS NULL",
                 params![rule_id],
                 |r| r.get(0),
             )?;

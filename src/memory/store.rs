@@ -289,6 +289,7 @@ pub(crate) fn get_recent_session_ids(
                 "SELECT DISTINCT s.id FROM sessions s \
                  JOIN observations o ON o.session_id = s.id \
                    AND o.kind != 'context_retrieval' \
+                   AND o.consolidated_into IS NULL \
                    AND (o.branch = ?2 OR o.branch IS NULL) \
                  ORDER BY s.started_at DESC, s.rowid DESC \
                  LIMIT ?1",
@@ -299,7 +300,9 @@ pub(crate) fn get_recent_session_ids(
         None => {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT s.id FROM sessions s \
-                 JOIN observations o ON o.session_id = s.id AND o.kind != 'context_retrieval' \
+                 JOIN observations o ON o.session_id = s.id \
+                   AND o.kind != 'context_retrieval' \
+                   AND o.consolidated_into IS NULL \
                  ORDER BY s.started_at DESC, s.rowid DESC \
                  LIMIT ?1",
             )?;
@@ -324,7 +327,7 @@ pub(crate) fn get_observations_filtered(
     let placeholders: Vec<String> = (1..=session_ids.len()).map(|i| format!("?{i}")).collect();
     let mut sql = format!(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
-         FROM observations WHERE session_id IN ({}) AND kind != 'context_retrieval' ",
+         FROM observations WHERE session_id IN ({}) AND kind != 'context_retrieval' AND consolidated_into IS NULL ",
         placeholders.join(", ")
     );
 
@@ -434,7 +437,7 @@ pub(crate) fn get_observations_for_context(
 
     let sql = format!(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
-         FROM observations WHERE ({}) AND kind != 'context_retrieval' {}ORDER BY created_at DESC, id DESC LIMIT {}",
+         FROM observations WHERE ({}) AND kind != 'context_retrieval' AND consolidated_into IS NULL {}ORDER BY created_at DESC, id DESC LIMIT {}",
         conditions.join(" OR "),
         branch_clause,
         limit_ph,
@@ -607,7 +610,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionSummary>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.started_at, s.compressed, COUNT(o.id) AS obs_count \
-         FROM sessions s LEFT JOIN observations o ON o.session_id = s.id AND o.kind != 'context_retrieval' \
+         FROM sessions s LEFT JOIN observations o ON o.session_id = s.id AND o.kind != 'context_retrieval' AND o.consolidated_into IS NULL \
          GROUP BY s.id ORDER BY s.started_at DESC, s.rowid DESC LIMIT ?1",
     )?;
     let rows = stmt
@@ -645,7 +648,7 @@ pub fn get_session_observations(
 
     let mut stmt = conn.prepare(
         "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
-         FROM observations WHERE session_id = ?1 AND kind != 'context_retrieval' ORDER BY created_at ASC, id ASC",
+         FROM observations WHERE session_id = ?1 AND kind != 'context_retrieval' AND consolidated_into IS NULL ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt
         .query_map(params![session_id], |r| {
@@ -1516,5 +1519,81 @@ mod tests {
         let dev_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("dev")).unwrap();
         // dev + NULL = 2
         assert_eq!(dev_rows.len(), 2);
+    }
+
+    // ─── Consolidation exclusion tests ──────────────────────────────────────
+
+    fn mark_consolidated(conn: &Connection, obs_id: i64, survivor_id: i64) {
+        conn.execute(
+            "UPDATE observations SET consolidated_into = ?1 WHERE id = ?2",
+            params![survivor_id, obs_id],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_get_observations_filtered_excludes_consolidated() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "survivor obs", Some("f::x"), None, None).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "consolidated obs", Some("f::x"), None, None).unwrap();
+        mark_consolidated(&conn, id2, id1);
+
+        let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id1);
+    }
+
+    #[test]
+    fn test_get_observations_for_context_excludes_consolidated() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "survivor context", None, Some("src/a.rs"), None).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged context", None, Some("src/a.rs"), None).unwrap();
+        mark_consolidated(&conn, id2, id1);
+
+        let rows = get_observations_for_context(&conn, &[], &["src/a.rs"], 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id1);
+    }
+
+    #[test]
+    fn test_get_recent_session_ids_excludes_consolidated_only_sessions() {
+        let (conn, _dir) = open_test_db();
+        conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('only-consolidated', 100, 'a')", []).unwrap();
+        let id1 = insert_observation(&conn, "only-consolidated", "insight", "obs", Some("f::x"), None, None).unwrap();
+        let id2 = insert_observation(&conn, "only-consolidated", "insight", "obs2", Some("f::x"), None, None).unwrap();
+        mark_consolidated(&conn, id1, id2);
+        mark_consolidated(&conn, id2, id1); // both consolidated — session has no visible obs
+
+        // Session with all obs consolidated should still appear (it has a consolidated_into IS NULL check on obs join)
+        // Actually both are consolidated, so no obs match the JOIN, and session won't appear
+        let ids = get_recent_session_ids(&conn, 10, None).unwrap();
+        assert!(ids.is_empty(), "session with only consolidated obs should not appear");
+    }
+
+    #[test]
+    fn test_list_sessions_count_excludes_consolidated() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None).unwrap();
+        mark_consolidated(&conn, id2, id1);
+
+        let sessions = list_sessions(&conn, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].observation_count, 1, "consolidated obs should not count");
+    }
+
+    #[test]
+    fn test_get_session_observations_excludes_consolidated() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None).unwrap();
+        mark_consolidated(&conn, id2, id1);
+
+        let obs = get_session_observations(&conn, "s1").unwrap().unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].id, id1);
     }
 }
