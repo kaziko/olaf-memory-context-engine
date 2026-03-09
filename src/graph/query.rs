@@ -2229,3 +2229,449 @@ mod tests {
         assert!(entry.contains("symbol changed"), "stale_reason must be preserved");
     }
 }
+
+#[cfg(test)]
+mod eval {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Instant;
+    use tempfile::tempdir;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestCaseFile {
+        case: Vec<TestCase>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestCase {
+        name: String,
+        intent: String,
+        #[serde(default)]
+        file_hints: Vec<String>,
+        expected_pivots: Vec<String>,
+        tag: String,
+        #[serde(default)]
+        exercises: Vec<String>,
+        #[serde(default)]
+        min_recall_at_3: Option<f32>,
+        #[serde(default)]
+        expected_policy: Option<ExpectedPolicy>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ExpectedPolicy {
+        depth: usize,
+        include_inbound: bool,
+        inbound_first: bool,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BaselineFile {
+        min_recall_at_3: f32,
+        #[serde(default)]
+        tag: HashMap<String, TagBaseline>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TagBaseline {
+        min_recall_at_3: f32,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct ReasonDistribution {
+        keyword: usize,
+        file_hint: usize,
+        fallback: usize,
+        caller_supplied: usize,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct CaseResult {
+        name: String,
+        tag: String,
+        intent: String,
+        recall_at_3: f32,
+        recall_at_5: f32,
+        mrr: f32,
+        expected_pivots: Vec<String>,
+        actual_pivots: Vec<PivotResult>,
+        reason_distribution: ReasonDistribution,
+        policy_pass: Option<bool>,
+        policy_details: Option<String>,
+        brief_tokens: Option<usize>,
+        latency_ms: Option<u128>,
+        exercises: Vec<String>,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct PivotResult {
+        fqn: String,
+        reason: String,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct AggregateResult {
+        global_recall_at_3: f32,
+        per_tag: HashMap<String, TagResult>,
+        reason_distribution: ReasonDistribution,
+        cases: Vec<CaseResult>,
+        coverage_matrix: HashMap<String, Vec<String>>,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct TagResult {
+        recall_at_3: f32,
+        recall_at_5: f32,
+        case_count: usize,
+    }
+
+    /// All retrieval-quality constants that must be exercised by at least one case.
+    const REQUIRED_CONSTANTS: &[&str] = &[
+        "CANDIDATE_GATHER_LIMIT",
+        "DEFAULT_PIVOT_POOL",
+        "LOW_CONFIDENCE_THRESHOLD",
+        "LOW_CONFIDENCE_PIVOT_POOL",
+        "INBOUND_BLEND_THRESHOLD",
+        "REFACTOR_DEPTH_THRESHOLD",
+    ];
+
+    fn compute_reason_distribution(pivots: &[PivotScore]) -> ReasonDistribution {
+        let mut dist = ReasonDistribution { keyword: 0, file_hint: 0, fallback: 0, caller_supplied: 0 };
+        for p in pivots {
+            match &p.reason {
+                SelectionReason::Keyword { .. } => dist.keyword += 1,
+                SelectionReason::FileHint { .. } => dist.file_hint += 1,
+                SelectionReason::Fallback => dist.fallback += 1,
+                SelectionReason::CallerSupplied => dist.caller_supplied += 1,
+            }
+        }
+        dist
+    }
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bench_corpus")
+    }
+
+    fn format_reason(reason: &SelectionReason) -> String {
+        match reason {
+            SelectionReason::Keyword { kw_score, in_degree } => {
+                format!("Keyword(kw={}, deg={})", kw_score, in_degree)
+            }
+            SelectionReason::FileHint { hint } => format!("FileHint({})", hint),
+            SelectionReason::CallerSupplied => "CallerSupplied".to_string(),
+            SelectionReason::Fallback => "Fallback".to_string(),
+        }
+    }
+
+    fn compute_recall_at_k(expected: &[String], actual_fqns: &[String], k: usize) -> f32 {
+        if expected.is_empty() {
+            // No expected pivots — recall is N/A. Return NaN so callers can distinguish
+            // from real scores; aggregate code filters NaN out.
+            return f32::NAN;
+        }
+        let top_k: std::collections::HashSet<&str> =
+            actual_fqns.iter().take(k).map(|s| s.as_str()).collect();
+        let hits = expected.iter().filter(|e| top_k.contains(e.as_str())).count();
+        hits as f32 / expected.len() as f32
+    }
+
+    fn compute_mrr(expected: &[String], actual_fqns: &[String]) -> f32 {
+        if expected.is_empty() {
+            return f32::NAN;
+        }
+        for (rank, fqn) in actual_fqns.iter().enumerate() {
+            if expected.contains(fqn) {
+                return 1.0 / (rank + 1) as f32;
+            }
+        }
+        0.0
+    }
+
+    #[test]
+    fn eval_retrieval_harness() {
+        // --- Setup: index fixture sources into tempdir ---
+        let tmp = tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).expect("db::open failed");
+
+        let corpus_path = fixture_path();
+        let stats = crate::index::full::run(&mut conn, &corpus_path)
+            .expect("index::full::run failed on bench_corpus");
+        assert!(stats.symbols > 0, "bench_corpus must produce symbols; got 0");
+
+        // --- Load test cases and baselines ---
+        let cases_toml = std::fs::read_to_string(corpus_path.join("cases.toml"))
+            .expect("failed to read cases.toml");
+        let case_file: TestCaseFile =
+            toml::from_str(&cases_toml).expect("failed to parse cases.toml");
+
+        let baseline_toml = std::fs::read_to_string(corpus_path.join("baseline.toml"))
+            .expect("failed to read baseline.toml");
+        let baselines: BaselineFile =
+            toml::from_str(&baseline_toml).expect("failed to parse baseline.toml");
+
+        // --- Per-case evaluation ---
+        let mut case_results: Vec<CaseResult> = Vec::new();
+        let mut tag_recalls_3: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut tag_recalls_5: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut coverage_matrix: HashMap<String, Vec<String>> = HashMap::new();
+
+        for tc in &case_file.case {
+            // Build coverage matrix
+            for constant in &tc.exercises {
+                coverage_matrix
+                    .entry(constant.clone())
+                    .or_default()
+                    .push(tc.name.clone());
+            }
+
+            // Derive traversal policy
+            let profile = detect_intent_profile(&tc.intent);
+            let policy = derive_traversal_policy(&profile);
+
+            // Assert traversal policy if expected
+            let (policy_pass, policy_details) = if let Some(ep) = &tc.expected_policy {
+                let pass = policy.depth == ep.depth
+                    && policy.include_inbound == ep.include_inbound
+                    && policy.inbound_first == ep.inbound_first;
+                let details = if pass {
+                    format!(
+                        "PASS: depth={}, include_inbound={}, inbound_first={}",
+                        policy.depth, policy.include_inbound, policy.inbound_first
+                    )
+                } else {
+                    format!(
+                        "FAIL: expected depth={}/include_inbound={}/inbound_first={}, got depth={}/include_inbound={}/inbound_first={}",
+                        ep.depth, ep.include_inbound, ep.inbound_first,
+                        policy.depth, policy.include_inbound, policy.inbound_first
+                    )
+                };
+                (Some(pass), Some(details))
+            } else {
+                (None, None)
+            };
+
+            // Find pivot symbols
+            let pivots = find_pivot_symbols(
+                &conn,
+                &tc.intent,
+                &tc.file_hints,
+                policy.pivot_pool_size,
+            )
+            .expect("find_pivot_symbols failed");
+
+            let actual_fqns: Vec<String> = pivots.iter().map(|p| p.fqn.clone()).collect();
+            let reason_dist = compute_reason_distribution(&pivots);
+
+            let recall_3 = compute_recall_at_k(&tc.expected_pivots, &actual_fqns, 3);
+            let recall_5 = compute_recall_at_k(&tc.expected_pivots, &actual_fqns, 5);
+            let mrr = compute_mrr(&tc.expected_pivots, &actual_fqns);
+
+            // Only accumulate non-NaN recalls (fallback cases with empty expected_pivots are NaN)
+            if recall_3.is_finite() {
+                tag_recalls_3.entry(tc.tag.clone()).or_default().push(recall_3);
+            }
+            if recall_5.is_finite() {
+                tag_recalls_5.entry(tc.tag.clone()).or_default().push(recall_5);
+            }
+
+            // Informational: get_context end-to-end measurement (panic-safe)
+            let (brief_tokens, latency_ms) = {
+                let corpus = corpus_path.clone();
+                let intent = tc.intent.clone();
+                let hints = tc.file_hints.clone();
+                let start = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    get_context(&conn, &corpus, &intent, &hints, 4000, None, &ContentPolicy::default())
+                }));
+                match result {
+                    Ok(Ok((output, notes))) => {
+                        let elapsed = start.elapsed().as_millis();
+                        let tokens = estimate_tokens(&output) + estimate_tokens(&notes);
+                        (Some(tokens), Some(elapsed))
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("  [info] get_context error for case '{}': {}", tc.name, e);
+                        (None, None)
+                    }
+                    Err(_) => {
+                        eprintln!("  [info] get_context panicked for case '{}' (non-fatal)", tc.name);
+                        (None, None)
+                    }
+                }
+            };
+
+            case_results.push(CaseResult {
+                name: tc.name.clone(),
+                tag: tc.tag.clone(),
+                intent: tc.intent.clone(),
+                recall_at_3: if recall_3.is_finite() { recall_3 } else { -1.0 },
+                recall_at_5: if recall_5.is_finite() { recall_5 } else { -1.0 },
+                mrr: if mrr.is_finite() { mrr } else { -1.0 },
+                expected_pivots: tc.expected_pivots.clone(),
+                actual_pivots: pivots
+                    .iter()
+                    .map(|p| PivotResult {
+                        fqn: p.fqn.clone(),
+                        reason: format_reason(&p.reason),
+                    })
+                    .collect(),
+                reason_distribution: reason_dist,
+                policy_pass,
+                policy_details,
+                brief_tokens,
+                latency_ms,
+                exercises: tc.exercises.clone(),
+            });
+        }
+
+        // --- Aggregate metrics ---
+        let all_recall_3: Vec<f32> = case_results.iter().map(|r| r.recall_at_3).collect();
+        let global_recall_3 = if all_recall_3.is_empty() {
+            0.0
+        } else {
+            all_recall_3.iter().sum::<f32>() / all_recall_3.len() as f32
+        };
+
+        let mut per_tag: HashMap<String, TagResult> = HashMap::new();
+        for (tag, recalls) in &tag_recalls_3 {
+            let avg_3 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+            let recalls_5 = tag_recalls_5.get(tag).unwrap();
+            let avg_5 = recalls_5.iter().sum::<f32>() / recalls_5.len() as f32;
+            per_tag.insert(
+                tag.clone(),
+                TagResult {
+                    recall_at_3: avg_3,
+                    recall_at_5: avg_5,
+                    case_count: recalls.len(),
+                },
+            );
+        }
+
+        // Aggregate reason distribution
+        let mut agg_reason = ReasonDistribution { keyword: 0, file_hint: 0, fallback: 0, caller_supplied: 0 };
+        for cr in &case_results {
+            agg_reason.keyword += cr.reason_distribution.keyword;
+            agg_reason.file_hint += cr.reason_distribution.file_hint;
+            agg_reason.fallback += cr.reason_distribution.fallback;
+            agg_reason.caller_supplied += cr.reason_distribution.caller_supplied;
+        }
+
+        let result = AggregateResult {
+            global_recall_at_3: global_recall_3,
+            per_tag,
+            reason_distribution: agg_reason,
+            cases: case_results,
+            coverage_matrix,
+        };
+
+        // --- Write JSON results ---
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bench_retrieval_results.json");
+        if let Some(parent) = json_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let json = serde_json::to_string_pretty(&result).expect("failed to serialize results");
+        std::fs::write(&json_path, &json).expect("failed to write bench results JSON");
+
+        // --- Print summary to stderr ---
+        eprintln!("\n=== Retrieval Evaluation Harness ===");
+        eprintln!("Global recall@3: {:.3}", global_recall_3);
+        for (tag, tr) in &result.per_tag {
+            eprintln!(
+                "  [{}] recall@3={:.3} recall@5={:.3} (n={})",
+                tag, tr.recall_at_3, tr.recall_at_5, tr.case_count
+            );
+        }
+        eprintln!("Results: {}", json_path.display());
+
+        // --- Gating assertions ---
+        let mut failures: Vec<String> = Vec::new();
+
+        // Traversal policy assertions (AC4)
+        for cr in &result.cases {
+            if let Some(false) = cr.policy_pass {
+                failures.push(format!(
+                    "Policy assertion failed for '{}': {}",
+                    cr.name,
+                    cr.policy_details.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
+
+        // Fallback behavior assertions: cases with empty expected_pivots must
+        // return pivots via Fallback reason (not vacuously pass recall)
+        for (tc, cr) in case_file.case.iter().zip(result.cases.iter()) {
+            if tc.expected_pivots.is_empty() && tc.tag == "fallback" {
+                if cr.reason_distribution.fallback == 0 {
+                    failures.push(format!(
+                        "Fallback case '{}' returned 0 Fallback-reason pivots (got {} Keyword, {} FileHint)",
+                        cr.name, cr.reason_distribution.keyword, cr.reason_distribution.file_hint
+                    ));
+                }
+                if cr.actual_pivots.is_empty() {
+                    failures.push(format!(
+                        "Fallback case '{}' returned no pivots at all",
+                        cr.name
+                    ));
+                }
+            }
+        }
+
+        // Coverage matrix enforcement (AC5): every required constant must be exercised
+        for &constant in REQUIRED_CONSTANTS {
+            if !result.coverage_matrix.contains_key(constant) {
+                failures.push(format!(
+                    "Coverage gap: constant '{}' is not exercised by any test case",
+                    constant
+                ));
+            }
+        }
+
+        // Global recall@3 (AC3a)
+        if global_recall_3 < baselines.min_recall_at_3 {
+            failures.push(format!(
+                "Global recall@3 {:.3} < baseline {:.3}",
+                global_recall_3, baselines.min_recall_at_3
+            ));
+        }
+
+        // Per-tag recall@3 (AC3b) — skip tags with no finite recalls (e.g. fallback)
+        for (tag, tr) in &result.per_tag {
+            if let Some(tb) = baselines.tag.get(tag) {
+                if tr.recall_at_3 < tb.min_recall_at_3 {
+                    failures.push(format!(
+                        "Tag '{}' recall@3 {:.3} < baseline {:.3}",
+                        tag, tr.recall_at_3, tb.min_recall_at_3
+                    ));
+                }
+            }
+        }
+
+        // Per-case min_recall_at_3 (AC3c)
+        for (tc, cr) in case_file.case.iter().zip(result.cases.iter()) {
+            if let Some(min) = tc.min_recall_at_3 {
+                if cr.recall_at_3 >= 0.0 && cr.recall_at_3 < min {
+                    failures.push(format!(
+                        "Case '{}' recall@3 {:.3} < per-case min {:.3}",
+                        cr.name, cr.recall_at_3, min
+                    ));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            eprintln!("\n=== REGRESSION FAILURES ===");
+            for f in &failures {
+                eprintln!("  FAIL: {}", f);
+            }
+            eprintln!("Full details: {}", json_path.display());
+            panic!(
+                "Retrieval evaluation failed with {} issue(s). See target/bench_retrieval_results.json",
+                failures.len()
+            );
+        }
+
+        eprintln!("=== ALL GATES PASSED ===\n");
+    }
+}

@@ -1,0 +1,169 @@
+# Retrieval Evaluation Harness — Test Cases
+#
+# Each case exercises specific retrieval paths and tunable constants.
+# FQNs use format: {relative_path}::{Parent}::{name}
+#
+# IMPORTANT: rank_symbols_by_keywords uses LIKE %word% on symbol name/fqn.
+# Keywords <=3 chars are filtered. Use terms that substring-match actual symbol names.
+# E.g. "auth" matches AuthHandler (contains "auth"), but "authentication" does NOT.
+#
+# Coverage Matrix:
+#   CANDIDATE_GATHER_LIMIT  → keyword-auth-validate, keyword-database-query, keyword-config-parse
+#   DEFAULT_PIVOT_POOL      → keyword-auth-validate, keyword-database-query, keyword-config-parse
+#   LOW_CONFIDENCE_THRESHOLD → lowconf-auth-flow, lowconf-config-setup
+#   LOW_CONFIDENCE_PIVOT_POOL → lowconf-auth-flow, lowconf-config-setup
+#   INBOUND_BLEND_THRESHOLD → bugfix-auth-validate, bugfix-database-error, refactor-config-extract, refactor-handler-restructure
+#   REFACTOR_DEPTH_THRESHOLD → refactor-config-extract, refactor-handler-restructure
+
+# --- keyword tag: queries with rankable terms (>3 chars) ---
+
+[[case]]
+name = "keyword-auth-validate"
+intent = "auth handler validate session"
+expected_pivots = ["src/auth.rs::AuthHandler::validate", "src/auth.rs::AuthHandler"]
+tag = "keyword"
+exercises = ["CANDIDATE_GATHER_LIMIT", "DEFAULT_PIVOT_POOL"]
+
+[[case]]
+name = "keyword-database-query"
+intent = "database pool execute query"
+expected_pivots = ["src/database.rs::DatabasePool::execute_query", "src/database.rs::DatabasePool"]
+tag = "keyword"
+exercises = ["CANDIDATE_GATHER_LIMIT", "DEFAULT_PIVOT_POOL"]
+
+[[case]]
+name = "keyword-config-parse"
+intent = "config manager parse settings"
+expected_pivots = ["src/config.rs::ConfigManager::parse", "src/config.rs::ConfigManager"]
+tag = "keyword"
+exercises = ["CANDIDATE_GATHER_LIMIT", "DEFAULT_PIVOT_POOL"]
+
+# --- file_hint tag: file-hint retrieval bypasses keyword ranking ---
+
+[[case]]
+name = "filehint-auth-module"
+intent = "check auth logic"
+file_hints = ["src/auth.rs"]
+expected_pivots = ["src/auth.rs::AuthHandler", "src/auth.rs::AuthHandler::validate"]
+tag = "file_hint"
+
+[[case]]
+name = "filehint-database-module"
+intent = "review database operations"
+file_hints = ["src/database.rs"]
+expected_pivots = ["src/database.rs::DatabasePool", "src/database.rs::DatabasePool::execute_query"]
+tag = "file_hint"
+
+# --- low_confidence tag: no intent signals, keyword matching still works ---
+
+[[case]]
+name = "lowconf-auth-flow"
+intent = "understand auth handler flow"
+expected_pivots = ["src/auth.rs::AuthHandler", "src/auth.rs::AuthHandler::validate"]
+tag = "low_confidence"
+exercises = ["LOW_CONFIDENCE_THRESHOLD", "LOW_CONFIDENCE_PIVOT_POOL"]
+
+[case.expected_policy]
+depth = 2
+include_inbound = false
+inbound_first = false
+
+[[case]]
+name = "lowconf-config-setup"
+intent = "check config manager setup"
+expected_pivots = ["src/config.rs::ConfigManager", "src/config.rs::ConfigManager::parse"]
+tag = "low_confidence"
+exercises = ["LOW_CONFIDENCE_THRESHOLD", "LOW_CONFIDENCE_PIVOT_POOL"]
+
+[case.expected_policy]
+depth = 2
+include_inbound = false
+inbound_first = false
+
+# --- bugfix tag: exercises INBOUND_BLEND_THRESHOLD ---
+# "fix" and "bug" are <=3 chars but classify intent as bugfix.
+# Longer terms ("auth", "validate", "error") drive keyword ranking.
+
+[[case]]
+name = "bugfix-auth-validate"
+intent = "fix auth handler validate error"
+expected_pivots = ["src/auth.rs::AuthHandler::validate", "src/auth.rs::AuthError"]
+tag = "bugfix"
+exercises = ["INBOUND_BLEND_THRESHOLD"]
+
+[case.expected_policy]
+depth = 2
+include_inbound = true
+inbound_first = true
+
+[[case]]
+name = "bugfix-database-error"
+intent = "debug database connection error crash"
+expected_pivots = ["src/database.rs::DatabasePool::connect", "src/database.rs::DatabaseError"]
+tag = "bugfix"
+exercises = ["INBOUND_BLEND_THRESHOLD"]
+
+[case.expected_policy]
+depth = 2
+include_inbound = true
+inbound_first = true
+
+# --- refactor tag: exercises REFACTOR_DEPTH_THRESHOLD ---
+
+[[case]]
+name = "refactor-config-extract"
+intent = "refactor config manager extract validator"
+expected_pivots = ["src/config.rs::ConfigManager", "src/config.rs::ConfigValidator"]
+tag = "refactor"
+exercises = ["REFACTOR_DEPTH_THRESHOLD", "INBOUND_BLEND_THRESHOLD"]
+
+[case.expected_policy]
+depth = 3
+include_inbound = true
+inbound_first = false
+
+[[case]]
+name = "refactor-handler-restructure"
+intent = "refactor request handler restructure middleware"
+expected_pivots = ["src/handler.rs::RequestHandler", "src/handler.rs::RequestHandler::middleware_chain"]
+tag = "refactor"
+exercises = ["REFACTOR_DEPTH_THRESHOLD", "INBOUND_BLEND_THRESHOLD"]
+
+[case.expected_policy]
+depth = 3
+include_inbound = true
+inbound_first = false
+
+# --- impl tag: implementation-mode queries ---
+
+[[case]]
+name = "impl-handler-middleware"
+intent = "implement request handler middleware pipeline"
+expected_pivots = ["src/handler.rs::RequestHandler::middleware_chain", "src/handler.rs::RequestHandler"]
+tag = "impl"
+exercises = []
+
+[case.expected_policy]
+depth = 2
+include_inbound = false
+inbound_first = false
+
+[[case]]
+name = "impl-database-migration"
+intent = "implement database migration runner system"
+expected_pivots = ["src/database.rs::MigrationRunner::apply_migrations", "src/database.rs::MigrationRunner"]
+tag = "impl"
+exercises = []
+
+[case.expected_policy]
+depth = 2
+include_inbound = false
+inbound_first = false
+
+# --- fallback tag: no keyword matches (all terms <=3 chars or nonsense) ---
+
+[[case]]
+name = "fallback-no-matches"
+intent = "xyz qqq zzz"
+expected_pivots = []
+tag = "fallback"

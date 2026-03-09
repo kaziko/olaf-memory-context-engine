@@ -18,4 +18,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check
       - run: cargo test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-retrieval-results
+          path: target/bench_retrieval_results.json
+          if-no-files-found: ignore
       - run: cargo clippy -- -D warnings
