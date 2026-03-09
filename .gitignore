@@ -7,3 +7,4 @@ _bmad-output/
 # Local machine config — contains absolute paths, not for commit
 .mcp.json
 .claude/settings.local.json
+site/

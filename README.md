@@ -1,8 +1,8 @@
-# olaf
+# Olaf
 
 ![Olaf](docs/hero.png)
 
-**Codebase context engine for Claude Code.**
+**Codebase context engine and session memory for Claude Code.**
 
 Olaf is a codebase indexing and context retrieval engine that integrates with Claude Code via the Model Context Protocol (MCP). It parses your project's source files (TypeScript, JavaScript, Python, Rust, PHP, Go), stores symbol-level summaries in a local SQLite database, and serves them to Claude Code on demand — so the AI always has accurate, up-to-date context about your codebase without reading every file on each request.
 
@@ -59,28 +59,18 @@ Linux binaries are fully static — no glibc dependency.
 
 ## Quick Start
 
-**1. Index your project:**
+**1. Initialize Olaf:**
 
 ```sh
 cd /path/to/your/project
 olaf init
 ```
 
-**2. Configure Claude Code MCP** — `olaf init` writes this automatically to `.mcp.json`:
+This creates the `.olaf/` database, registers the MCP server in `.mcp.json`, installs Claude Code hooks, writes tool preference rules, and runs the initial index — all in one command.
 
-```json
-{
-  "mcpServers": {
-    "olaf": {
-      "command": "/path/to/olaf",
-      "args": ["serve"],
-      "type": "stdio"
-    }
-  }
-}
-```
+**2. Open Claude Code** — it reads `.mcp.json` on startup and connects to Olaf automatically.
 
-**3. Use in Claude Code** — Olaf exposes these MCP tools to Claude:
+**3. Use it** — Olaf exposes these MCP tools to Claude:
 
 **Context retrieval:**
 - `get_brief` — start here. Context brief for any task with optional impact analysis

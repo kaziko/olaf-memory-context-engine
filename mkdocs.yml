@@ -1,0 +1,70 @@
+site_name: Olaf
+site_description: Codebase context engine and session memory for Claude Code
+site_url: https://kaziko.github.io/olaf-memory-context-engine
+repo_url: https://github.com/kaziko/olaf-memory-context-engine
+repo_name: kaziko/olaf-memory-context-engine
+
+theme:
+  name: material
+  logo: assets/hero.png
+  favicon: assets/hero.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.integrate
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - def_list
+
+exclude_docs: |
+  CLAUDE.md
+  **/CLAUDE.md
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quick-start.md
+    - Verify & Troubleshoot: getting-started/troubleshooting.md
+    - Upgrade: getting-started/upgrade.md
+  - Guide:
+    - How Claude Uses Olaf: guide/how-claude-uses-olaf.md
+    - Session Memory: guide/session-memory.md
+    - Project Rules: guide/project-rules.md
+    - Content Policy: guide/content-policy.md
+    - Tool Preference Rules: guide/tool-preference-rules.md
+    - Multi-Repo Workspaces: guide/workspaces.md
+    - Undoing AI Edits: guide/undo.md
+  - Reference:
+    - MCP Tools: reference/mcp-tools.md
+    - CLI Commands: reference/cli.md
+    - Known Limitations: reference/known-limitations.md
