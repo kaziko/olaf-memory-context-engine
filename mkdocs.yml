@@ -68,4 +68,5 @@ nav:
   - Reference:
     - MCP Tools: reference/mcp-tools.md
     - CLI Commands: reference/cli.md
+    - Benchmarks: reference/benchmarks.md
     - Known Limitations: reference/known-limitations.md

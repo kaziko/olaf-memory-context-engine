@@ -29,6 +29,17 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 - **Failure analysis** — parse stack traces and get context briefs focused on the error path
 - **Multi-repo workspaces** — federated context retrieval across linked repositories via `.olaf/workspace.toml` (pivot search and context assembly span repos; impact analysis, memory, and graph traversal remain local per-repo)
 
+### How much does it save?
+
+We benchmarked two real tasks on Olaf's own codebase — understanding the ranking algorithm and tracing an MCP request across modules:
+
+| | Regular tools (Grep + Read) | Olaf | Savings |
+|-|-|-|-|
+| Ranking algorithm | ~6,000 tokens / 5-7 calls | ~1,950 tokens / 1 call | **68%** |
+| Cross-module trace | ~5,550 tokens / 7 calls | ~1,800 tokens / 1 call | **68%** |
+
+One tool call instead of seven. The gap widens on larger codebases where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
+
 ## Install
 
 ### Homebrew (macOS) (recommended)
