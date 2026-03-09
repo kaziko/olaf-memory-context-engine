@@ -219,7 +219,7 @@ fn handle_session_end(payload: &olaf::memory::HookPayload, cwd: &std::path::Path
             |r| r.get::<_, i64>(0),
         ).ok().map(|secs| (secs as u128) * 1000)
     };
-    if let Err(e) = olaf::restore::cleanup_old_restore_points(&cwd, protect_ms) {
+    if let Err(e) = olaf::restore::cleanup_old_restore_points(cwd, protect_ms) {
         log::debug!("observe session-end: restore cleanup failed: {e}");
         if monitor_active {
             olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
@@ -319,7 +319,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Pa
 
             // Track whether an observation was actually stored (not just a body-only diff)
             let mut obs_stored = false;
-            let kind = match olaf::index::reindex_single_file(&mut conn, &cwd, &rel_path) {
+            let kind = match olaf::index::reindex_single_file(&mut conn, cwd, &rel_path) {
                 Ok(olaf::index::ReindexOutcome::Changed(diff)) => {
                     if let Some(content) = olaf::memory::format_structural_observation(&diff) {
                         olaf::memory::insert_auto_observation(

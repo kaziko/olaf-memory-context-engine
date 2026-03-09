@@ -50,7 +50,7 @@ pub fn resolve_worktree_root(cwd: &Path) -> PathBuf {
     // Walk up from gitdir looking for the .git directory boundary.
     let mut ancestor = canonical.as_path();
     loop {
-        if ancestor.file_name().map_or(false, |n| n == ".git") {
+        if ancestor.file_name().is_some_and(|n| n == ".git") {
             // Found the .git directory — parent is the main repo root
             if let Some(repo_root) = ancestor.parent() {
                 return repo_root.to_path_buf();
