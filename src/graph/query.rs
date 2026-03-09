@@ -609,6 +609,7 @@ fn format_intent_header(profile: &IntentProfile, intent: &str) -> String {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_context_brief(
     conn: &Connection,
     project_root: &Path,

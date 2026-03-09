@@ -199,9 +199,9 @@ fn print_event(ev: &EventRow, json: bool, use_color: bool) {
 
     if use_color {
         let source_colored = match ev.source.as_str() {
-            "mcp" => format!("\x1b[36m[mcp]\x1b[0m"),  // cyan
-            "hook" => format!("\x1b[33m[hook]\x1b[0m"), // yellow
-            "cli" => format!("\x1b[32m[cli]\x1b[0m"),   // green
+            "mcp" => "\x1b[36m[mcp]\x1b[0m".to_string(),  // cyan
+            "hook" => "\x1b[33m[hook]\x1b[0m".to_string(), // yellow
+            "cli" => "\x1b[32m[cli]\x1b[0m".to_string(),   // green
             s => format!("[{s}]"),
         };
         let dim = "\x1b[2m";

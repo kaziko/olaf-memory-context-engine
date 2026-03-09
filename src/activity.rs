@@ -33,12 +33,11 @@ pub fn is_monitor_active(project_root: &Path) -> bool {
     for path in &paths {
         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
             // monitor.{pid}.pid -> extract middle part
-            if let Some(pid_str) = fname.strip_prefix("monitor.").and_then(|s| s.strip_suffix(".pid")) {
-                if let Ok(pid) = pid_str.parse::<i32>() {
-                    if is_pid_alive(pid) {
-                        return true;
-                    }
-                }
+            if let Some(pid_str) = fname.strip_prefix("monitor.").and_then(|s| s.strip_suffix(".pid"))
+                && let Ok(pid) = pid_str.parse::<i32>()
+                && is_pid_alive(pid)
+            {
+                return true;
             }
         }
     }

@@ -209,7 +209,7 @@ fn detect_rule_candidates(
 
     let mut candidates = Vec::new();
 
-    for (_scope_key, indices) in &groups {
+    for indices in groups.values() {
         if indices.len() < 3 {
             continue;
         }
@@ -681,7 +681,7 @@ pub(crate) fn mark_rules_stale(
     }
 
     let mut param_idx = 3; // ?1=reason, ?2=updated_at
-    let branch_clause = if let Some(_) = branch {
+    let branch_clause = if branch.is_some() {
         let bp = param_idx;
         param_idx += 1;
         format!("AND (branch = ?{} OR branch IS NULL)", bp)

@@ -17,17 +17,17 @@ pub(crate) fn run(event: &str) -> anyhow::Result<()> {
     // Phase 2: handle event (if this fails, we can emit an error event using cwd)
     if let Err(ref e) = handle_event(event, &payload, monitor_active) {
         log::debug!("observe: {e}");
-        if monitor_active {
-            if let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db")) {
-                olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
-                    source: "hook",
-                    event_type: "hook_error",
-                    summary: olaf::activity::truncate(&e.to_string(), 120),
-                    is_error: true,
-                    error_message: Some(olaf::activity::sanitize_error(&e.to_string(), 200)),
-                    ..Default::default()
-                });
-            }
+        if monitor_active
+            && let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db"))
+        {
+            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+                source: "hook",
+                event_type: "hook_error",
+                summary: olaf::activity::truncate(&e.to_string(), 120),
+                is_error: true,
+                error_message: Some(olaf::activity::sanitize_error(&e.to_string(), 200)),
+                ..Default::default()
+            });
         }
     }
     Ok(())
@@ -117,21 +117,21 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool
     let elapsed = start.elapsed();
     log::debug!("observe pre-tool-use: snapshot completed in {:?}", elapsed);
 
-    if monitor_active {
-        if let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db")) {
-            let summary = if olaf::memory::is_sensitive_path(&rel_file_path) {
-                "Snapshot: <redacted>".to_string()
-            } else {
-                format!("Snapshot: {rel_file_path}")
-            };
-            olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
-                source: "hook",
-                event_type: "snapshot",
-                summary,
-                duration_ms: Some(elapsed.as_millis() as u64),
-                ..Default::default()
-            });
-        }
+    if monitor_active
+        && let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db"))
+    {
+        let summary = if olaf::memory::is_sensitive_path(&rel_file_path) {
+            "Snapshot: <redacted>".to_string()
+        } else {
+            format!("Snapshot: {rel_file_path}")
+        };
+        olaf::activity::emit(&conn, olaf::activity::ActivityEvent {
+            source: "hook",
+            event_type: "snapshot",
+            summary,
+            duration_ms: Some(elapsed.as_millis() as u64),
+            ..Default::default()
+        });
     }
 
     Ok(())

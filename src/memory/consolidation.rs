@@ -129,7 +129,7 @@ fn find_and_merge_duplicates(
 
     let mut total_consolidated = 0usize;
 
-    for (_key, indices) in &groups {
+    for indices in groups.values() {
         if indices.len() < 2 {
             continue;
         }
@@ -228,9 +228,9 @@ fn single_linkage_cluster(
 
     // Collect clusters
     let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..n {
+    for (i, &idx) in indices.iter().enumerate().take(n) {
         let root = find(&mut parent, i);
-        cluster_map.entry(root).or_default().push(indices[i]);
+        cluster_map.entry(root).or_default().push(idx);
     }
 
     cluster_map.into_values().collect()

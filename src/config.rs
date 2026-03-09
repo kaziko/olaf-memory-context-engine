@@ -34,12 +34,7 @@ pub fn detect_git_branch(project_root: &Path) -> Option<String> {
     let head_content = std::fs::read_to_string(&head_path).ok()?;
     let head = head_content.trim();
 
-    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-        Some(branch.to_string())
-    } else {
-        // Detached HEAD (raw SHA or other ref)
-        None
-    }
+    head.strip_prefix("ref: refs/heads/").map(|branch| branch.to_string())
 }
 
 #[cfg(test)]
