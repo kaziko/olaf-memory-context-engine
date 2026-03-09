@@ -10,8 +10,8 @@ pub(crate) enum ReconcileAction {
 }
 
 pub(crate) fn print_branding() {
-    println!("olaf  codebase context engine for Claude Code");
-    println!("─────────────────────────────────────────────");
+    println!("Olaf ver. {} — codebase context engine for Claude Code", env!("CARGO_PKG_VERSION"));
+    println!("─────────────────────────────────────────────────────");
 }
 
 /// Creates `.olaf/` if absent. Returns `true` if created.
