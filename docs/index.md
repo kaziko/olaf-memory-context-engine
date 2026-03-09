@@ -83,10 +83,11 @@ cd /path/to/your/project
 olaf init
 ```
 
-`olaf init` does four things automatically:
+`olaf init` does five things automatically:
 - Creates `.olaf/` — local database directory
 - Registers the MCP server in `.mcp.json` — Claude Code reads this to connect
 - Installs hooks in `.claude/settings.local.json` — enables passive observation capture and shadow snapshots
+- Writes tool preference rules to `.claude/rules/olaf-tools.md` — guides Claude to prefer Olaf MCP tools over native file reads
 - Runs the initial index — scans your project files and builds the symbol graph
 
 ### 3. Open Claude Code
@@ -378,6 +379,18 @@ reason = "Auth internals — signatures visible, bodies hidden"
 - Policy is loaded fresh on every tool call — create, edit, or delete the file and changes take effect immediately without restarting the server
 - Malformed policy files are ignored with a warning — the server never crashes due to policy errors
 - Deny takes precedence over redact when both match the same path
+
+### Tool preference rules
+
+`olaf init` writes a rules file at `.claude/rules/olaf-tools.md` that teaches Claude when to use Olaf MCP tools instead of native file reads. The rules include:
+
+- **Tool routing table** — maps common tasks (explore codebase, analyze dependencies, diagnose errors) to the appropriate Olaf tool
+- **Freshness guidance** — which tools auto-reindex after edits and which require a manual reindex
+- **When to use native tools** — editing, running commands, reading a single known file, or narrow keyword searches are still best done with Edit/Write, Bash, Read, and Grep
+
+The rules file includes a content hash in a marker comment. On each `olaf init`, Olaf compares the hash to detect drift — if the template has changed (e.g., after an Olaf upgrade), the file is regenerated. `olaf status` reports the rules file state: `current`, `outdated`, `missing`, or `malformed`.
+
+You can edit the file freely. If you want to restore the default content, delete it and re-run `olaf init`.
 
 ### Multi-repo workspaces
 
