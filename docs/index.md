@@ -25,7 +25,7 @@ Claude Code reads files. A lot of them. On every request it may scan dozens of s
 
 - **Free**
 
----
+    ---
 
     Because why not. Olaf is open source and runs entirely on your machine.
 
