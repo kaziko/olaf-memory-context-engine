@@ -147,8 +147,14 @@ pub(crate) fn path_hash(rel_file_path: &str) -> String {
 /// Returns `Ok(())` on success. Returns `Err(RestoreError::Io)` only for errors
 /// other than `NotFound` — callers in `cli/observe.rs` convert to `anyhow::Error`
 /// and the outer `run()` swallows it, ensuring exit 0 (AC7).
-pub fn snapshot(cwd: &std::path::Path, rel_file_path: &str) -> Result<(), RestoreError> {
-    let abs_path = cwd.join(rel_file_path);
+/// Create a snapshot of a file before it is modified.
+///
+/// `storage_root` is where `.olaf/restores/` lives (the canonical project root).
+/// `source_root` is where the actual file lives — same as `storage_root` for normal
+/// repos, but may be a worktree path for worktree-isolated subagents.
+pub fn snapshot(storage_root: &std::path::Path, rel_file_path: &str, source_root: Option<&std::path::Path>) -> Result<(), RestoreError> {
+    let read_root = source_root.unwrap_or(storage_root);
+    let abs_path = read_root.join(rel_file_path);
 
     // TOCTOU-safe read: single syscall, match on NotFound for AC3
     let contents = match std::fs::read(&abs_path) {
@@ -165,7 +171,7 @@ pub fn snapshot(cwd: &std::path::Path, rel_file_path: &str) -> Result<(), Restor
     let pid = std::process::id(); // u32
     let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed); // unique within process per call
 
-    let snap_dir = cwd.join(".olaf").join("restores").join(&hash);
+    let snap_dir = storage_root.join(".olaf").join("restores").join(&hash);
     std::fs::create_dir_all(&snap_dir)?;
 
     // Filename: <millis>-<pid>-<seq>.snap
@@ -348,7 +354,7 @@ mod tests {
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join("main.rs"), b"fn main() {}").unwrap();
 
-        snapshot(tmpdir.path(), "src/main.rs").unwrap();
+        snapshot(tmpdir.path(), "src/main.rs", None).unwrap();
 
         let expected_hash = path_hash("src/main.rs");
         let snap_dir = tmpdir.path().join(".olaf").join("restores").join(&expected_hash);
@@ -370,7 +376,7 @@ mod tests {
     fn test_snapshot_nonexistent_file_is_noop() {
         let tmpdir = tempfile::tempdir().unwrap();
 
-        let result = snapshot(tmpdir.path(), "src/main.rs");
+        let result = snapshot(tmpdir.path(), "src/main.rs", None);
         assert!(result.is_ok());
 
         let restores_dir = tmpdir.path().join(".olaf").join("restores");
@@ -383,7 +389,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         std::fs::write(tmpdir.path().join("file.txt"), b"hello").unwrap();
 
-        snapshot(tmpdir.path(), "file.txt").unwrap();
+        snapshot(tmpdir.path(), "file.txt", None).unwrap();
 
         let hash = path_hash("file.txt");
         let snap_dir = tmpdir.path().join(".olaf").join("restores").join(&hash);
@@ -402,10 +408,10 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         std::fs::write(tmpdir.path().join("data.txt"), b"version1").unwrap();
 
-        snapshot(tmpdir.path(), "data.txt").unwrap();
+        snapshot(tmpdir.path(), "data.txt", None).unwrap();
         std::thread::sleep(Duration::from_millis(2));
         std::fs::write(tmpdir.path().join("data.txt"), b"version2").unwrap();
-        snapshot(tmpdir.path(), "data.txt").unwrap();
+        snapshot(tmpdir.path(), "data.txt", None).unwrap();
 
         let hash = path_hash("data.txt");
         let snap_dir = tmpdir.path().join(".olaf").join("restores").join(&hash);

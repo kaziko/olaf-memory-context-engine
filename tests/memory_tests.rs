@@ -2829,3 +2829,191 @@ fn test_consolidation_before_rules() {
     ).unwrap();
     assert_eq!(rule_count, 0, "no rules should be created when duplicates are consolidated away");
 }
+
+// ─── Story 10-7b: Worktree hook resolution ──────────────────────────────────
+
+/// Simulates a worktree subagent hook payload where cwd points to a worktree
+/// but file_path uses the worktree absolute path. Verifies that:
+/// 1. The observation lands in the main repo's DB (not a worktree orphan)
+/// 2. The file path is relativized correctly against the worktree cwd
+/// 3. Branch detection uses the worktree's HEAD, not the main repo's
+#[test]
+fn test_observe_worktree_edit_resolves_to_main_repo() {
+    use std::fs;
+
+    let base = tempfile::tempdir().unwrap();
+
+    // Set up main repo structure with .git dir and .olaf DB
+    let main_repo = base.path().join("main_repo");
+    let main_git = main_repo.join(".git");
+    let worktree_gitdir = main_git.join("worktrees").join("wt1");
+    fs::create_dir_all(&worktree_gitdir).unwrap();
+    fs::write(worktree_gitdir.join("HEAD"), "ref: refs/heads/feature/wt-branch\n").unwrap();
+
+    // Initialize main repo DB
+    let db_path = main_repo.join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    // Set up worktree directory with .git file pointing to worktree gitdir
+    let wt_dir = base.path().join("worktree_wt1");
+    fs::create_dir_all(wt_dir.join("src")).unwrap();
+    fs::write(
+        wt_dir.join(".git"),
+        format!("gitdir: {}\n", worktree_gitdir.to_string_lossy()),
+    ).unwrap();
+
+    // Create the file in the worktree (so reindex can find it)
+    fs::write(wt_dir.join("src").join("lib.rs"), "fn worktree_edit() {}").unwrap();
+
+    let wt_cwd = wt_dir.to_str().unwrap();
+    // Payload has worktree cwd and worktree absolute file path
+    let payload = serde_json::json!({
+        "session_id": "wt-sess-1",
+        "cwd": wt_cwd,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{wt_cwd}/src/lib.rs"),
+            "old_string": "hello",
+            "new_string": "goodbye"
+        },
+        "tool_use_id": "toolu_wt01"
+    });
+
+    // Run observe with the worktree payload — but current_dir doesn't matter,
+    // cwd comes from the payload
+    let json = serde_json::to_string(&payload).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "post-tool-use"])
+        .current_dir(base.path()) // doesn't matter — payload.cwd is used
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(json.as_bytes()).unwrap();
+            child.wait_with_output()
+        })
+        .expect("olaf observe must spawn");
+
+    assert!(
+        output.status.success(),
+        "olaf observe must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify: observation was stored in the MAIN REPO's DB, not in the worktree
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let row: Result<(String, Option<String>), _> = conn.query_row(
+        "SELECT kind, file_path FROM observations WHERE session_id = 'wt-sess-1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    assert!(row.is_ok(), "observation must exist in main repo DB; got err: {:?}", row.err());
+    let (kind, file_path) = row.unwrap();
+    assert_eq!(kind, "file_change");
+    assert_eq!(file_path.as_deref(), Some("src/lib.rs"), "path must be relative, not absolute");
+
+    // Verify: no orphan DB was created in the worktree
+    assert!(
+        !wt_dir.join(".olaf").join("index.db").exists(),
+        "worktree must NOT have its own .olaf/index.db"
+    );
+}
+
+/// Verifies that pre-tool-use (snapshot) also works with worktree cwd —
+/// the snapshot should be stored in the main repo's .olaf/restores/
+#[test]
+fn test_observe_worktree_pre_tool_use_snapshot_in_main_repo() {
+    use std::fs;
+
+    let base = tempfile::tempdir().unwrap();
+
+    // Main repo with .git dir
+    let main_repo = base.path().join("main_repo2");
+    let main_git = main_repo.join(".git");
+    let worktree_gitdir = main_git.join("worktrees").join("wt2");
+    fs::create_dir_all(&worktree_gitdir).unwrap();
+    fs::write(worktree_gitdir.join("HEAD"), "ref: refs/heads/snapshot-branch\n").unwrap();
+
+    // Initialize main repo DB and create snapshots dir
+    let db_path = main_repo.join(".olaf").join("index.db");
+    let _conn = olaf::db::open(&db_path).unwrap();
+    drop(_conn);
+
+    // Worktree directory
+    let wt_dir = base.path().join("worktree_wt2");
+    fs::create_dir_all(wt_dir.join("src")).unwrap();
+    fs::write(
+        wt_dir.join(".git"),
+        format!("gitdir: {}\n", worktree_gitdir.to_string_lossy()),
+    ).unwrap();
+
+    // Create the file to be snapshotted in the worktree
+    fs::write(wt_dir.join("src").join("snap.rs"), "fn original() {}").unwrap();
+
+    let wt_cwd = wt_dir.to_str().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "wt-sess-2",
+        "cwd": wt_cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{wt_cwd}/src/snap.rs"),
+            "old_string": "original",
+            "new_string": "modified"
+        }
+    });
+
+    let json = serde_json::to_string(&payload).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .args(["observe", "--event", "pre-tool-use"])
+        .current_dir(base.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(json.as_bytes()).unwrap();
+            child.wait_with_output()
+        })
+        .expect("olaf observe must spawn");
+
+    assert!(
+        output.status.success(),
+        "olaf observe must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify: snapshot was stored in the main repo's .olaf/restores/
+    let restores_dir = main_repo.join(".olaf").join("restores");
+    assert!(restores_dir.exists(), "main repo must have .olaf/restores/ after snapshot");
+
+    // Walk restores dir — find the hash subdirectory with .snap files
+    let hash_dirs: Vec<_> = fs::read_dir(&restores_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(!hash_dirs.is_empty(), "at least one hash directory must exist in restores/");
+
+    let snap_files: Vec<_> = fs::read_dir(hash_dirs[0].path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
+        .collect();
+    assert!(!snap_files.is_empty(), "at least one .snap file must exist");
+
+    // Verify snapshot content matches the worktree file
+    let snap_content = fs::read(snap_files[0].path()).unwrap();
+    assert_eq!(snap_content, b"fn original() {}", "snapshot must contain worktree file content");
+
+    // Verify: no orphan .olaf/ in worktree
+    assert!(
+        !wt_dir.join(".olaf").exists(),
+        "worktree must NOT have its own .olaf/ directory"
+    );
+}

@@ -11,11 +11,15 @@ pub(crate) fn run(event: &str) -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let cwd = PathBuf::from(&payload.cwd);
+    let raw_cwd = PathBuf::from(&payload.cwd);
+    let cwd = olaf::config::resolve_worktree_root(&raw_cwd);
+    if cwd != raw_cwd {
+        log::debug!("observe: resolved worktree cwd {} → {}", raw_cwd.display(), cwd.display());
+    }
     let monitor_active = olaf::activity::is_monitor_active(&cwd);
 
     // Phase 2: handle event (if this fails, we can emit an error event using cwd)
-    if let Err(ref e) = handle_event(event, &payload, monitor_active) {
+    if let Err(ref e) = handle_event(event, &payload, &cwd, &raw_cwd, monitor_active) {
         log::debug!("observe: {e}");
         if monitor_active
             && let Ok(conn) = olaf::db::open(&cwd.join(".olaf/index.db"))
@@ -46,11 +50,11 @@ fn read_and_parse_payload() -> anyhow::Result<olaf::memory::HookPayload> {
     }
 }
 
-fn handle_event(event: &str, payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
+fn handle_event(event: &str, payload: &olaf::memory::HookPayload, cwd: &std::path::Path, raw_cwd: &std::path::Path, monitor_active: bool) -> anyhow::Result<()> {
     match event {
-        "pre-tool-use" => handle_pre_tool_use(payload, monitor_active),
-        "post-tool-use" => handle_post_tool_use(payload, monitor_active),
-        "session-end" => handle_session_end(payload, monitor_active),
+        "pre-tool-use" => handle_pre_tool_use(payload, cwd, raw_cwd, monitor_active),
+        "post-tool-use" => handle_post_tool_use(payload, cwd, raw_cwd, monitor_active),
+        "session-end" => handle_session_end(payload, cwd, raw_cwd, monitor_active),
         _ => {
             log::debug!("observe: unhandled event: {event}");
             Ok(())
@@ -58,7 +62,28 @@ fn handle_event(event: &str, payload: &olaf::memory::HookPayload, monitor_active
     }
 }
 
-fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
+/// Relativize an absolute file path against project root, trying raw_cwd first (for worktree
+/// paths) then resolved cwd. Rejects paths with `..` components.
+fn relativize_path(abs_path: &str, cwd: &std::path::Path, raw_cwd: &std::path::Path) -> Option<String> {
+    // Try raw_cwd first (matches worktree absolute paths), then resolved cwd
+    let candidates = if raw_cwd != cwd { &[raw_cwd, cwd][..] } else { &[cwd][..] };
+    for base in candidates {
+        if let Ok(rel) = std::path::Path::new(abs_path).strip_prefix(base) {
+            let mut normalized = std::path::PathBuf::new();
+            for component in rel.components() {
+                match component {
+                    std::path::Component::ParentDir => return None,
+                    std::path::Component::CurDir => {}
+                    c => normalized.push(c),
+                }
+            }
+            return Some(normalized.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Path, raw_cwd: &std::path::Path, monitor_active: bool) -> anyhow::Result<()> {
     // AC5: Only snapshot for Edit/Write tools
     match payload.tool_name.as_deref() {
         Some("Edit") | Some("Write") => {}
@@ -81,30 +106,11 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool
         return Ok(());
     }
 
-    let cwd = PathBuf::from(&payload.cwd);
-
     // AC8: Enforce project root boundary — reject paths outside cwd.
-    let rel_file_path = match std::path::Path::new(abs_file_path).strip_prefix(&cwd) {
-        Ok(rel) => {
-            let mut normalized = std::path::PathBuf::new();
-            for component in rel.components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        log::debug!(
-                            "observe pre-tool-use: rejecting path with .. component: {abs_file_path}"
-                        );
-                        return Ok(());
-                    }
-                    std::path::Component::CurDir => {}
-                    c => normalized.push(c),
-                }
-            }
-            normalized.to_string_lossy().into_owned()
-        }
-        Err(_) => {
-            log::debug!(
-                "observe pre-tool-use: skipping path outside project root: {abs_file_path}"
-            );
+    let rel_file_path = match relativize_path(abs_file_path, cwd, raw_cwd) {
+        Some(p) => p,
+        None => {
+            log::debug!("observe pre-tool-use: skipping path outside project root: {abs_file_path}");
             return Ok(());
         }
     };
@@ -112,7 +118,9 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool
     let start = std::time::Instant::now();
 
     // AC3: non-existent file handled inside snapshot() via NotFound match
-    olaf::restore::snapshot(&cwd, &rel_file_path)?;
+    // For worktree subagents: read file from raw_cwd (worktree), store snapshot in cwd (main repo)
+    let source = if raw_cwd != cwd { Some(raw_cwd) } else { None };
+    olaf::restore::snapshot(cwd, &rel_file_path, source)?;
 
     let elapsed = start.elapsed();
     log::debug!("observe pre-tool-use: snapshot completed in {:?}", elapsed);
@@ -137,14 +145,13 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool
     Ok(())
 }
 
-fn handle_session_end(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
+fn handle_session_end(payload: &olaf::memory::HookPayload, cwd: &std::path::Path, raw_cwd: &std::path::Path, monitor_active: bool) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
-    let cwd = PathBuf::from(&payload.cwd);
     let mut conn = olaf::db::open(&cwd.join(".olaf/index.db"))
         .map_err(|e| { log::debug!("observe session-end: DB open failed: {e}"); e })?;
     olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
     olaf::memory::mark_session_ended(&conn, &payload.session_id)?;
-    let branch = olaf::config::detect_git_branch(&cwd);
+    let branch = olaf::config::detect_git_branch(raw_cwd);
     let ran = olaf::memory::run_session_end_pipeline(&mut conn, &payload.session_id, branch.as_deref())?;
 
     if !ran {
@@ -230,13 +237,11 @@ fn handle_session_end(payload: &olaf::memory::HookPayload, monitor_active: bool)
     Ok(())
 }
 
-fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: bool) -> anyhow::Result<()> {
+fn handle_post_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Path, raw_cwd: &std::path::Path, monitor_active: bool) -> anyhow::Result<()> {
     let tool_name = match payload.tool_name.as_deref() {
         Some(t) => t,
         None => return Ok(()),
     };
-
-    let cwd = PathBuf::from(&payload.cwd);
 
     match tool_name {
         "Bash" => {
@@ -253,7 +258,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: boo
                     return Ok(());
                 }
             };
-            let branch = olaf::config::detect_git_branch(&cwd);
+            let branch = olaf::config::detect_git_branch(raw_cwd);
             olaf::memory::upsert_session(&conn, &result.session_id, "claude-code")?;
             olaf::memory::insert_auto_observation(
                 &conn,
@@ -290,19 +295,9 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: boo
                 None => return Ok(()),
             };
 
-            let rel_path = match std::path::Path::new(abs_path).strip_prefix(&cwd) {
-                Ok(rel) => {
-                    let mut normalized = std::path::PathBuf::new();
-                    for component in rel.components() {
-                        match component {
-                            std::path::Component::ParentDir => return Ok(()),
-                            std::path::Component::CurDir => {}
-                            c => normalized.push(c),
-                        }
-                    }
-                    normalized.to_string_lossy().into_owned()
-                }
-                Err(_) => return Ok(()),
+            let rel_path = match relativize_path(abs_path, cwd, raw_cwd) {
+                Some(p) => p,
+                None => return Ok(()),
             };
 
             if olaf::memory::is_sensitive_path(&rel_path) {
@@ -319,7 +314,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: boo
                 }
             };
 
-            let branch = olaf::config::detect_git_branch(&cwd);
+            let branch = olaf::config::detect_git_branch(raw_cwd);
             olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
 
             // Track whether an observation was actually stored (not just a body-only diff)
@@ -419,7 +414,7 @@ fn handle_post_tool_use(payload: &olaf::memory::HookPayload, monitor_active: boo
                     return Ok(());
                 }
             };
-            let branch = olaf::config::detect_git_branch(&cwd);
+            let branch = olaf::config::detect_git_branch(raw_cwd);
             olaf::memory::upsert_session(&conn, &payload.session_id, "claude-code")?;
             olaf::memory::insert_auto_observation(
                 &conn,
