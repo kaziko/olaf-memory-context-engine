@@ -12,8 +12,10 @@ pub use compression::{run_compression, DEFAULT_COMPRESSION_THRESHOLD_SECS, DEFAU
 pub use consolidation::consolidate_observations;
 pub use rules::detect_and_write_rules;
 pub use store::{
-    Importance, SessionSummary, get_session_observations, insert_auto_observation,
-    is_sensitive_path, list_sessions, mark_session_ended, upsert_session,
+    Importance, MemoryHealthReport, ResolvedBranchScope, SessionSummary,
+    format_memory_health_markdown, format_memory_health_summary, get_session_observations,
+    insert_auto_observation, is_sensitive_path, list_sessions, mark_session_ended,
+    memory_health_report, upsert_session,
 };
 
 /// Atomically detect anti-patterns and compress a session in a single BEGIN IMMEDIATE

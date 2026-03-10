@@ -275,6 +275,19 @@ pub(crate) fn list() -> Vec<Value> {
                 "required": ["edges"]
             }
         }),
+        serde_json::json!({
+            "name": "memory_health",
+            "description": "Read-only memory diagnostics: observation counts (by kind, importance, scope, staleness), rule states, session stats, and recommendations. Does NOT trigger reindexing, consolidation, or any mutations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch filter. Omit to auto-detect current branch, 'all' for cross-branch report."
+                    }
+                }
+            }
+        }),
     ]
 }
 
@@ -302,6 +315,7 @@ pub(crate) fn dispatch(ws: &mut crate::workspace::Workspace, session_id: &str, p
         "undo_change"          => { let (c, r) = ws.local_parts(); handle_undo_change(c, r, session_id, args) }
         "trace_flow"           => { let cp = ContentPolicy::load(ws.local_root()); handle_trace_flow(ws.local_conn(), args, &cp) }
         "submit_lsp_edges"     => handle_submit_lsp_edges(ws.local_conn(), args),
+        "memory_health"        => { let (c, r) = ws.local_parts(); handle_memory_health(c, r, args) }
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
     }
 }
@@ -1518,9 +1532,41 @@ fn handle_submit_lsp_edges(
     Ok(serde_json::to_string_pretty(&response).unwrap())
 }
 
+fn handle_memory_health(
+    conn: &mut rusqlite::Connection,
+    project_root: &Path,
+    args: Option<&Value>,
+) -> Result<String, ToolError> {
+    use crate::memory::store::{ResolvedBranchScope, memory_health_report, format_memory_health_markdown};
+
+    let scope = match args.and_then(|a| a.get("branch")).and_then(|b| b.as_str()) {
+        Some("all") => ResolvedBranchScope::All,
+        Some(b) => ResolvedBranchScope::Branch(b.to_string()),
+        None => {
+            match crate::config::detect_git_branch(project_root) {
+                Some(b) => ResolvedBranchScope::Branch(b),
+                None => ResolvedBranchScope::All,
+            }
+        }
+    };
+
+    let report = memory_health_report(conn, &scope)
+        .map_err(|e| ToolError::Internal(e.into()))?;
+    Ok(format_memory_health_markdown(&report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_list_contains_memory_health() {
+        let tools = list();
+        let matches: Vec<_> = tools.iter().filter(|t| t["name"] == "memory_health").collect();
+        assert_eq!(matches.len(), 1, "list() must contain exactly one memory_health entry");
+        let schema = &matches[0]["inputSchema"];
+        assert!(schema["properties"]["branch"].is_object(), "memory_health must accept optional branch param");
+    }
 
     #[test]
     fn test_list_contains_trace_flow() {

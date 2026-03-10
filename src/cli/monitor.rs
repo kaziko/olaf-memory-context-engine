@@ -293,17 +293,15 @@ fn print_event(ev: &EventRow, json: bool, use_color: bool) {
                 p.time_str, source_colored, p.session_str, p.summary, p.duration_str
             );
         }
+    } else if p.is_error {
+        println!(
+            "{} {}{} ERROR: {}{}",
+            p.time_str, p.source_tag, p.session_str,
+            p.error_text.as_deref().unwrap_or(&p.summary),
+            p.duration_str
+        );
     } else {
-        if p.is_error {
-            println!(
-                "{} {}{} ERROR: {}{}",
-                p.time_str, p.source_tag, p.session_str,
-                p.error_text.as_deref().unwrap_or(&p.summary),
-                p.duration_str
-            );
-        } else {
-            println!("{} {}{} {}{}", p.time_str, p.source_tag, p.session_str, p.summary, p.duration_str);
-        }
+        println!("{} {}{} {}{}", p.time_str, p.source_tag, p.session_str, p.summary, p.duration_str);
     }
 }
 

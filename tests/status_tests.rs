@@ -96,6 +96,35 @@ fn test_status_shows_tool_preferences() {
 }
 
 #[test]
+fn test_status_shows_memory_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "pub fn main() {}").unwrap();
+
+    #[allow(deprecated)]
+    Command::cargo_bin("olaf")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("index")
+        .assert()
+        .success();
+
+    #[allow(deprecated)]
+    let output = Command::cargo_bin("olaf")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("status")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Memory:"),
+        "status must show Memory summary line; got:\n{stdout}"
+    );
+}
+
+#[test]
 fn test_status_tool_preferences_missing() {
     let dir = tempfile::tempdir().unwrap();
 

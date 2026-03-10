@@ -775,7 +775,7 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn insert_obs_with_confidence(
         conn: &Connection,
         session_id: &str,

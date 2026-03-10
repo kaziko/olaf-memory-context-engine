@@ -2729,25 +2729,25 @@ mod eval {
 
         // Per-tag recall@3 (AC3b) — skip tags with no finite recalls (e.g. fallback)
         for (tag, tr) in &result.per_tag {
-            if let Some(tb) = baselines.tag.get(tag) {
-                if tr.recall_at_3 < tb.min_recall_at_3 {
-                    failures.push(format!(
-                        "Tag '{}' recall@3 {:.3} < baseline {:.3}",
-                        tag, tr.recall_at_3, tb.min_recall_at_3
-                    ));
-                }
+            if let Some(tb) = baselines.tag.get(tag)
+                && tr.recall_at_3 < tb.min_recall_at_3
+            {
+                failures.push(format!(
+                    "Tag '{}' recall@3 {:.3} < baseline {:.3}",
+                    tag, tr.recall_at_3, tb.min_recall_at_3
+                ));
             }
         }
 
         // Per-case min_recall_at_3 (AC3c)
         for (tc, cr) in case_file.case.iter().zip(result.cases.iter()) {
-            if let Some(min) = tc.min_recall_at_3 {
-                if cr.recall_at_3 >= 0.0 && cr.recall_at_3 < min {
-                    failures.push(format!(
-                        "Case '{}' recall@3 {:.3} < per-case min {:.3}",
-                        cr.name, cr.recall_at_3, min
-                    ));
-                }
+            if let Some(min) = tc.min_recall_at_3
+                && cr.recall_at_3 >= 0.0 && cr.recall_at_3 < min
+            {
+                failures.push(format!(
+                    "Case '{}' recall@3 {:.3} < per-case min {:.3}",
+                    cr.name, cr.recall_at_3, min
+                ));
             }
         }
 

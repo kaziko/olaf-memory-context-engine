@@ -30,6 +30,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
     println!("Observations:   {}", stats.observations);
     println!("Last indexed:   {}", last_indexed);
 
+    // Memory health one-liner
+    {
+        use olaf::memory::{ResolvedBranchScope, memory_health_report, format_memory_health_summary};
+        let scope = match olaf::config::detect_git_branch(&cwd) {
+            Some(b) => ResolvedBranchScope::Branch(b),
+            None => ResolvedBranchScope::All,
+        };
+        match memory_health_report(&conn, &scope) {
+            Ok(report) => println!("{}", format_memory_health_summary(&report)),
+            Err(e) => eprintln!("Memory health: error ({})", e),
+        }
+    }
+
     print_diagnostics(&cwd)?;
 
     Ok(())

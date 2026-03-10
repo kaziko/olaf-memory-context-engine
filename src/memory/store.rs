@@ -97,6 +97,57 @@ pub struct ObservationRow {
     pub importance: Importance,
 }
 
+/// Branch scope for memory health queries. Callers resolve the branch name
+/// before calling store code.
+#[derive(Debug, Clone)]
+pub enum ResolvedBranchScope {
+    Branch(String),
+    All,
+}
+
+/// Observation-level metrics for the memory health report.
+#[derive(Debug, Default)]
+pub struct ObservationMetrics {
+    pub total: u64,
+    pub stale: u64,
+    pub by_kind: Vec<(String, u64)>,
+    pub by_importance: [u64; 4], // [critical, high, medium, low]
+    pub scope_symbol_only: u64,
+    pub scope_file_only: u64,
+    pub scope_both: u64,
+    pub scope_project: u64,
+    pub retrieval_traffic: u64,
+    pub noise_count: u64,
+    pub has_recent_activity: bool,
+    pub oldest_days: Option<u64>,
+    pub oldest_non_stale_days: Option<u64>,
+}
+
+/// Rule-level metrics for the memory health report.
+#[derive(Debug, Default)]
+pub struct RuleMetrics {
+    pub active: u64,
+    pub pending: u64,
+    pub stale: u64,
+}
+
+/// Session-level metrics (always global — sessions have no branch column).
+#[derive(Debug, Default)]
+pub struct SessionMetrics {
+    pub total: u64,
+    pub compressed: u64,
+}
+
+/// Full memory health diagnostic report.
+#[derive(Debug)]
+pub struct MemoryHealthReport {
+    pub branch_label: String,
+    pub observations: ObservationMetrics,
+    pub rules: RuleMetrics,
+    pub sessions: SessionMetrics,
+    pub recommendations: Vec<String>,
+}
+
 pub fn upsert_session(
     conn: &Connection,
     session_id: &str,
@@ -852,6 +903,308 @@ pub fn get_session_observations(
             })
             .collect(),
     ))
+}
+
+/// Build a memory health diagnostic report.
+pub fn memory_health_report(
+    conn: &Connection,
+    scope: &ResolvedBranchScope,
+) -> Result<MemoryHealthReport, StoreError> {
+    let now = now_secs();
+    let seven_days_ago = now - 7 * 86400;
+
+    // Branch clause shared across observation and rule queries
+    let (obs_branch_clause, rule_branch_clause, branch_label, branch_param) = match scope {
+        ResolvedBranchScope::Branch(b) => (
+            "AND (branch = ?1 OR branch IS NULL)".to_string(),
+            "AND (branch = ?1 OR branch IS NULL)".to_string(),
+            format!("branch: {b}"),
+            Some(b.clone()),
+        ),
+        ResolvedBranchScope::All => (
+            String::new(),
+            String::new(),
+            "all branches".to_string(),
+            None,
+        ),
+    };
+
+    // ── Observation aggregate query ──
+    let obs_agg_sql = format!(
+        "SELECT \
+            SUM(CASE WHEN kind != 'context_retrieval' THEN 1 ELSE 0 END) AS total, \
+            SUM(CASE WHEN kind != 'context_retrieval' AND is_stale = 1 THEN 1 ELSE 0 END) AS stale_count, \
+            SUM(CASE WHEN kind = 'context_retrieval' THEN 1 ELSE 0 END) AS retrieval_count, \
+            SUM(CASE WHEN kind IN ('tool_call','file_change','context_retrieval') THEN 1 ELSE 0 END) AS noise_count, \
+            SUM(CASE WHEN importance = 'critical' AND kind != 'context_retrieval' THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN importance = 'high' AND kind != 'context_retrieval' THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN importance = 'medium' AND kind != 'context_retrieval' THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN importance = 'low' AND kind != 'context_retrieval' THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN symbol_fqn IS NOT NULL AND file_path IS NULL AND kind != 'context_retrieval' THEN 1 ELSE 0 END) AS symbol_only, \
+            SUM(CASE WHEN symbol_fqn IS NULL AND file_path IS NOT NULL AND kind != 'context_retrieval' THEN 1 ELSE 0 END) AS file_only, \
+            SUM(CASE WHEN symbol_fqn IS NOT NULL AND file_path IS NOT NULL AND kind != 'context_retrieval' THEN 1 ELSE 0 END) AS both_scope, \
+            SUM(CASE WHEN symbol_fqn IS NULL AND file_path IS NULL AND kind != 'context_retrieval' THEN 1 ELSE 0 END) AS project_scope, \
+            MIN(CASE WHEN kind != 'context_retrieval' THEN created_at ELSE NULL END) AS oldest_ts, \
+            MIN(CASE WHEN is_stale = 0 AND kind != 'context_retrieval' THEN created_at ELSE NULL END) AS oldest_non_stale_ts, \
+            MAX(CASE WHEN kind != 'context_retrieval' AND created_at >= ?{p} THEN 1 ELSE 0 END) AS has_recent \
+         FROM observations \
+         WHERE consolidated_into IS NULL {obs_clause}",
+        obs_clause = obs_branch_clause,
+        p = if branch_param.is_some() { "2" } else { "1" },
+    );
+
+    let obs_metrics = if let Some(ref b) = branch_param {
+        conn.query_row(&obs_agg_sql, params![b, seven_days_ago], |r| {
+            Ok(ObservationMetrics {
+                total: r.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                stale: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                retrieval_traffic: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                noise_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                by_importance: [
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                ],
+                scope_symbol_only: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64,
+                scope_file_only: r.get::<_, Option<i64>>(9)?.unwrap_or(0) as u64,
+                scope_both: r.get::<_, Option<i64>>(10)?.unwrap_or(0) as u64,
+                scope_project: r.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
+                oldest_days: r.get::<_, Option<i64>>(12)?.map(|ts| ((now - ts) / 86400) as u64),
+                oldest_non_stale_days: r.get::<_, Option<i64>>(13)?.map(|ts| ((now - ts) / 86400) as u64),
+                has_recent_activity: r.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
+                by_kind: Vec::new(), // filled below
+            })
+        })?
+    } else {
+        conn.query_row(&obs_agg_sql, params![seven_days_ago], |r| {
+            Ok(ObservationMetrics {
+                total: r.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                stale: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                retrieval_traffic: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                noise_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                by_importance: [
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                    r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                ],
+                scope_symbol_only: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64,
+                scope_file_only: r.get::<_, Option<i64>>(9)?.unwrap_or(0) as u64,
+                scope_both: r.get::<_, Option<i64>>(10)?.unwrap_or(0) as u64,
+                scope_project: r.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
+                oldest_days: r.get::<_, Option<i64>>(12)?.map(|ts| ((now - ts) / 86400) as u64),
+                oldest_non_stale_days: r.get::<_, Option<i64>>(13)?.map(|ts| ((now - ts) / 86400) as u64),
+                has_recent_activity: r.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
+                by_kind: Vec::new(),
+            })
+        })?
+    };
+
+    // ── Observation by-kind query ──
+    let kind_sql = format!(
+        "SELECT kind, COUNT(*) FROM observations \
+         WHERE consolidated_into IS NULL AND kind != 'context_retrieval' {obs_clause} \
+         GROUP BY kind ORDER BY kind",
+        obs_clause = obs_branch_clause,
+    );
+    let mut obs_metrics = obs_metrics;
+    {
+        let mut stmt = conn.prepare(&kind_sql)?;
+        let rows = if let Some(ref b) = branch_param {
+            stmt.query_map(params![b], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        obs_metrics.by_kind = rows.into_iter().map(|(k, c)| (k, c as u64)).collect();
+    }
+
+    // ── Rules aggregate query ──
+    let rules_sql = format!(
+        "SELECT \
+            SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END), \
+            SUM(CASE WHEN is_active = -1 THEN 1 ELSE 0 END) \
+         FROM project_rules WHERE 1=1 {rule_clause}",
+        rule_clause = rule_branch_clause,
+    );
+    let rules = if let Some(ref b) = branch_param {
+        conn.query_row(&rules_sql, params![b], |r| {
+            Ok(RuleMetrics {
+                active: r.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                pending: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                stale: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+            })
+        })?
+    } else {
+        conn.query_row(&rules_sql, [], |r| {
+            Ok(RuleMetrics {
+                active: r.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                pending: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                stale: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+            })
+        })?
+    };
+
+    // ── Sessions aggregate query (always global) ──
+    let sessions: SessionMetrics = conn.query_row(
+        "SELECT COUNT(*), SUM(CASE WHEN compressed = 1 THEN 1 ELSE 0 END) FROM sessions",
+        [],
+        |r| Ok(SessionMetrics {
+            total: r.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+            compressed: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+        }),
+    )?;
+
+    // ── Recent insight/decision check (scope-aware) ──
+    let recent_insight_sql = format!(
+        "SELECT COUNT(*) FROM observations \
+         WHERE consolidated_into IS NULL \
+           AND kind IN ('insight', 'decision') \
+           AND created_at >= ?{p} \
+           {obs_clause}",
+        obs_clause = obs_branch_clause,
+        p = if branch_param.is_some() { "2" } else { "1" },
+    );
+    let recent_insight_count: i64 = if let Some(ref b) = branch_param {
+        conn.query_row(&recent_insight_sql, params![b, seven_days_ago], |r| r.get(0))?
+    } else {
+        conn.query_row(&recent_insight_sql, params![seven_days_ago], |r| r.get(0))?
+    };
+
+    // ── Compute recommendations ──
+    let recommendations = compute_recommendations(
+        &obs_metrics,
+        &rules,
+        recent_insight_count > 0,
+        &branch_label,
+    );
+
+    Ok(MemoryHealthReport {
+        branch_label,
+        observations: obs_metrics,
+        rules,
+        sessions,
+        recommendations,
+    })
+}
+
+/// Pure function: compute recommendations from health metrics.
+pub fn compute_recommendations(
+    obs: &ObservationMetrics,
+    rules: &RuleMetrics,
+    has_recent_insights: bool,
+    branch_label: &str,
+) -> Vec<String> {
+    let mut recs = Vec::new();
+
+    if obs.total > 0 {
+        let stale_pct = (obs.stale as f64 / obs.total as f64) * 100.0;
+        if stale_pct > 50.0 {
+            recs.push(format!("{:.0}% of observations are stale — consider reviewing outdated entries", stale_pct));
+        }
+
+        let low_ratio = obs.by_importance[3] as f64 / obs.total as f64;
+        if low_ratio > 0.70 {
+            recs.push("Over 70% of observations are low-importance — retention may need tuning".to_string());
+        }
+
+        // Noise ratio: compression-eligible / total health-visible (AC3 total excludes context_retrieval)
+        if obs.total > 0 {
+            let noise_ratio = obs.noise_count as f64 / obs.total as f64;
+            if noise_ratio > 0.60 {
+                recs.push("Over 60% of observations are compression-eligible (tool_call, file_change, context_retrieval) — compression may be overdue".to_string());
+            }
+        }
+
+        if !has_recent_insights && obs.has_recent_activity {
+            let msg = if branch_label.starts_with("branch:") {
+                format!("No insights or decisions recorded in 7 days despite recent activity on {}", branch_label.trim_start_matches("branch: "))
+            } else {
+                "No insights or decisions recorded in 7 days despite recent activity".to_string()
+            };
+            recs.push(msg);
+        }
+    }
+
+    if rules.stale > 0 {
+        recs.push(format!("{} stale rule(s) detected — linked symbols may have changed", rules.stale));
+    }
+
+    recs
+}
+
+/// Format memory health report as markdown for MCP response.
+pub fn format_memory_health_markdown(report: &MemoryHealthReport) -> String {
+    let mut out = format!("## Memory Health ({})\n\n", report.branch_label);
+    let obs = &report.observations;
+
+    if obs.total == 0 {
+        out.push_str("**Observations**: No observations stored.\n");
+        if obs.retrieval_traffic > 0 {
+            out.push_str(&format!("  - Retrieval traffic (context_retrieval): {}\n", obs.retrieval_traffic));
+        }
+        out.push('\n');
+    } else {
+        let stale_pct = if obs.total > 0 { (obs.stale as f64 / obs.total as f64) * 100.0 } else { 0.0 };
+        out.push_str(&format!("**Observations**: {} total ({} stale — {:.0}%)\n", obs.total, obs.stale, stale_pct));
+
+        // by kind
+        let kinds: Vec<String> = obs.by_kind.iter().map(|(k, c)| format!("{c} {k}")).collect();
+        if !kinds.is_empty() {
+            out.push_str(&format!("  - By kind: {}\n", kinds.join(", ")));
+        }
+
+        // by importance
+        out.push_str(&format!(
+            "  - By importance: {} critical, {} high, {} medium, {} low\n",
+            obs.by_importance[0], obs.by_importance[1], obs.by_importance[2], obs.by_importance[3]
+        ));
+
+        // by scope
+        out.push_str(&format!(
+            "  - By scope: {} symbol, {} file, {} both, {} project\n",
+            obs.scope_symbol_only, obs.scope_file_only, obs.scope_both, obs.scope_project
+        ));
+
+        out.push_str(&format!("  - Retrieval traffic (context_retrieval): {}\n", obs.retrieval_traffic));
+        out.push_str(&format!("  - Noise (compression-eligible): {}\n\n", obs.noise_count));
+    }
+
+    let r = &report.rules;
+    out.push_str(&format!("**Rules**: {} active, {} pending, {} stale\n\n", r.active, r.pending, r.stale));
+
+    let s = &report.sessions;
+    out.push_str(&format!("**Sessions** (all branches): {} total ({} compressed)\n\n", s.total, s.compressed));
+
+    if obs.oldest_days.is_some() || obs.oldest_non_stale_days.is_some() {
+        out.push_str(&format!(
+            "**Age**: oldest observation {} days, oldest non-stale {} days\n\n",
+            obs.oldest_days.map(|d| d.to_string()).unwrap_or_else(|| "n/a".to_string()),
+            obs.oldest_non_stale_days.map(|d| d.to_string()).unwrap_or_else(|| "n/a".to_string()),
+        ));
+    }
+
+    if !report.recommendations.is_empty() {
+        out.push_str("### Recommendations\n");
+        for rec in &report.recommendations {
+            out.push_str(&format!("- {rec}\n"));
+        }
+    }
+
+    out
+}
+
+/// One-liner memory health summary for CLI status output.
+pub fn format_memory_health_summary(report: &MemoryHealthReport) -> String {
+    let obs = &report.observations;
+    let stale_pct = if obs.total > 0 { (obs.stale as f64 / obs.total as f64) * 100.0 } else { 0.0 };
+    format!(
+        "Memory: {} obs ({:.0}% stale), {} active rules, {} sessions",
+        obs.total, stale_pct, report.rules.active, report.sessions.total,
+    )
 }
 
 #[cfg(test)]
@@ -2053,5 +2406,251 @@ mod tests {
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
         assert!(contents.contains(&"main branch note"));
         assert!(contents.contains(&"global note"));
+    }
+
+    // ─── Story 11.3 — Memory Health Diagnostic Tool ──────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_obs_at(conn: &Connection, session_id: &str, kind: &str, content: &str,
+                     symbol_fqn: Option<&str>, file_path: Option<&str>,
+                     branch: Option<&str>, importance: Importance,
+                     created_at: i64, is_stale: bool) {
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, symbol_fqn, file_path, branch, importance, is_stale) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![session_id, created_at, kind, content, symbol_fqn, file_path, branch, importance, is_stale as i64],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_health_empty_db() {
+        let (conn, _dir) = open_test_db();
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert_eq!(report.observations.total, 0);
+        assert_eq!(report.observations.stale, 0);
+        assert_eq!(report.observations.retrieval_traffic, 0);
+        assert!(report.observations.by_kind.is_empty());
+        assert!(!report.observations.has_recent_activity);
+        assert!(report.observations.oldest_days.is_none());
+        assert_eq!(report.rules.active, 0);
+        assert_eq!(report.sessions.total, 0);
+        assert!(report.recommendations.is_empty());
+    }
+
+    #[test]
+    fn test_health_basic_counts() {
+        let (conn, _dir) = open_test_db();
+        let now = now_secs();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // Various kinds
+        insert_obs_at(&conn, "s1", "insight", "i1", Some("mod::f"), None, Some("main"), Importance::High, now - 100, false);
+        insert_obs_at(&conn, "s1", "decision", "d1", None, Some("a.rs"), Some("main"), Importance::High, now - 200, false);
+        insert_obs_at(&conn, "s1", "error", "e1", Some("mod::g"), Some("b.rs"), Some("main"), Importance::Medium, now - 300, true);
+        insert_obs_at(&conn, "s1", "tool_call", "tc1", None, None, Some("main"), Importance::Low, now - 50, false);
+        insert_obs_at(&conn, "s1", "file_change", "fc1", None, Some("c.rs"), Some("main"), Importance::Low, now - 60, false);
+        insert_obs_at(&conn, "s1", "context_retrieval", "cr1", None, None, Some("main"), Importance::Low, now - 10, false);
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::Branch("main".into())).unwrap();
+        let obs = &report.observations;
+
+        // context_retrieval excluded from total
+        assert_eq!(obs.total, 5);
+        assert_eq!(obs.stale, 1);
+        assert_eq!(obs.retrieval_traffic, 1);
+        // noise = tool_call + file_change + context_retrieval = 3
+        assert_eq!(obs.noise_count, 3);
+
+        // by importance: critical=0, high=2, medium=1, low=2
+        assert_eq!(obs.by_importance, [0, 2, 1, 2]);
+
+        // scope categories
+        assert_eq!(obs.scope_symbol_only, 1); // insight with symbol only
+        assert_eq!(obs.scope_file_only, 2);   // decision (file only) + file_change (file only)
+        assert_eq!(obs.scope_both, 1);         // error (symbol + file)
+        assert_eq!(obs.scope_project, 1);      // tool_call (no anchors)
+
+        assert!(obs.has_recent_activity);
+    }
+
+    #[test]
+    fn test_health_consolidated_exclusion() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "survivor", None, None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "absorbed", None, None, None, Importance::Medium).unwrap();
+        // Mark id2 as consolidated
+        conn.execute("UPDATE observations SET consolidated_into = ?1 WHERE id = ?2", params![id1, id2]).unwrap();
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert_eq!(report.observations.total, 1);
+    }
+
+    #[test]
+    fn test_health_retrieval_traffic_separation() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        insert_observation(&conn, "s1", "context_retrieval", "cr1", None, None, None, Importance::Low).unwrap();
+        insert_observation(&conn, "s1", "context_retrieval", "cr2", None, None, None, Importance::Low).unwrap();
+        insert_observation(&conn, "s1", "insight", "i1", None, None, None, Importance::Medium).unwrap();
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert_eq!(report.observations.total, 1); // only insight
+        assert_eq!(report.observations.retrieval_traffic, 2);
+    }
+
+    #[test]
+    fn test_health_noise_count() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        insert_observation(&conn, "s1", "tool_call", "tc", None, None, None, Importance::Low).unwrap();
+        insert_observation(&conn, "s1", "file_change", "fc", None, None, None, Importance::Low).unwrap();
+        insert_observation(&conn, "s1", "context_retrieval", "cr", None, None, None, Importance::Low).unwrap();
+        insert_observation(&conn, "s1", "insight", "i", None, None, None, Importance::Medium).unwrap();
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert_eq!(report.observations.noise_count, 3);
+    }
+
+    #[test]
+    fn test_health_branch_filtering() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        insert_observation(&conn, "s1", "insight", "main-obs", None, None, Some("main"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "feat-obs", None, None, Some("feature"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "global-obs", None, None, None, Importance::Medium).unwrap();
+
+        let main_report = memory_health_report(&conn, &ResolvedBranchScope::Branch("main".into())).unwrap();
+        assert_eq!(main_report.observations.total, 2); // main + NULL
+
+        let all_report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert_eq!(all_report.observations.total, 3);
+    }
+
+    #[test]
+    fn test_health_scope_categories_sum_to_total() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        insert_observation(&conn, "s1", "insight", "sym", Some("mod::f"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "file", None, Some("a.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "both", Some("mod::g"), Some("b.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "proj", None, None, None, Importance::Medium).unwrap();
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        let obs = &report.observations;
+        assert_eq!(obs.scope_symbol_only + obs.scope_file_only + obs.scope_both + obs.scope_project, obs.total);
+    }
+
+    #[test]
+    fn test_health_has_recent_activity() {
+        let (conn, _dir) = open_test_db();
+        let now = now_secs();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // Only old observations
+        insert_obs_at(&conn, "s1", "insight", "old", None, None, None, Importance::Medium, now - 30 * 86400, false);
+
+        let report = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert!(!report.observations.has_recent_activity);
+
+        // Add recent observation
+        insert_obs_at(&conn, "s1", "insight", "new", None, None, None, Importance::Medium, now - 100, false);
+        let report2 = memory_health_report(&conn, &ResolvedBranchScope::All).unwrap();
+        assert!(report2.observations.has_recent_activity);
+    }
+
+    #[test]
+    fn test_health_recommendation_stale_threshold() {
+        let obs = ObservationMetrics { total: 100, stale: 51, ..Default::default() };
+        let rules = RuleMetrics::default();
+        let recs = compute_recommendations(&obs, &rules, true, "all branches");
+        assert!(recs.iter().any(|r| r.contains("stale")));
+
+        let obs_below = ObservationMetrics { total: 100, stale: 50, ..Default::default() };
+        let recs_below = compute_recommendations(&obs_below, &rules, true, "all branches");
+        assert!(!recs_below.iter().any(|r| r.contains("stale")));
+    }
+
+    #[test]
+    fn test_health_recommendation_low_importance() {
+        let obs = ObservationMetrics { total: 100, by_importance: [0, 0, 29, 71], ..Default::default() };
+        let rules = RuleMetrics::default();
+        let recs = compute_recommendations(&obs, &rules, true, "all branches");
+        assert!(recs.iter().any(|r| r.contains("low-importance")));
+    }
+
+    #[test]
+    fn test_health_recommendation_noise_ratio() {
+        // noise_count/total > 60%: 25/40 = 62.5%
+        let obs = ObservationMetrics { total: 40, noise_count: 25, ..Default::default() };
+        let rules = RuleMetrics::default();
+        let recs = compute_recommendations(&obs, &rules, true, "all branches");
+        assert!(recs.iter().any(|r| r.contains("compression-eligible")));
+    }
+
+    #[test]
+    fn test_health_recommendation_activity_gated_insight() {
+        let obs = ObservationMetrics { total: 10, has_recent_activity: true, ..Default::default() };
+        let rules = RuleMetrics::default();
+        // No recent insights + has_recent_activity = recommend
+        let recs = compute_recommendations(&obs, &rules, false, "branch: main");
+        assert!(recs.iter().any(|r| r.contains("No insights")));
+        assert!(recs.iter().any(|r| r.contains("main")));
+
+        // No recent insights but no recent activity = don't recommend
+        let obs_quiet = ObservationMetrics { total: 10, has_recent_activity: false, ..Default::default() };
+        let recs_quiet = compute_recommendations(&obs_quiet, &rules, false, "branch: main");
+        assert!(!recs_quiet.iter().any(|r| r.contains("No insights")));
+    }
+
+    #[test]
+    fn test_health_recommendation_stale_rules() {
+        let obs = ObservationMetrics::default();
+        let rules = RuleMetrics { active: 3, pending: 1, stale: 2 };
+        let recs = compute_recommendations(&obs, &rules, true, "all branches");
+        assert!(recs.iter().any(|r| r.contains("stale rule")));
+    }
+
+    #[test]
+    fn test_health_formatter_empty_state() {
+        let report = MemoryHealthReport {
+            branch_label: "all branches".to_string(),
+            observations: ObservationMetrics::default(),
+            rules: RuleMetrics { active: 2, pending: 0, stale: 0 },
+            sessions: SessionMetrics { total: 5, compressed: 3 },
+            recommendations: Vec::new(),
+        };
+        let md = format_memory_health_markdown(&report);
+        assert!(md.contains("No observations stored."));
+        assert!(md.contains("2 active"));
+        assert!(md.contains("5 total"));
+    }
+
+    #[test]
+    fn test_health_formatter_retrieval_only_shows_empty_state() {
+        let report = MemoryHealthReport {
+            branch_label: "branch: main".to_string(),
+            observations: ObservationMetrics { retrieval_traffic: 10, ..Default::default() },
+            rules: RuleMetrics::default(),
+            sessions: SessionMetrics::default(),
+            recommendations: Vec::new(),
+        };
+        let md = format_memory_health_markdown(&report);
+        assert!(md.contains("No observations stored."), "retrieval-only DB should show empty state");
+        assert!(md.contains("Retrieval traffic"), "should still report retrieval traffic count");
+    }
+
+    #[test]
+    fn test_health_summary_format() {
+        let report = MemoryHealthReport {
+            branch_label: "branch: main".to_string(),
+            observations: ObservationMetrics { total: 42, stale: 5, ..Default::default() },
+            rules: RuleMetrics { active: 3, pending: 1, stale: 0 },
+            sessions: SessionMetrics { total: 34, compressed: 28 },
+            recommendations: Vec::new(),
+        };
+        let summary = format_memory_health_summary(&report);
+        assert!(summary.contains("42 obs"));
+        assert!(summary.contains("12%"));
+        assert!(summary.contains("3 active rules"));
+        assert!(summary.contains("34 sessions"));
     }
 }

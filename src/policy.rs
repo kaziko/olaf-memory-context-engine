@@ -284,7 +284,7 @@ mod tests {
             path = "real/**"
         "#);
         assert!(policy.is_denied("real/file.rs", None));
-        assert!(policy.is_empty() == false);
+        assert!(!policy.is_empty());
     }
 
     #[test]

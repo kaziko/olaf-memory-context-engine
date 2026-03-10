@@ -207,7 +207,7 @@ fn event_to_line(ev: &EventPresentation, max_width: usize, no_color: bool) -> Li
         // Build spans for the truncated version
         vec![
             Span::styled(format!("{} ", ev.time_str), dim),
-            Span::styled(format!("{}", ev.source_tag), source_style(ev.source_color, no_color)),
+            Span::styled(ev.source_tag.to_string(), source_style(ev.source_color, no_color)),
             Span::styled(format!("{} ", ev.session_str), dim),
             Span::styled("ERROR: ", err_style),
             Span::raw(if truncated.len() < raw.len() {
@@ -412,7 +412,7 @@ pub(crate) fn run_tui(
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
-    let _ = ctrlc::set_handler(move || {
+    ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     });
 
@@ -439,12 +439,11 @@ pub(crate) fn run_tui(
 
     while running.load(Ordering::SeqCst) {
         // Poll for keyboard input
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if !app.handle_key(key) {
-                    break;
-                }
-            }
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+            && !app.handle_key(key)
+        {
+            break;
         }
 
         // DB refresh
