@@ -55,6 +55,9 @@ enum Commands {
         /// Show only errors
         #[arg(long)]
         errors_only: bool,
+        /// Force plain-text output (no TUI)
+        #[arg(long)]
+        plain: bool,
     },
     /// Generate shell completion scripts
     Completions {
@@ -176,8 +179,8 @@ fn main() -> anyhow::Result<()> {
                 cli::workspace::run_doctor()?;
             }
         },
-        Commands::Monitor { json, tail, tool, errors_only } => {
-            cli::monitor::run(json, tail, tool, errors_only)?;
+        Commands::Monitor { json, tail, tool, errors_only, plain } => {
+            cli::monitor::run(json, tail, tool, errors_only, plain)?;
         }
         Commands::Completions { shell } => {
             use clap::CommandFactory;

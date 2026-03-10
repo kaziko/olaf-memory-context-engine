@@ -38,4 +38,33 @@ All commands run from your project root.
 | Command | Description |
 |-|-|
 | `olaf completions <shell>` | Print shell completion script for `bash`, `zsh`, `fish`, or `powershell`. |
-| `olaf monitor` | Watch live activity events (tool calls, hooks, sessions, indexing). Flags: `--json` (JSON lines output), `--tail <N>` (last N events, default 10), `--tool <name>` (filter by tool), `--errors-only`. |
+| `olaf monitor` | Watch live activity events in a bordered TUI (see below). Flags: `--json` (JSON lines), `--tail <N>` (last N events, default 10), `--tool <name>` (filter by tool), `--errors-only`, `--plain` (force plain-text output). |
+
+## Monitor TUI
+
+When run on an interactive terminal, `olaf monitor` launches a bordered TUI with scrollable event log, color-coded sources, and a status bar.
+
+### TUI activation
+
+TUI activates when **all** of: stdout is a TTY, stdin is a TTY, `--json` is not passed, `--plain` is not passed, and `TERM` is not `dumb`. When any condition fails, output falls back to plain text (identical to previous behavior).
+
+`NO_COLOR` does **not** disable TUI — it disables colors within the TUI (borders and layout still render, just monochrome).
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-|-|
+| `↑` / `k` | Scroll up (pauses auto-follow) |
+| `↓` / `j` | Scroll down |
+| `G` / `End` | Resume auto-follow |
+| `q` | Quit (dismisses help overlay first if open) |
+| `?` | Toggle help overlay |
+
+### Viewport modes
+
+- **FOLLOW** (default): auto-scrolls to show newest events.
+- **PAUSED**: activated by scrolling up. Status bar shows `PAUSED (N new)`. Press `G` or `End` to resume.
+
+### Event buffer
+
+TUI mode caps the in-memory buffer at 2000 events. When old events are dropped, a notice appears at the top. This cap does not apply to `--plain` or `--json` modes.

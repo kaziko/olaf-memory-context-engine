@@ -1,6 +1,7 @@
 pub(crate) mod index;
 pub(crate) mod init;
 pub(crate) mod monitor;
+pub(crate) mod monitor_tui;
 pub(crate) mod observe;
 pub(crate) mod restore;
 pub(crate) mod serve;

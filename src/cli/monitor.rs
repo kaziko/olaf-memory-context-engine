@@ -2,11 +2,81 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceColor {
+    Cyan,
+    Yellow,
+    Green,
+    Default,
+}
+
+pub(crate) struct EventPresentation {
+    pub time_str: String,
+    pub source_tag: String,
+    pub source_color: SourceColor,
+    pub session_str: String,
+    pub summary: String,
+    pub duration_str: String,
+    pub is_error: bool,
+    pub error_text: Option<String>,
+}
+
+pub(crate) fn to_presentation(ev: &EventRow) -> EventPresentation {
+    let time_str = format_timestamp(ev.timestamp);
+    let duration_str = ev.duration_ms.map(|ms| format!(" ({ms}ms)")).unwrap_or_default();
+    let session_str = ev.session_id.as_deref().map(|s| format!(" <{s}>")).unwrap_or_default();
+    let source_color = match ev.source.as_str() {
+        "mcp" => SourceColor::Cyan,
+        "hook" => SourceColor::Yellow,
+        "cli" => SourceColor::Green,
+        _ => SourceColor::Default,
+    };
+    EventPresentation {
+        time_str,
+        source_tag: format!("[{}]", ev.source),
+        source_color,
+        session_str,
+        summary: ev.summary.clone(),
+        duration_str,
+        is_error: ev.is_error,
+        error_text: ev.error_message.clone(),
+    }
+}
+
+pub(crate) struct TuiCapabilities {
+    pub stdout_is_tty: bool,
+    pub stdin_is_tty: bool,
+    pub json: bool,
+    pub plain: bool,
+    pub term: Option<String>,
+}
+
+impl TuiCapabilities {
+    pub fn from_env(json: bool, plain: bool) -> Self {
+        Self {
+            stdout_is_tty: std::io::stdout().is_terminal(),
+            stdin_is_tty: std::io::stdin().is_terminal(),
+            json,
+            plain,
+            term: std::env::var("TERM").ok(),
+        }
+    }
+
+    pub fn should_use_tui(&self) -> bool {
+        self.stdout_is_tty
+            && self.stdin_is_tty
+            && !self.json
+            && !self.plain
+            && self.term.as_deref() != Some("dumb")
+    }
+}
+
 pub(crate) fn run(
     json: bool,
     tail: usize,
     tool: Option<String>,
     errors_only: bool,
+    plain: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let db_path = cwd.join(".olaf/index.db");
@@ -17,6 +87,11 @@ pub(crate) fn run(
     }
 
     let conn = olaf::db::open(&db_path)?;
+
+    // Check TUI gate
+    if TuiCapabilities::from_env(json, plain).should_use_tui() {
+        return super::monitor_tui::run_tui(conn, tail, tool, errors_only);
+    }
 
     // Cleanup old events (> 1 hour)
     cleanup_old_events(&conn);
@@ -85,20 +160,20 @@ pub(crate) fn run(
     Ok(())
 }
 
-struct EventRow {
-    id: i64,
-    timestamp: i64,
-    source: String,
-    session_id: Option<String>,
-    event_type: String,
-    tool_name: Option<String>,
-    summary: String,
-    duration_ms: Option<i64>,
-    is_error: bool,
-    error_message: Option<String>,
+pub(crate) struct EventRow {
+    pub(crate) id: i64,
+    pub(crate) timestamp: i64,
+    pub(crate) source: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) event_type: String,
+    pub(crate) tool_name: Option<String>,
+    pub(crate) summary: String,
+    pub(crate) duration_ms: Option<i64>,
+    pub(crate) is_error: bool,
+    pub(crate) error_message: Option<String>,
 }
 
-fn cleanup_old_events(conn: &rusqlite::Connection) {
+pub(crate) fn cleanup_old_events(conn: &rusqlite::Connection) {
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -107,7 +182,7 @@ fn cleanup_old_events(conn: &rusqlite::Connection) {
     let _ = conn.execute("DELETE FROM activity_events WHERE timestamp < ?1", rusqlite::params![cutoff]);
 }
 
-fn query_events(
+pub(crate) fn query_events(
     conn: &rusqlite::Connection,
     after_id: i64,
     limit: Option<usize>,
@@ -160,7 +235,7 @@ fn query_events(
     }
 }
 
-fn map_row(row: &rusqlite::Row) -> rusqlite::Result<EventRow> {
+pub(crate) fn map_row(row: &rusqlite::Row) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
         id: row.get(0)?,
         timestamp: row.get(1)?,
@@ -193,46 +268,46 @@ fn print_event(ev: &EventRow, json: bool, use_color: bool) {
         return;
     }
 
-    let time_str = format_timestamp(ev.timestamp);
-    let duration_str = ev.duration_ms.map(|ms| format!(" ({ms}ms)")).unwrap_or_default();
-    let session_str = ev.session_id.as_deref().map(|s| format!(" <{s}>")).unwrap_or_default();
+    let p = to_presentation(ev);
 
     if use_color {
-        let source_colored = match ev.source.as_str() {
-            "mcp" => "\x1b[36m[mcp]\x1b[0m".to_string(),  // cyan
-            "hook" => "\x1b[33m[hook]\x1b[0m".to_string(), // yellow
-            "cli" => "\x1b[32m[cli]\x1b[0m".to_string(),   // green
-            s => format!("[{s}]"),
+        let source_colored = match p.source_color {
+            SourceColor::Cyan => format!("\x1b[36m{}\x1b[0m", p.source_tag),
+            SourceColor::Yellow => format!("\x1b[33m{}\x1b[0m", p.source_tag),
+            SourceColor::Green => format!("\x1b[32m{}\x1b[0m", p.source_tag),
+            _ => p.source_tag.clone(),
         };
         let dim = "\x1b[2m";
         let reset = "\x1b[0m";
 
-        if ev.is_error {
+        if p.is_error {
             println!(
-                "{time_str} {source_colored}{dim}{session_str}{reset} \x1b[31mERROR\x1b[0m: {} {dim}{duration_str}{reset}",
-                ev.error_message.as_deref().unwrap_or(&ev.summary)
+                "{} {}{dim}{}{reset} \x1b[31mERROR\x1b[0m: {} {dim}{}{reset}",
+                p.time_str, source_colored, p.session_str,
+                p.error_text.as_deref().unwrap_or(&p.summary),
+                p.duration_str
             );
         } else {
             println!(
-                "{time_str} {source_colored}{dim}{session_str}{reset} {}{dim}{duration_str}{reset}",
-                ev.summary
+                "{} {}{dim}{}{reset} {}{dim}{}{reset}",
+                p.time_str, source_colored, p.session_str, p.summary, p.duration_str
             );
         }
     } else {
-        let source_tag = format!("[{}]", ev.source);
-        if ev.is_error {
+        if p.is_error {
             println!(
-                "{time_str} {source_tag}{session_str} ERROR: {}{}",
-                ev.error_message.as_deref().unwrap_or(&ev.summary),
-                duration_str
+                "{} {}{} ERROR: {}{}",
+                p.time_str, p.source_tag, p.session_str,
+                p.error_text.as_deref().unwrap_or(&p.summary),
+                p.duration_str
             );
         } else {
-            println!("{time_str} {source_tag}{session_str} {}{}", ev.summary, duration_str);
+            println!("{} {}{} {}{}", p.time_str, p.source_tag, p.session_str, p.summary, p.duration_str);
         }
     }
 }
 
-fn format_timestamp(ts: i64) -> String {
+pub(crate) fn format_timestamp(ts: i64) -> String {
     let secs = ts % 86400;
     let h = (secs / 3600) % 24;
     let m = (secs % 3600) / 60;
@@ -421,5 +496,153 @@ mod tests {
         // Simulate exit cleanup
         let _ = std::fs::remove_file(&pid_file);
         assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn test_should_use_tui_all_pass() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+            json: false,
+            plain: false,
+            term: Some("xterm-256color".to_string()),
+        };
+        assert!(cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_json_disables() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+            json: true,
+            plain: false,
+            term: Some("xterm".to_string()),
+        };
+        assert!(!cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_plain_disables() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+            json: false,
+            plain: true,
+            term: Some("xterm".to_string()),
+        };
+        assert!(!cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_dumb_term_disables() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+            json: false,
+            plain: false,
+            term: Some("dumb".to_string()),
+        };
+        assert!(!cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_no_tty_disables() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: false,
+            stdin_is_tty: true,
+            json: false,
+            plain: false,
+            term: Some("xterm".to_string()),
+        };
+        assert!(!cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_no_stdin_tty_disables() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: false,
+            json: false,
+            plain: false,
+            term: Some("xterm".to_string()),
+        };
+        assert!(!cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_should_use_tui_none_term() {
+        let cap = TuiCapabilities {
+            stdout_is_tty: true,
+            stdin_is_tty: true,
+            json: false,
+            plain: false,
+            term: None,
+        };
+        assert!(cap.should_use_tui());
+    }
+
+    #[test]
+    fn test_presentation_preserves_source_color_on_error() {
+        // AC3: error events must keep original source coloring, not override to Red
+        let mcp_error = EventRow {
+            id: 1, timestamp: 73200, source: "mcp".into(),
+            session_id: None, event_type: "tool_call".into(),
+            tool_name: Some("get_brief".into()),
+            summary: "get_brief".into(),
+            duration_ms: Some(5), is_error: true,
+            error_message: Some("internal error".into()),
+        };
+        let p = to_presentation(&mcp_error);
+        assert_eq!(p.source_color, SourceColor::Cyan);
+        assert!(p.is_error);
+
+        let hook_error = EventRow {
+            id: 2, timestamp: 73200, source: "hook".into(),
+            session_id: None, event_type: "hook_error".into(),
+            tool_name: None,
+            summary: "failed".into(),
+            duration_ms: None, is_error: true,
+            error_message: Some("permission denied".into()),
+        };
+        let p = to_presentation(&hook_error);
+        assert_eq!(p.source_color, SourceColor::Yellow);
+        assert!(p.is_error);
+    }
+
+    #[test]
+    fn test_plain_output_format_parity() {
+        // Verify plain-mode output format matches pre-refactor expectations
+        let ev = EventRow {
+            id: 1, timestamp: 73200 + 34 * 60 + 12, source: "mcp".into(),
+            session_id: Some("abc123".into()), event_type: "tool_call".into(),
+            tool_name: Some("get_brief".into()),
+            summary: "get_brief(intent=fix bug) → 100 chars".into(),
+            duration_ms: Some(42), is_error: false, error_message: None,
+        };
+        let p = to_presentation(&ev);
+        // Plain mode (no color) format: "{time} {source_tag}{session} {summary}{duration}"
+        let plain_line = format!("{} {}{} {}{}", p.time_str, p.source_tag, p.session_str, p.summary, p.duration_str);
+        assert_eq!(plain_line, "20:54:12 [mcp] <abc123> get_brief(intent=fix bug) → 100 chars (42ms)");
+    }
+
+    #[test]
+    fn test_plain_error_output_format_parity() {
+        let ev = EventRow {
+            id: 1, timestamp: 73200, source: "hook".into(),
+            session_id: None, event_type: "hook_error".into(),
+            tool_name: None,
+            summary: "cleanup".into(),
+            duration_ms: Some(0), is_error: true,
+            error_message: Some("permission denied".into()),
+        };
+        let p = to_presentation(&ev);
+        let plain_line = format!(
+            "{} {}{} ERROR: {}{}",
+            p.time_str, p.source_tag, p.session_str,
+            p.error_text.as_deref().unwrap_or(&p.summary),
+            p.duration_str
+        );
+        assert_eq!(plain_line, "20:20:00 [hook] ERROR: permission denied (0ms)");
     }
 }
