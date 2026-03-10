@@ -1,3 +1,4 @@
+pub(crate) mod embed;
 pub(crate) mod index;
 pub(crate) mod init;
 pub(crate) mod monitor;

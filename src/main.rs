@@ -59,6 +59,15 @@ enum Commands {
         #[arg(long)]
         plain: bool,
     },
+    /// Embed observations for semantic retrieval
+    Embed {
+        /// Clear all embeddings and re-embed from scratch
+        #[arg(long)]
+        rebuild: bool,
+        /// Number of observations to embed per batch
+        #[arg(long, default_value = "64")]
+        batch_size: usize,
+    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -181,6 +190,9 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::Monitor { json, tail, tool, errors_only, plain } => {
             cli::monitor::run(json, tail, tool, errors_only, plain)?;
+        }
+        Commands::Embed { rebuild, batch_size } => {
+            cli::embed::run(rebuild, batch_size)?;
         }
         Commands::Completions { shell } => {
             use clap::CommandFactory;

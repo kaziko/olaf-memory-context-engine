@@ -467,6 +467,28 @@ fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end
     Ok(lines[start..end].join("\n"))
 }
 
+/// Create an embedder for the given project root. Returns None without `embeddings` feature
+/// or on any initialization failure (including missing ONNX runtime).
+fn create_embedder(project_root: &Path) -> Option<Box<dyn crate::memory::embedder::EmbedText>> {
+    #[cfg(feature = "embeddings")]
+    {
+        let cache_dir = project_root.join(".olaf").join("models");
+        // catch_unwind: ort panics (instead of Err) when libonnxruntime is missing
+        std::panic::catch_unwind(|| {
+            crate::memory::embedder::FastEmbedder::new(&cache_dir)
+                .ok()
+                .map(|e| Box::new(e) as Box<dyn crate::memory::embedder::EmbedText>)
+        })
+        .ok()
+        .flatten()
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = project_root;
+        None
+    }
+}
+
 fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservation) -> String {
     let obs = &scored.obs;
     let confidence_val = obs.confidence.unwrap_or(0.5);
@@ -491,12 +513,20 @@ fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservat
         ref imp => format!("[{}] ", imp),
     };
 
+    let breakdown = scored.score_breakdown.format_compact();
+
     let mut entry = String::new();
     if obs.is_stale {
         let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
-        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] {}[{}] {} {}\n", reason, importance_tag, obs.kind, obs.content, signal_label));
-    } else {
+        if breakdown.is_empty() {
+            entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] {}[{}] {} {}\n", reason, importance_tag, obs.kind, obs.content, signal_label));
+        } else {
+            entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] {}[{}] {} {} {}\n", reason, importance_tag, obs.kind, obs.content, signal_label, breakdown));
+        }
+    } else if breakdown.is_empty() {
         entry.push_str(&format!("- {}[{}] {} {}\n", importance_tag, obs.kind, obs.content, signal_label));
+    } else {
+        entry.push_str(&format!("- {}[{}] {} {} {}\n", importance_tag, obs.kind, obs.content, signal_label, breakdown));
     }
     if let Some(fqn) = &obs.symbol_fqn {
         entry.push_str(&format!("  Symbol: {}\n", fqn));
@@ -505,6 +535,39 @@ fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservat
         entry.push_str(&format!("  File: {}\n", fp));
     }
     entry
+}
+
+/// Compute semantic scores for project-scoped observations against intent.
+/// Returns None when embedder is None, intent is missing, or no stored embeddings exist.
+fn compute_project_semantic_scores(
+    conn: &Connection,
+    observations: &[&crate::memory::store::ObservationRow],
+    intent: Option<&str>,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
+) -> Option<std::collections::HashMap<i64, f64>> {
+    let embedder = embedder?;
+    let intent_query = intent?;
+    if intent_query.trim().is_empty() || observations.is_empty() {
+        return None;
+    }
+
+    let query_vec = embedder.embed_query(intent_query).ok()?;
+
+    let obs_ids: Vec<i64> = observations.iter().map(|o| o.id).collect();
+    let stored = crate::memory::embedder::load_embeddings(
+        conn, &obs_ids, embedder.model_id(), embedder.model_rev(),
+    ).ok()?;
+
+    if stored.is_empty() { return None; }
+
+    let mut scores = std::collections::HashMap::new();
+    for (obs_id, embedding) in &stored {
+        let sim = crate::memory::embedder::cosine_similarity(
+            &query_vec, embedding,
+        );
+        scores.insert(*obs_id, ((sim as f64) + 1.0) / 2.0);
+    }
+    Some(scores)
 }
 
 fn extract_intent_label(intent_header: &str) -> String {
@@ -722,11 +785,15 @@ fn build_context_brief(
     let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
     let anchored_memory_budget = memory_budget - project_sub_budget;
 
+    // Create embedder once for both anchored and project-scoped scoring
+    let embedder = create_embedder(project_root);
+    let embedder_ref = embedder.as_ref().map(|e| e.as_ref());
     let mut mem_section = String::new();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
+            embedder_ref,
         )
         .unwrap_or_default();
 
@@ -754,7 +821,7 @@ fn build_context_brief(
             .unwrap_or_default();
         let min_matches = if intent_tokens.len() < 2 { 1 } else { 2 };
 
-        // Score by match count, then sort best-first so budget truncation keeps the most relevant
+        // Token overlap gate: cheap pre-filter
         let mut scored_project: Vec<(usize, &crate::memory::store::ObservationRow)> = project_obs.iter()
             .filter_map(|obs| {
                 let obs_tokens: std::collections::HashSet<String> =
@@ -763,7 +830,21 @@ fn build_context_brief(
                 if matching >= min_matches { Some((matching, obs)) } else { None }
             })
             .collect();
-        scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+
+        // When embeddings available, use semantic similarity for sort; else fall back to token count
+        let semantic_sort = compute_project_semantic_scores(
+            conn, &scored_project.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            intent_query, embedder_ref,
+        );
+        if let Some(ref sem) = semantic_sort {
+            scored_project.sort_by(|a, b| {
+                let sa = sem.get(&a.1.id).copied().unwrap_or(0.0);
+                let sb = sem.get(&b.1.id).copied().unwrap_or(0.0);
+                sb.total_cmp(&sa).then_with(|| b.1.created_at.cmp(&a.1.created_at))
+            });
+        } else {
+            scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+        }
 
         let mut project_tokens = 0usize;
         for (_score, obs) in &scored_project {
@@ -1122,11 +1203,15 @@ pub(crate) fn build_context_brief_multi(
     let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
     let anchored_memory_budget = memory_budget - project_sub_budget;
 
+    // Create embedder once for both anchored and project-scoped scoring
+    let embedder = create_embedder(workspace.local_root());
+    let embedder_ref = embedder.as_ref().map(|e| e.as_ref());
     let mut mem_section = String::new();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             local_conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
+            embedder_ref,
         )
         .unwrap_or_default();
 
@@ -1152,7 +1237,7 @@ pub(crate) fn build_context_brief_multi(
             .unwrap_or_default();
         let min_matches = if intent_tokens.len() < 2 { 1 } else { 2 };
 
-        // Score by match count, then sort best-first so budget truncation keeps the most relevant
+        // Token overlap gate: cheap pre-filter
         let mut scored_project: Vec<(usize, &crate::memory::store::ObservationRow)> = project_obs.iter()
             .filter_map(|obs| {
                 let obs_tokens: std::collections::HashSet<String> =
@@ -1161,7 +1246,21 @@ pub(crate) fn build_context_brief_multi(
                 if matching >= min_matches { Some((matching, obs)) } else { None }
             })
             .collect();
-        scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+
+        // When embeddings available, use semantic similarity for sort; else fall back to token count
+        let semantic_sort = compute_project_semantic_scores(
+            local_conn, &scored_project.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            intent_query, embedder_ref,
+        );
+        if let Some(ref sem) = semantic_sort {
+            scored_project.sort_by(|a, b| {
+                let sa = sem.get(&a.1.id).copied().unwrap_or(0.0);
+                let sb = sem.get(&b.1.id).copied().unwrap_or(0.0);
+                sb.total_cmp(&sa).then_with(|| b.1.created_at.cmp(&a.1.created_at))
+            });
+        } else {
+            scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+        }
 
         let mut project_tokens = 0usize;
         for (_score, obs) in &scored_project {
@@ -2285,6 +2384,7 @@ mod tests {
             },
             relevance_score: 0.85,
             primary_signal: "recency".to_string(),
+            score_breakdown: Default::default(),
         };
         let entry = format_scored_observation_entry(&recent);
         assert!(entry.contains("(recent"), "score >= 0.7 must get a (recent…) label");
@@ -2299,6 +2399,7 @@ mod tests {
             },
             relevance_score: 0.3,
             primary_signal: "recency".to_string(),
+            score_breakdown: Default::default(),
         };
         let entry = format_scored_observation_entry(&aged);
         assert!(entry.contains("(aged)"), "low-score non-stale recency must get (aged) label");
@@ -2313,6 +2414,7 @@ mod tests {
             },
             relevance_score: 0.0,
             primary_signal: "stale".to_string(),
+            score_breakdown: Default::default(),
         };
         let entry = format_scored_observation_entry(&stale);
         assert!(entry.contains("(stale)"), "is_stale=true must get (stale) label regardless of score");

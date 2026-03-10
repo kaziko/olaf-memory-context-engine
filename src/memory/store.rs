@@ -290,26 +290,71 @@ pub(crate) struct ScoredObservation {
     pub(crate) obs: ObservationRow,
     pub(crate) relevance_score: f64,
     pub(crate) primary_signal: String,
+    /// Weighted contributions per signal: bm25, semantic, recency, confidence, staleness.
+    /// Values are weight × raw component value; they sum to the final score.
+    pub(crate) score_breakdown: ScoreBreakdown,
 }
 
+/// Weighted signal contributions. Each field = weight × raw component value.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScoreBreakdown {
+    pub(crate) bm25: f64,
+    pub(crate) semantic: f64,
+    pub(crate) recency: f64,
+    pub(crate) confidence: f64,
+    pub(crate) staleness: f64,
+}
+
+impl ScoreBreakdown {
+    /// Format as compact annotation for context-memory output.
+    pub(crate) fn format_compact(&self) -> String {
+        let mut parts = Vec::new();
+        if self.bm25 > 0.001 { parts.push(format!("bm25={:.2}", self.bm25)); }
+        if self.semantic > 0.001 { parts.push(format!("sem={:.2}", self.semantic)); }
+        if self.recency > 0.001 { parts.push(format!("rec={:.2}", self.recency)); }
+        if self.confidence > 0.001 { parts.push(format!("conf={:.2}", self.confidence)); }
+        if self.staleness < -0.001 { parts.push(format!("stale={:.2}", self.staleness)); }
+        if parts.is_empty() { return String::new(); }
+        format!("[{}]", parts.join(" "))
+    }
+}
+
+// ── Weight constants: tuning candidates ──
+
+// Weights WITHOUT semantic signal (current behavior)
 const W_BM25: f64 = 0.35;
 const W_RECENCY: f64 = 0.40;
 const W_CONFIDENCE: f64 = 0.15;
+
+// Weights WITH semantic signal
+const W_BM25_SEM: f64 = 0.20;
+const W_SEMANTIC: f64 = 0.25;
+const W_RECENCY_SEM: f64 = 0.35;
+const W_CONFIDENCE_SEM: f64 = 0.10;
+
 const STALENESS_PENALTY: f64 = -0.30;
 
-/// Score observations using composite relevance: BM25 text match (35%), recency (40%),
-/// confidence (15%), with a -0.30 staleness penalty. When `query` is None, the BM25
-/// component is 0.0. Confidence NULL is treated as 0.5 baseline.
-/// Recency uses 7-day half-life exponential decay. Score is request-scoped — not stored in DB.
+/// Score observations using composite relevance. When `semantic_scores` is Some,
+/// uses rebalanced weights (BM25 20%, semantic 25%, recency 35%, confidence 10%).
+/// When None, uses original weights (BM25 35%, recency 40%, confidence 15%).
+/// Staleness penalty (-0.30) unchanged in both modes.
 pub(crate) fn score_observations(
     conn: &Connection,
     observations: Vec<ObservationRow>,
     query: Option<&str>,
+    semantic_scores: Option<&std::collections::HashMap<i64, f64>>,
 ) -> Vec<ScoredObservation> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as f64;
+
+    let has_semantic = semantic_scores.is_some();
+    let (w_bm25, w_recency, w_confidence) = if has_semantic {
+        (W_BM25_SEM, W_RECENCY_SEM, W_CONFIDENCE_SEM)
+    } else {
+        (W_BM25, W_RECENCY, W_CONFIDENCE)
+    };
 
     // Build BM25 scores if query is provided and observations are non-empty
     let bm25_scores: std::collections::HashMap<i64, f64> = match query {
@@ -331,7 +376,7 @@ pub(crate) fn score_observations(
             let half_life = obs.importance.half_life_days();
             let recency = 0.5_f64.powf(age_days / half_life);
             let confidence = obs.confidence.unwrap_or(0.5);
-            let staleness_penalty = if obs.is_stale { STALENESS_PENALTY } else { 0.0 };
+            let staleness_val = if obs.is_stale { STALENESS_PENALTY } else { 0.0 };
 
             let bm25_norm = if min_bm25 < 0.0 {
                 bm25_scores.get(&obs.id).map(|raw| raw / min_bm25).unwrap_or(0.0)
@@ -339,28 +384,46 @@ pub(crate) fn score_observations(
                 0.0
             };
 
-            let score = (W_BM25 * bm25_norm + W_RECENCY * recency + W_CONFIDENCE * confidence + staleness_penalty)
+            let semantic_raw = semantic_scores
+                .and_then(|m| m.get(&obs.id).copied())
+                .unwrap_or(0.0);
+            let semantic_contrib = if has_semantic { W_SEMANTIC * semantic_raw } else { 0.0 };
+
+            let bm25_contrib = w_bm25 * bm25_norm;
+            let recency_contrib = w_recency * recency;
+            let confidence_contrib = w_confidence * confidence;
+
+            let score = (bm25_contrib + semantic_contrib + recency_contrib + confidence_contrib + staleness_val)
                 .clamp(0.0, 1.0);
 
             let primary_signal = if obs.is_stale {
                 "stale".to_string()
             } else {
-                let fts_contrib = W_BM25 * bm25_norm;
-                let recency_contrib = W_RECENCY * recency;
-                let confidence_contrib = W_CONFIDENCE * confidence;
-                if fts_contrib >= recency_contrib && fts_contrib >= confidence_contrib {
-                    "fts".to_string()
-                } else if recency_contrib >= confidence_contrib {
-                    "recency".to_string()
-                } else {
-                    "confidence".to_string()
-                }
+                let contribs = [
+                    (bm25_contrib, "fts"),
+                    (semantic_contrib, "semantic"),
+                    (recency_contrib, "recency"),
+                    (confidence_contrib, "confidence"),
+                ];
+                contribs.iter()
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, name)| name.to_string())
+                    .unwrap_or_else(|| "recency".to_string())
+            };
+
+            let score_breakdown = ScoreBreakdown {
+                bm25: bm25_contrib,
+                semantic: semantic_contrib,
+                recency: recency_contrib,
+                confidence: confidence_contrib,
+                staleness: staleness_val,
             };
 
             ScoredObservation {
                 obs,
                 relevance_score: score,
                 primary_signal,
+                score_breakdown,
             }
         })
         .collect()
@@ -684,6 +747,7 @@ pub(crate) fn get_project_scoped_observations(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_scored_observations_for_context(
     conn: &Connection,
     symbol_fqns: &[&str],
@@ -692,11 +756,49 @@ pub(crate) fn get_scored_observations_for_context(
     intent: Option<&str>,
     branch: Option<&str>,
     content_policy: &crate::policy::ContentPolicy,
+    embedder: Option<&dyn super::embedder::EmbedText>,
 ) -> Result<Vec<ScoredObservation>, StoreError> {
     let observations = get_observations_for_context(conn, symbol_fqns, file_paths, limit, branch, content_policy)?;
-    let mut scored = score_observations(conn, observations, intent);
+
+    let semantic_scores = compute_semantic_scores(conn, &observations, intent, embedder);
+
+    let mut scored = score_observations(conn, observations, intent, semantic_scores.as_ref());
     scored.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
     Ok(scored)
+}
+
+/// Compute semantic similarity scores for observations against the intent query.
+/// Returns None when embedder is None, intent is missing, or no stored embeddings exist.
+fn compute_semantic_scores(
+    conn: &Connection,
+    observations: &[ObservationRow],
+    intent: Option<&str>,
+    embedder: Option<&dyn super::embedder::EmbedText>,
+) -> Option<std::collections::HashMap<i64, f64>> {
+    let embedder = embedder?;
+    let intent_query = intent?;
+    if intent_query.trim().is_empty() || observations.is_empty() {
+        return None;
+    }
+
+    let query_vec = embedder.embed_query(intent_query).ok()?;
+
+    let obs_ids: Vec<i64> = observations.iter().map(|o| o.id).collect();
+    let stored = super::embedder::load_embeddings(
+        conn, &obs_ids, embedder.model_id(), embedder.model_rev(),
+    ).ok()?;
+
+    if stored.is_empty() {
+        return None;
+    }
+
+    let mut scores = std::collections::HashMap::new();
+    for (obs_id, embedding) in &stored {
+        let sim = super::embedder::cosine_similarity(&query_vec, embedding);
+        // Normalize cosine from [-1,1] to [0,1]
+        scores.insert(*obs_id, ((sim as f64) + 1.0) / 2.0);
+    }
+    Some(scores)
 }
 
 #[derive(Debug)]
@@ -1672,7 +1774,7 @@ mod tests {
         let recent = make_obs(now - 3600, false, None);       // 1 hour old
         let old = make_obs(now - 14 * 86400, false, None);    // 14 days old
 
-        let scored = score_observations(&conn, vec![recent, old], None);
+        let scored = score_observations(&conn, vec![recent, old], None, None);
         assert!(
             scored[0].relevance_score > scored[1].relevance_score,
             "1-hour-old ({:.4}) must score higher than 14-day-old ({:.4})",
@@ -1687,7 +1789,7 @@ mod tests {
         let fresh = make_obs(now - 86400, false, None);
         let stale = make_obs(now - 86400, true, Some("source changed"));
 
-        let scored = score_observations(&conn, vec![fresh, stale], None);
+        let scored = score_observations(&conn, vec![fresh, stale], None, None);
         assert!(
             scored[0].relevance_score > scored[1].relevance_score,
             "non-stale ({:.4}) must score higher than same-age stale ({:.4})",
@@ -1703,12 +1805,12 @@ mod tests {
         let obs2 = make_obs(now - 3 * 86400, false, None);
 
         // Score in two different result sets
-        let scored_alone = score_observations(&conn, vec![obs1], None);
+        let scored_alone = score_observations(&conn, vec![obs1], None, None);
         let scored_with_others = score_observations(&conn, vec![
             make_obs(now - 100, false, None),
             obs2,
             make_obs(now - 30 * 86400, false, None),
-        ], None);
+        ], None, None);
 
         let diff = (scored_alone[0].relevance_score - scored_with_others[1].relevance_score).abs();
         assert!(diff < 0.01, "same observation in different sets must produce similar score (diff={:.4})", diff);
@@ -1721,7 +1823,7 @@ mod tests {
         let zero_age = make_obs(now, false, None);
         let very_old = make_obs(0, false, None); // epoch
 
-        let scored = score_observations(&conn, vec![zero_age, very_old], None);
+        let scored = score_observations(&conn, vec![zero_age, very_old], None, None);
         for so in &scored {
             assert!(so.relevance_score >= 0.0, "score must be >= 0.0");
             assert!(so.relevance_score <= 1.0, "score must be <= 1.0");
@@ -1734,7 +1836,7 @@ mod tests {
         let now = now_epoch();
         let seven_days = make_obs(now - 7 * 86400, false, None);
 
-        let scored = score_observations(&conn, vec![seven_days], None);
+        let scored = score_observations(&conn, vec![seven_days], None, None);
         // Recency at 7 days = 0.5^(7/7) = 0.5, confidence = NULL → 0.5 baseline, no BM25, no staleness penalty
         // Expected: 0.35 * 0 + 0.40 * 0.5 + 0.15 * 0.5 = 0.275
         let expected = 0.275;
@@ -1869,7 +1971,7 @@ mod tests {
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
             confidence: Some(0.2), branch: None, importance: Importance::Medium,
         };
-        let scored = score_observations(&conn, vec![high_conf, low_conf], None);
+        let scored = score_observations(&conn, vec![high_conf, low_conf], None, None);
         assert!(
             scored[0].relevance_score > scored[1].relevance_score,
             "high confidence ({:.4}) must score higher than low confidence ({:.4})",
@@ -1882,7 +1984,7 @@ mod tests {
         let (conn, _dir) = open_test_db();
         let now = now_epoch();
         let stale_obs = make_obs(now - 3600, true, Some("outdated"));
-        let scored = score_observations(&conn, vec![stale_obs], None);
+        let scored = score_observations(&conn, vec![stale_obs], None, None);
         assert_eq!(scored[0].primary_signal, "stale", "stale observation must have primary_signal='stale'");
     }
 
@@ -1892,7 +1994,7 @@ mod tests {
         let now = now_epoch();
         let obs = make_obs(now - 3600, false, None);
         // Without query, BM25 is 0, recency (0.40) > confidence (0.15*0.5=0.075)
-        let scored = score_observations(&conn, vec![obs], None);
+        let scored = score_observations(&conn, vec![obs], None, None);
         assert_eq!(scored[0].primary_signal, "recency", "no-query fresh obs must have primary_signal='recency'");
     }
 
@@ -1939,7 +2041,7 @@ mod tests {
         let obs1 = ObservationRow { id: id1, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "rust memory management allocation patterns".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None, importance: Importance::Medium };
         let obs2 = ObservationRow { id: id2, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "general programming note".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None, importance: Importance::Medium };
 
-        let scored = score_observations(&conn, vec![obs1, obs2], Some("rust memory management"));
+        let scored = score_observations(&conn, vec![obs1, obs2], Some("rust memory management"), None);
         // obs1 should score higher due to BM25 match
         assert!(
             scored[0].relevance_score >= scored[1].relevance_score,
@@ -2217,7 +2319,7 @@ mod tests {
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
             confidence: Some(0.5), branch: None, importance: Importance::Medium,
         };
-        let scored = score_observations(&conn, vec![critical_old, medium_week], None);
+        let scored = score_observations(&conn, vec![critical_old, medium_week], None, None);
         assert!(
             scored[0].relevance_score > scored[1].relevance_score,
             "critical from 30 days ({:.4}) must score higher than medium from 7 days ({:.4})",
@@ -2241,7 +2343,7 @@ mod tests {
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
             confidence: Some(0.5), branch: None, importance: Importance::Low,
         };
-        let scored = score_observations(&conn, vec![medium_obs, low_obs], None);
+        let scored = score_observations(&conn, vec![medium_obs, low_obs], None, None);
         assert!(
             scored[0].relevance_score > scored[1].relevance_score,
             "medium from 3 days ({:.4}) must score higher than low from 3 days ({:.4})",
@@ -2259,11 +2361,53 @@ mod tests {
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
             confidence: Some(0.5), branch: None, importance: Importance::Critical,
         };
-        let scored = score_observations(&conn, vec![old_critical], None);
+        let scored = score_observations(&conn, vec![old_critical], None, None);
         // At 365 days with 365-day half-life, recency = 0.5
         // Score = 0.35*0 + 0.40*0.5 + 0.15*0.5 = 0.275
         assert!(scored[0].relevance_score > 0.2, "365-day critical must still have meaningful score, got {:.4}", scored[0].relevance_score);
         assert!(scored[0].relevance_score < 0.5, "365-day critical should not dominate, got {:.4}", scored[0].relevance_score);
+    }
+
+    #[test]
+    fn test_score_with_none_semantic_matches_current_behavior() {
+        let (conn, _dir) = open_test_db();
+        let now = now_epoch();
+        let obs = make_obs(now - 3600, false, None);
+        // Without semantic scores, weights are BM25=0.35, recency=0.40, confidence=0.15
+        let scored = score_observations(&conn, vec![obs], None, None);
+        assert_eq!(scored[0].primary_signal, "recency");
+        assert!(scored[0].score_breakdown.semantic.abs() < 0.001, "no semantic signal without semantic_scores");
+        assert!(scored[0].score_breakdown.recency > 0.1, "recency should contribute");
+    }
+
+    #[test]
+    fn test_score_with_semantic_scores_semantic_wins_primary_signal() {
+        let (conn, _dir) = open_test_db();
+        let now = now_epoch();
+        // Very old observation so recency is near-zero
+        let obs = make_obs(now - 365 * 86400, false, None);
+        // Give it a very high cosine similarity
+        let mut sem_scores = std::collections::HashMap::new();
+        sem_scores.insert(obs.id, 1.0);
+        let scored = score_observations(&conn, vec![obs], None, Some(&sem_scores));
+        // Semantic contrib = 0.25 * 1.0 = 0.25, recency contrib ≈ 0, confidence contrib = 0.10 * 0.5 = 0.05
+        assert_eq!(scored[0].primary_signal, "semantic", "high cosine must make semantic the primary signal");
+        assert!(scored[0].score_breakdown.semantic > 0.2, "semantic contribution should be ~0.25");
+    }
+
+    #[test]
+    fn test_score_breakdown_format_compact() {
+        let bd = ScoreBreakdown { bm25: 0.04, semantic: 0.21, recency: 0.28, confidence: 0.05, staleness: 0.0 };
+        let formatted = bd.format_compact();
+        assert!(formatted.contains("bm25=0.04"), "should contain bm25");
+        assert!(formatted.contains("sem=0.21"), "should contain semantic");
+        assert!(formatted.contains("rec=0.28"), "should contain recency");
+        assert!(formatted.contains("conf=0.05"), "should contain confidence");
+        assert!(!formatted.contains("stale"), "no staleness when 0");
+
+        let stale_bd = ScoreBreakdown { bm25: 0.0, semantic: 0.0, recency: 0.28, confidence: 0.05, staleness: -0.30 };
+        let formatted = stale_bd.format_compact();
+        assert!(formatted.contains("stale=-0.30"), "should show staleness when applied");
     }
 
     #[test]

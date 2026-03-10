@@ -288,9 +288,21 @@ ALTER TABLE observations ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium' CH
 CREATE INDEX IF NOT EXISTS idx_observations_importance_session ON observations(importance, session_id);
 ";
 
+const MIGRATION_011: &str = "
+CREATE TABLE observation_embeddings (
+    observation_id INTEGER PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    model_rev TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_obs_embeddings_model ON observation_embeddings(model_id, model_rev);
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 10;
+pub const MIGRATION_COUNT: i64 = 11;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -304,7 +316,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_008),
         M::up(MIGRATION_009),
         M::up(MIGRATION_010),
-        // Future migrations: append M::up(MIGRATION_011), etc. — never edit existing entries
+        M::up(MIGRATION_011),
+        // Future migrations: append M::up(MIGRATION_012), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

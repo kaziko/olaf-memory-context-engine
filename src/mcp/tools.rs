@@ -1000,7 +1000,7 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Pa
     }
 
     let total = observations.len();
-    let scored = crate::memory::store::score_observations(conn, observations, None);
+    let scored = crate::memory::store::score_observations(conn, observations, None, None);
     let capped = total.min(200);
 
     match sort_mode {
