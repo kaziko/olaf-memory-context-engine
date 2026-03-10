@@ -718,6 +718,12 @@ fn build_context_brief(
         (std::cmp::min(token_budget * 5 / 100, 300), token_budget * 5 / 100)
     };
 
+    // Carve project sub-budget from memory budget (AC3: 20% of memory_budget, capped at 200)
+    let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
+    let anchored_memory_budget = memory_budget - project_sub_budget;
+
+    let mut mem_section = String::new();
+
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
@@ -725,22 +731,59 @@ fn build_context_brief(
         .unwrap_or_default();
 
         if !scored.is_empty() {
-            let mut mem_section = String::new();
             let mut mem_tokens = 0usize;
             for scored_obs in &scored {
                 let entry = format_scored_observation_entry(scored_obs);
                 let entry_tokens = estimate_tokens(&entry);
-                if mem_tokens + entry_tokens > memory_budget {
+                if mem_tokens + entry_tokens > anchored_memory_budget {
                     break;
                 }
                 mem_section.push_str(&entry);
                 mem_tokens += entry_tokens;
             }
-            if !mem_section.is_empty() {
-                output.push_str("## Session Memory\n\n");
-                output.push_str(&mem_section);
-            }
         }
+    }
+
+    // Project-scoped observations with relevance gating (AC4)
+    if project_sub_budget > 0
+        && let Ok(project_obs) = crate::memory::store::get_project_scoped_observations(conn, branch, 20)
+        && !project_obs.is_empty()
+    {
+        let intent_tokens: std::collections::HashSet<String> = intent_query
+            .map(|q| crate::memory::rules::extract_tokens(q).into_iter().collect())
+            .unwrap_or_default();
+        let min_matches = if intent_tokens.len() < 2 { 1 } else { 2 };
+
+        // Score by match count, then sort best-first so budget truncation keeps the most relevant
+        let mut scored_project: Vec<(usize, &crate::memory::store::ObservationRow)> = project_obs.iter()
+            .filter_map(|obs| {
+                let obs_tokens: std::collections::HashSet<String> =
+                    crate::memory::rules::extract_tokens(&obs.content).into_iter().collect();
+                let matching = obs_tokens.intersection(&intent_tokens).count();
+                if matching >= min_matches { Some((matching, obs)) } else { None }
+            })
+            .collect();
+        scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+
+        let mut project_tokens = 0usize;
+        for (_score, obs) in &scored_project {
+            let entry = format!("- [project] [{}] {} ({})\n",
+                obs.kind,
+                obs.content,
+                if obs.is_stale { "stale" } else { "active" },
+            );
+            let entry_tokens = estimate_tokens(&entry);
+            if project_tokens + entry_tokens > project_sub_budget {
+                break;
+            }
+            mem_section.push_str(&entry);
+            project_tokens += entry_tokens;
+        }
+    }
+
+    if !mem_section.is_empty() {
+        output.push_str("## Session Memory\n\n");
+        output.push_str(&mem_section);
     }
 
     // Rules injection
@@ -1075,6 +1118,12 @@ pub(crate) fn build_context_brief_multi(
         (std::cmp::min(token_budget * 5 / 100, 300), token_budget * 5 / 100)
     };
 
+    // Carve project sub-budget from memory budget (AC3/AC10: local-only)
+    let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
+    let anchored_memory_budget = memory_budget - project_sub_budget;
+
+    let mut mem_section = String::new();
+
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             local_conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
@@ -1082,20 +1131,57 @@ pub(crate) fn build_context_brief_multi(
         .unwrap_or_default();
 
         if !scored.is_empty() {
-            let mut mem_section = String::new();
             let mut mem_tokens = 0usize;
             for scored_obs in &scored {
                 let entry = format_scored_observation_entry(scored_obs);
                 let entry_tokens = estimate_tokens(&entry);
-                if mem_tokens + entry_tokens > memory_budget { break; }
+                if mem_tokens + entry_tokens > anchored_memory_budget { break; }
                 mem_section.push_str(&entry);
                 mem_tokens += entry_tokens;
             }
-            if !mem_section.is_empty() {
-                output.push_str("## Session Memory\n\n");
-                output.push_str(&mem_section);
-            }
         }
+    }
+
+    // Project-scoped observations — local_conn only (AC10)
+    if project_sub_budget > 0
+        && let Ok(project_obs) = crate::memory::store::get_project_scoped_observations(local_conn, branch, 20)
+        && !project_obs.is_empty()
+    {
+        let intent_tokens: std::collections::HashSet<String> = intent_query
+            .map(|q| crate::memory::rules::extract_tokens(q).into_iter().collect())
+            .unwrap_or_default();
+        let min_matches = if intent_tokens.len() < 2 { 1 } else { 2 };
+
+        // Score by match count, then sort best-first so budget truncation keeps the most relevant
+        let mut scored_project: Vec<(usize, &crate::memory::store::ObservationRow)> = project_obs.iter()
+            .filter_map(|obs| {
+                let obs_tokens: std::collections::HashSet<String> =
+                    crate::memory::rules::extract_tokens(&obs.content).into_iter().collect();
+                let matching = obs_tokens.intersection(&intent_tokens).count();
+                if matching >= min_matches { Some((matching, obs)) } else { None }
+            })
+            .collect();
+        scored_project.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created_at.cmp(&a.1.created_at)));
+
+        let mut project_tokens = 0usize;
+        for (_score, obs) in &scored_project {
+            let entry = format!("- [project] [{}] {} ({})\n",
+                obs.kind,
+                obs.content,
+                if obs.is_stale { "stale" } else { "active" },
+            );
+            let entry_tokens = estimate_tokens(&entry);
+            if project_tokens + entry_tokens > project_sub_budget {
+                break;
+            }
+            mem_section.push_str(&entry);
+            project_tokens += entry_tokens;
+        }
+    }
+
+    if !mem_section.is_empty() {
+        output.push_str("## Session Memory\n\n");
+        output.push_str(&mem_section);
     }
 
     // Rules injection — local only
@@ -2678,5 +2764,120 @@ mod eval {
         }
 
         eprintln!("=== ALL GATES PASSED ===\n");
+    }
+
+    // ─── Story 11.2 — project-scoped observations in context assembly ────────
+
+    fn setup_project_obs_db() -> (Connection, tempfile::TempDir) {
+        let tmpdb = tempfile::tempdir().unwrap();
+        let db_path = tmpdb.path().join(".olaf").join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        // Insert a symbol so pivots work
+        conn.execute("INSERT INTO files (path, blake3_hash, last_indexed_at) VALUES ('src/a.rs', 'h', 0)", []).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE path='src/a.rs'", [], |r| r.get::<_, i64>(0)).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (?1, 'src/a.rs::handler', 'handler', 'function', 1, 5, 'h')",
+            rusqlite::params![file_id],
+        ).unwrap();
+        conn.execute("INSERT INTO sessions (id, started_at) VALUES ('s1', 1704067200000)", []).unwrap();
+        (conn, tmpdb)
+    }
+
+    #[test]
+    fn project_obs_relevant_included_with_label() {
+        let (conn, _tmpdb) = setup_project_obs_db();
+        // Insert a project-scoped observation with content matching intent
+        conn.execute(
+            "INSERT INTO observations (session_id, content, kind, symbol_fqn, file_path, created_at, importance) \
+             VALUES ('s1', 'authentication uses JWT tokens for session management', 'insight', NULL, NULL, 1704067200000, 'medium')",
+            [],
+        ).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
+
+        let (result, _notes) = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix authentication JWT tokens issue",
+            &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
+        ).unwrap();
+        assert!(result.contains("[project]"),
+            "project-scoped observation must be labeled [project]; got: {result}");
+        assert!(result.contains("authentication uses JWT tokens"),
+            "relevant project obs must be included; got: {result}");
+    }
+
+    #[test]
+    fn project_obs_irrelevant_excluded() {
+        let (conn, _tmpdb) = setup_project_obs_db();
+        // Insert a project-scoped observation with content NOT matching intent
+        conn.execute(
+            "INSERT INTO observations (session_id, content, kind, symbol_fqn, file_path, created_at, importance) \
+             VALUES ('s1', 'database uses PostgreSQL for storage', 'insight', NULL, NULL, 1704067200000, 'medium')",
+            [],
+        ).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
+
+        let (result, _notes) = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix authentication JWT tokens issue",
+            &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
+        ).unwrap();
+        assert!(!result.contains("database uses PostgreSQL"),
+            "irrelevant project obs must be excluded; got: {result}");
+    }
+
+    #[test]
+    fn project_obs_respects_token_sub_budget() {
+        let (conn, _tmpdb) = setup_project_obs_db();
+        // Insert project obs with matching content
+        conn.execute(
+            "INSERT INTO observations (session_id, content, kind, symbol_fqn, file_path, created_at, importance) \
+             VALUES ('s1', 'authentication handler uses middleware pattern for request validation', 'insight', NULL, NULL, 1704067200000, 'medium')",
+            [],
+        ).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
+
+        // Very small budget — project sub-budget will be tiny (20% of ~5% of 50 = ~0-1 tokens)
+        let (result, _notes) = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix authentication handler middleware",
+            &["src/a.rs::handler".to_string()], 50, None, &ContentPolicy::default(),
+        ).unwrap();
+        // With a 50-token budget, memory_budget ~ 5 tokens, project sub ~ 1 token
+        // The project obs entry is longer than 1 token, so it should be excluded
+        assert!(!result.contains("[project]"),
+            "project obs should be excluded when budget is too small; got: {result}");
+    }
+
+    #[test]
+    fn project_obs_punctuation_heavy_intents_match() {
+        let (conn, _tmpdb) = setup_project_obs_db();
+        conn.execute(
+            "INSERT INTO observations (session_id, content, kind, symbol_fqn, file_path, created_at, importance) \
+             VALUES ('s1', 'CI/CD pipeline uses GitHub Actions for node.js deployment', 'insight', NULL, NULL, 1704067200000, 'medium')",
+            [],
+        ).unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
+
+        // Intent with punctuation-heavy terms
+        let (result, _notes) = get_context_with_pivots(
+            &conn, tmpdir.path(), "fix CI/CD pipeline node.js deployment",
+            &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
+        ).unwrap();
+        assert!(result.contains("[project]") && result.contains("CI/CD pipeline"),
+            "punctuation-heavy intents should match; got: {result}");
     }
 }

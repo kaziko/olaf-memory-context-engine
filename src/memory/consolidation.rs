@@ -98,7 +98,8 @@ fn find_and_merge_duplicates(
                 None => continue,
             }
         } else {
-            continue;
+            // Project-scoped observations: group under __project__ scope
+            "__project__".to_string()
         };
 
         if is_sensitive_path(&scope_key) {
@@ -474,14 +475,16 @@ mod tests {
     }
 
     #[test]
-    fn test_no_scope_key_skipped() {
+    fn test_project_scoped_duplicates_consolidated() {
         let (mut conn, _dir) = open_test_db();
         insert_session(&conn, "s1");
-        // Observations with no file_path and no symbol_fqn are skipped
-        insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
-        insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
+        // Project-scoped observations (no file_path, no symbol_fqn) should now be consolidated
+        let id1 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
+        let id2 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
         let count = consolidate_observations(&mut conn, None).unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 1, "duplicate project-scoped observations should be consolidated");
+        assert!(is_consolidated(&conn, id2) || is_consolidated(&conn, id1),
+            "one of the duplicates should be marked consolidated");
     }
 
     #[test]
@@ -559,5 +562,25 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert_eq!(remaining, 0, "deleting survivor must cascade-delete consolidated duplicates");
+    }
+
+    #[test]
+    fn test_anchored_consolidation_unaffected_by_project_scope() {
+        let (mut conn, _dir) = open_test_db();
+        insert_session(&conn, "s1");
+        // Anchored duplicate observations should still consolidate as before
+        let id1 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", Some("src/config.rs"), None, None);
+        let id2 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", Some("src/config.rs"), None, None);
+        // Project-scoped observations should consolidate separately
+        let id3 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
+        let id4 = insert_auto_obs(&conn, "s1", "function parse_config reads configuration from disk validates schema", None, None, None);
+
+        let count = consolidate_observations(&mut conn, None).unwrap();
+        assert_eq!(count, 2, "both anchored and project-scoped duplicates consolidated: 1+1=2");
+
+        // Verify anchored consolidation worked
+        assert!(is_consolidated(&conn, id1) || is_consolidated(&conn, id2));
+        // Verify project-scoped consolidation worked
+        assert!(is_consolidated(&conn, id3) || is_consolidated(&conn, id4));
     }
 }

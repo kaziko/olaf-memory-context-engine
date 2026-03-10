@@ -153,7 +153,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "save_observation",
-            "description": "Save an observation (insight, decision, error, etc.) linked to a symbol FQN or file path. Persists to session memory for retrieval in future sessions. At least one of symbol_fqn or file_path is required.",
+            "description": "Save an observation (insight, decision, error, etc.) linked to a symbol FQN or file path. Persists to session memory for retrieval in future sessions. At least one of symbol_fqn or file_path is required — unless scope is \"project\", which saves a project-wide observation without anchors.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -176,6 +176,10 @@ pub(crate) fn list() -> Vec<Value> {
                     "importance": {
                         "type": "string",
                         "description": "Optional: retention priority — critical (never purged), high (14-day half-life), medium (default, 7-day), low (3.5-day). Defaults by kind: decision→high, anti_pattern→medium, file_change/tool_call→low."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional: set to \"project\" to save a project-wide observation not tied to any file or symbol. When scope is \"project\", symbol_fqn and file_path are not required."
                     }
                 },
                 "required": ["content", "kind"]
@@ -207,6 +211,11 @@ pub(crate) fn list() -> Vec<Value> {
                     "branch": {
                         "type": "string",
                         "description": "Filter by git branch. Omit for current branch, 'all' for cross-branch."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Filter by scope: 'project' (unanchored only), 'anchored' (file/symbol linked only), 'all' (default, no filter)",
+                        "enum": ["project", "anchored", "all"]
                     }
                 }
             }
@@ -874,14 +883,33 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
         ));
     }
 
-    if symbol_fqn.is_none() && file_path.is_none() {
+    let scope = args.get("scope").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let is_project_scoped = scope == Some("project");
+
+    if let Some(s) = scope
+        && s != "project"
+    {
         return Err(ToolError::InvalidParams(
-            "at least one of symbol_fqn or file_path is required".into()
+            format!("invalid scope '{s}'; only \"project\" is supported")
+        ));
+    }
+
+    if is_project_scoped && (symbol_fqn.is_some() || file_path.is_some()) {
+        return Err(ToolError::InvalidParams(
+            "scope \"project\" conflicts with symbol_fqn/file_path — project-scoped observations must not have anchors".into()
+        ));
+    }
+
+    if !is_project_scoped && symbol_fqn.is_none() && file_path.is_none() {
+        return Err(ToolError::InvalidParams(
+            "at least one of symbol_fqn or file_path is required (or set scope: \"project\")".into()
         ));
     }
 
     let importance = match args.get("importance").and_then(|v| v.as_str()) {
         Some(s) => s.parse::<crate::memory::store::Importance>().map_err(ToolError::InvalidParams)?,
+        None if is_project_scoped && kind == "decision" => crate::memory::store::Importance::High,
+        None if is_project_scoped => crate::memory::store::Importance::Medium,
         None => crate::memory::store::Importance::default_for_kind(kind),
     };
 
@@ -891,7 +919,8 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
     let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path, branch.as_deref(), importance)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
-    Ok(format!("Observation saved (id={id}, kind={kind}, importance={importance})."))
+    let scope_label = if is_project_scoped { ", scope=project" } else { "" };
+    Ok(format!("Observation saved (id={id}, kind={kind}, importance={importance}{scope_label})."))
 }
 
 fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
@@ -928,8 +957,29 @@ fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Pa
         return Ok("No sessions found.".into());
     }
 
-    let observations = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path, branch.as_deref(), content_policy)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+    let scope_filter = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
+    if !["project", "anchored", "all"].contains(&scope_filter) {
+        return Err(ToolError::InvalidParams(
+            format!("Invalid scope '{}'. Must be 'project', 'anchored', or 'all'.", scope_filter),
+        ));
+    }
+
+    // For scope=project, use dedicated retrieval that queries NULL anchors directly in SQL
+    // rather than fetching all observations and filtering post-hoc (avoids 800-row cap issue).
+    let observations = if scope_filter == "project" {
+        let project_obs = crate::memory::store::get_project_scoped_observations(conn, branch.as_deref(), 800)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+        let session_set: std::collections::HashSet<&str> = session_ids.iter().map(|s| s.as_str()).collect();
+        project_obs.into_iter().filter(|o| session_set.contains(o.session_id.as_str())).collect()
+    } else {
+        let all = crate::memory::store::get_observations_filtered(conn, &session_ids, symbol_fqn, file_path, branch.as_deref(), content_policy)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+        if scope_filter == "anchored" {
+            all.into_iter().filter(|obs| obs.symbol_fqn.is_some() || obs.file_path.is_some()).collect()
+        } else {
+            all
+        }
+    };
 
     if observations.is_empty() {
         return Ok("No observations found matching the given filters.".into());
@@ -1875,5 +1925,152 @@ mod tests {
         let output_lines: Vec<&str> = output.lines().collect();
         // 80 head + 1 marker + 20 tail = 101
         assert_eq!(output_lines.len(), 101, "must have 101 lines; got {}", output_lines.len());
+    }
+
+    // ─── Story 11.2 — project-scoped observations ────────────────────────────
+
+    fn open_full_test_db() -> (rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let conn = crate::db::open(&db_path).expect("open DB");
+        (conn, dir)
+    }
+
+    #[test]
+    fn test_save_observation_project_scope_succeeds() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "This team prefers composition over inheritance",
+            "kind": "insight",
+            "scope": "project"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(result.is_ok(), "project-scoped save should succeed: {:?}", result);
+        let msg = result.unwrap();
+        assert!(msg.contains("scope=project"), "response should mention project scope: {msg}");
+    }
+
+    #[test]
+    fn test_save_observation_no_scope_no_anchors_fails() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "Some observation",
+            "kind": "insight"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))),
+            "save without scope and without anchors should fail");
+    }
+
+    #[test]
+    fn test_save_observation_invalid_scope_fails() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "Some observation",
+            "kind": "insight",
+            "scope": "invalid"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))),
+            "invalid scope value should fail");
+    }
+
+    #[test]
+    fn test_save_observation_project_scope_decision_defaults_high() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "We use composition over inheritance",
+            "kind": "decision",
+            "scope": "project"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert!(msg.contains("importance=high"), "project decision should default to high: {msg}");
+    }
+
+    #[test]
+    fn test_session_history_scope_filter_project() {
+        let (mut conn, dir) = open_full_test_db();
+        // Setup session and observations
+        crate::memory::store::upsert_session(&conn, "s1", "test").unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "project note", None, None, None, crate::memory::store::Importance::Medium).unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "file note", None, Some("src/a.rs"), None, crate::memory::store::Importance::Medium).unwrap();
+
+        let args = serde_json::json!({ "scope": "project", "sessions_back": 5 });
+        let result = handle_get_session_history(&mut conn, dir.path(), Some(&args), &crate::policy::ContentPolicy::default());
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("project note"), "project-scoped obs must appear: {output}");
+        assert!(!output.contains("file note"), "anchored obs must be excluded: {output}");
+    }
+
+    #[test]
+    fn test_session_history_scope_filter_anchored() {
+        let (mut conn, dir) = open_full_test_db();
+        crate::memory::store::upsert_session(&conn, "s1", "test").unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "project note", None, None, None, crate::memory::store::Importance::Medium).unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "file note", None, Some("src/a.rs"), None, crate::memory::store::Importance::Medium).unwrap();
+
+        let args = serde_json::json!({ "scope": "anchored", "sessions_back": 5 });
+        let result = handle_get_session_history(&mut conn, dir.path(), Some(&args), &crate::policy::ContentPolicy::default());
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(!output.contains("project note"), "project-scoped obs must be excluded: {output}");
+        assert!(output.contains("file note"), "anchored obs must appear: {output}");
+    }
+
+    #[test]
+    fn test_session_history_scope_filter_all_default() {
+        let (mut conn, dir) = open_full_test_db();
+        crate::memory::store::upsert_session(&conn, "s1", "test").unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "project note", None, None, None, crate::memory::store::Importance::Medium).unwrap();
+        crate::memory::store::insert_observation(&conn, "s1", "insight", "file note", None, Some("src/a.rs"), None, crate::memory::store::Importance::Medium).unwrap();
+
+        // No scope = defaults to "all"
+        let args = serde_json::json!({ "sessions_back": 5 });
+        let result = handle_get_session_history(&mut conn, dir.path(), Some(&args), &crate::policy::ContentPolicy::default());
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("project note"), "project-scoped obs must appear: {output}");
+        assert!(output.contains("file note"), "anchored obs must appear: {output}");
+    }
+
+    #[test]
+    fn test_save_observation_project_scope_insight_defaults_medium() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "The codebase uses monorepo pattern",
+            "kind": "insight",
+            "scope": "project"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert!(msg.contains("importance=medium"), "project insight should default to medium: {msg}");
+    }
+
+    #[test]
+    fn test_save_observation_project_scope_with_anchors_rejected() {
+        let (mut conn, dir) = open_full_test_db();
+        let args = serde_json::json!({
+            "content": "Some observation",
+            "kind": "insight",
+            "scope": "project",
+            "file_path": "src/main.rs"
+        });
+        let result = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args));
+        assert!(matches!(result, Err(ToolError::InvalidParams(_))),
+            "project scope with anchors should be rejected: {:?}", result);
+
+        let args2 = serde_json::json!({
+            "content": "Some observation",
+            "kind": "insight",
+            "scope": "project",
+            "symbol_fqn": "src/main.rs::main"
+        });
+        let result2 = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args2));
+        assert!(matches!(result2, Err(ToolError::InvalidParams(_))),
+            "project scope with symbol_fqn should be rejected");
     }
 }

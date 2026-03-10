@@ -567,6 +567,72 @@ pub(crate) fn get_observations_for_context(
         .collect())
 }
 
+/// Fetch project-scoped observations (no symbol_fqn, no file_path, not consolidated).
+pub(crate) fn get_project_scoped_observations(
+    conn: &Connection,
+    branch: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ObservationRow>, StoreError> {
+    let (branch_clause, branch_param) = if let Some(b) = branch {
+        ("AND (branch = ?1 OR branch IS NULL) ".to_string(), Some(b.to_string()))
+    } else {
+        (String::new(), None)
+    };
+
+    let sql = format!(
+        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, \
+         is_stale, stale_reason, confidence, branch, importance \
+         FROM observations \
+         WHERE symbol_fqn IS NULL AND file_path IS NULL \
+           AND consolidated_into IS NULL \
+           AND kind != 'context_retrieval' \
+           {} \
+         ORDER BY created_at DESC, id DESC \
+         LIMIT {}",
+        branch_clause,
+        if branch_param.is_some() { "?2" } else { "?1" },
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = if let Some(ref b) = branch_param {
+        stmt.query_map(rusqlite::params![b, limit as i64], |r| {
+            Ok(ObservationRow {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                created_at: r.get(2)?,
+                kind: r.get(3)?,
+                content: r.get(4)?,
+                symbol_fqn: r.get(5)?,
+                file_path: r.get(6)?,
+                is_stale: r.get::<_, i64>(7)? != 0,
+                stale_reason: r.get(8)?,
+                confidence: r.get(9)?,
+                branch: r.get(10)?,
+                importance: r.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok(ObservationRow {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                created_at: r.get(2)?,
+                kind: r.get(3)?,
+                content: r.get(4)?,
+                symbol_fqn: r.get(5)?,
+                file_path: r.get(6)?,
+                is_stale: r.get::<_, i64>(7)? != 0,
+                stale_reason: r.get(8)?,
+                confidence: r.get(9)?,
+                branch: r.get(10)?,
+                importance: r.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(rows)
+}
+
 pub(crate) fn get_scored_observations_for_context(
     conn: &Connection,
     symbol_fqns: &[&str],
@@ -1939,5 +2005,53 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1, "composite index on (importance, session_id) must exist");
+    }
+
+    // ─── Story 11.2 — project-scoped observation retrieval ───────────────────
+
+    #[test]
+    fn test_get_project_scoped_returns_unanchored_only() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // project-scoped (no anchors)
+        insert_observation(&conn, "s1", "insight", "project-wide note", None, None, None, Importance::Medium).unwrap();
+        // anchored to file
+        insert_observation(&conn, "s1", "insight", "file note", None, Some("src/main.rs"), None, Importance::Medium).unwrap();
+        // anchored to symbol
+        insert_observation(&conn, "s1", "insight", "symbol note", Some("src/main.rs::main"), None, None, Importance::Medium).unwrap();
+
+        let results = get_project_scoped_observations(&conn, None, 100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "project-wide note");
+    }
+
+    #[test]
+    fn test_get_project_scoped_excludes_consolidated() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "original note", None, None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "duplicate note", None, None, None, Importance::Medium).unwrap();
+        // Mark id2 as consolidated into id1
+        conn.execute("UPDATE observations SET consolidated_into = ?1 WHERE id = ?2", rusqlite::params![id1, id2]).unwrap();
+
+        let results = get_project_scoped_observations(&conn, None, 100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id1);
+    }
+
+    #[test]
+    fn test_get_project_scoped_branch_filtering() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        insert_observation(&conn, "s1", "insight", "main branch note", None, None, Some("main"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "feature branch note", None, None, Some("feature"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "global note", None, None, None, Importance::Medium).unwrap();
+
+        // Filter for "main" branch: should get main + global (NULL branch)
+        let results = get_project_scoped_observations(&conn, Some("main"), 100).unwrap();
+        assert_eq!(results.len(), 2);
+        let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+        assert!(contents.contains(&"main branch note"));
+        assert!(contents.contains(&"global note"));
     }
 }
