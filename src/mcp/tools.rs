@@ -172,6 +172,10 @@ pub(crate) fn list() -> Vec<Value> {
                     "file_path": {
                         "type": "string",
                         "description": "Optional: file path to link this observation to, e.g. 'src/auth.ts'"
+                    },
+                    "importance": {
+                        "type": "string",
+                        "description": "Optional: retention priority — critical (never purged), high (14-day half-life), medium (default, 7-day), low (3.5-day). Defaults by kind: decision→high, anti_pattern→medium, file_change/tool_call→low."
                     }
                 },
                 "required": ["content", "kind"]
@@ -876,13 +880,18 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
         ));
     }
 
+    let importance = match args.get("importance").and_then(|v| v.as_str()) {
+        Some(s) => s.parse::<crate::memory::store::Importance>().map_err(ToolError::InvalidParams)?,
+        None => crate::memory::store::Importance::default_for_kind(kind),
+    };
+
     let branch = crate::config::detect_git_branch(project_root);
     crate::memory::store::upsert_session(conn, session_id, "claude-code")
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
-    let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path, branch.as_deref())
+    let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path, branch.as_deref(), importance)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
-    Ok(format!("Observation saved (id={id}, kind={kind})."))
+    Ok(format!("Observation saved (id={id}, kind={kind}, importance={importance})."))
 }
 
 fn handle_get_session_history(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
@@ -990,17 +999,22 @@ fn format_session_mode(
                 String::new()
             };
 
+            let importance_tag = match so.obs.importance {
+                crate::memory::store::Importance::Medium => String::new(),
+                ref imp => format!("[{}] ", imp),
+            };
+
             if so.obs.is_stale {
                 stale_count += 1;
                 let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
                 output.push_str(&format!(
-                    "- \u{26a0} [STALE \u{2014} {}] {}[{}] [score: {:.2} \u{00b7} {}] {}\n",
-                    reason, branch_label, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
+                    "- \u{26a0} [STALE \u{2014} {}] {}{}[{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    reason, branch_label, importance_tag, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             } else {
                 output.push_str(&format!(
-                    "- {}[{}] [score: {:.2} \u{00b7} {}] {}\n",
-                    branch_label, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
+                    "- {}{}[{}] [score: {:.2} \u{00b7} {}] {}\n",
+                    branch_label, importance_tag, so.obs.kind, so.relevance_score, so.primary_signal, so.obs.content
                 ));
             }
             if let Some(fqn) = &so.obs.symbol_fqn {
@@ -1077,17 +1091,22 @@ fn format_relevance_mode(
             String::new()
         };
 
+        let importance_tag = match so.obs.importance {
+            crate::memory::store::Importance::Medium => String::new(),
+            ref imp => format!("[{}] ", imp),
+        };
+
         if so.obs.is_stale {
             stale_count += 1;
             let reason = so.obs.stale_reason.as_deref().unwrap_or("unknown reason");
             output.push_str(&format!(
-                "{}. [score: {:.2} \u{00b7} {}] \u{26a0} [STALE \u{2014} {}] {}[{}] {}\n",
-                i + 1, so.relevance_score, so.primary_signal, reason, branch_label, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] \u{26a0} [STALE \u{2014} {}] {}{}[{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, reason, branch_label, importance_tag, so.obs.kind, so.obs.content
             ));
         } else {
             output.push_str(&format!(
-                "{}. [score: {:.2} \u{00b7} {}] {}[{}] {}\n",
-                i + 1, so.relevance_score, so.primary_signal, branch_label, so.obs.kind, so.obs.content
+                "{}. [score: {:.2} \u{00b7} {}] {}{}[{}] {}\n",
+                i + 1, so.relevance_score, so.primary_signal, branch_label, importance_tag, so.obs.kind, so.obs.content
             ));
         }
         if let Some(fqn) = &so.obs.symbol_fqn {
@@ -1185,6 +1204,7 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
         conn, session_id, "decision",
         &format!("Reverted {} — restore point {} applied", rel, snapshot_id),
         None, Some(&rel), branch.as_deref(),
+        crate::memory::store::Importance::Medium,
     ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
     Ok(format!("Restored {} to snapshot {}.", rel, snapshot_id))

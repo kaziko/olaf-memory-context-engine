@@ -3017,3 +3017,92 @@ fn test_observe_worktree_pre_tool_use_snapshot_in_main_repo() {
         "worktree must NOT have its own .olaf/ directory"
     );
 }
+
+// ─── Story 11.1 Tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_save_observation_explicit_importance_accepted() {
+    let (mut child, tmpdir) = spawn_server();
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "save_observation",
+            "arguments": {
+                "content": "Critical arch decision",
+                "kind": "decision",
+                "file_path": "src/main.rs",
+                "importance": "critical"
+            }
+        }
+    });
+    {
+        let stdin = child.stdin.take().unwrap();
+        let mut w = BufWriter::new(stdin);
+        writeln!(w, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    }
+    let output = child.wait_with_output().expect("server process did not exit");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value = serde_json::from_str(stdout.lines().next().expect("response"))
+        .expect("valid JSON");
+    let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("importance=critical"), "explicit importance must be reflected; got: {text}");
+
+    // Verify in DB
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+    let imp: String = conn
+        .query_row("SELECT importance FROM observations LIMIT 1", [], |r| r.get(0))
+        .expect("query importance");
+    assert_eq!(imp, "critical", "explicit importance must be stored");
+}
+
+#[test]
+fn test_save_observation_invalid_importance_rejected() {
+    let responses = run_requests(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "save_observation",
+            "arguments": {
+                "content": "test obs",
+                "kind": "insight",
+                "file_path": "src/main.rs",
+                "importance": "urgent"
+            }
+        }
+    })]);
+    let code = responses[0]["error"]["code"].as_i64();
+    assert_eq!(code, Some(-32602), "invalid importance must return InvalidParams; got: {}", responses[0]);
+}
+
+#[test]
+fn test_save_observation_omitted_importance_defaults_by_kind() {
+    // Decision kind without explicit importance should default to 'high'
+    let (mut child, tmpdir) = spawn_server();
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "save_observation",
+            "arguments": {
+                "content": "Arch decision without explicit importance",
+                "kind": "decision",
+                "file_path": "src/main.rs"
+            }
+        }
+    });
+    {
+        let stdin = child.stdin.take().unwrap();
+        let mut w = BufWriter::new(stdin);
+        writeln!(w, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    }
+    let output = child.wait_with_output().expect("server process did not exit");
+    assert!(output.status.success());
+
+    let db_path = tmpdir.path().join(".olaf").join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+    let imp: String = conn
+        .query_row("SELECT importance FROM observations LIMIT 1", [], |r| r.get(0))
+        .expect("query importance");
+    assert_eq!(imp, "high", "manual decision must default to 'high' per AC2/default_for_kind");
+}

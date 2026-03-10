@@ -486,12 +486,17 @@ fn format_scored_observation_entry(scored: &crate::memory::store::ScoredObservat
         }
     };
 
+    let importance_tag = match obs.importance {
+        crate::memory::store::Importance::Medium => String::new(),
+        ref imp => format!("[{}] ", imp),
+    };
+
     let mut entry = String::new();
     if obs.is_stale {
         let reason = obs.stale_reason.as_deref().unwrap_or("unknown reason");
-        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] [{}] {} {}\n", reason, obs.kind, obs.content, signal_label));
+        entry.push_str(&format!("- \u{26a0} [STALE \u{2014} {}] {}[{}] {} {}\n", reason, importance_tag, obs.kind, obs.content, signal_label));
     } else {
-        entry.push_str(&format!("- [{}] {} {}\n", obs.kind, obs.content, signal_label));
+        entry.push_str(&format!("- {}[{}] {} {}\n", importance_tag, obs.kind, obs.content, signal_label));
     }
     if let Some(fqn) = &obs.symbol_fqn {
         entry.push_str(&format!("  Symbol: {}\n", fqn));
@@ -2190,7 +2195,7 @@ mod tests {
             obs: ObservationRow {
                 id: 1, session_id: "s1".to_string(), created_at: 0,
                 kind: "discovery".to_string(), content: "found pattern".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: Some(0.8), branch: None,
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: Some(0.8), branch: None, importance: crate::memory::store::Importance::Medium,
             },
             relevance_score: 0.85,
             primary_signal: "recency".to_string(),
@@ -2204,7 +2209,7 @@ mod tests {
             obs: ObservationRow {
                 id: 2, session_id: "s1".to_string(), created_at: 0,
                 kind: "note".to_string(), content: "old note".to_string(),
-                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None,
+                symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None, importance: crate::memory::store::Importance::Medium,
             },
             relevance_score: 0.3,
             primary_signal: "recency".to_string(),
@@ -2218,7 +2223,7 @@ mod tests {
                 id: 3, session_id: "s1".to_string(), created_at: 0,
                 kind: "bug".to_string(), content: "stale finding".to_string(),
                 symbol_fqn: None, file_path: None, is_stale: true,
-                stale_reason: Some("symbol changed".to_string()), confidence: None, branch: None,
+                stale_reason: Some("symbol changed".to_string()), confidence: None, branch: None, importance: crate::memory::store::Importance::Medium,
             },
             relevance_score: 0.0,
             primary_signal: "stale".to_string(),

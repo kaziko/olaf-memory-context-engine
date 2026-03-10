@@ -283,9 +283,14 @@ fn handle_corruption_or_propagate(
     }
 }
 
+const MIGRATION_010: &str = "
+ALTER TABLE observations ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium' CHECK(importance IN ('critical','high','medium','low'));
+CREATE INDEX IF NOT EXISTS idx_observations_importance_session ON observations(importance, session_id);
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 9;
+pub const MIGRATION_COUNT: i64 = 10;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -298,7 +303,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_007),
         M::up(MIGRATION_008),
         M::up(MIGRATION_009),
-        // Future migrations: append M::up(MIGRATION_010), etc. — never edit existing entries
+        M::up(MIGRATION_010),
+        // Future migrations: append M::up(MIGRATION_011), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

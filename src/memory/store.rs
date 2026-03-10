@@ -6,6 +6,79 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// Retention-policy tier for observations. Controls recency decay half-life,
+/// compression protection, and purge protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Importance {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl Importance {
+    /// Default importance based on observation kind.
+    /// Used by both manual (`save_observation`) and auto (`insert_auto_observation`) paths.
+    pub fn default_for_kind(kind: &str) -> Self {
+        match kind {
+            "decision" => Importance::High,
+            "anti_pattern" => Importance::Medium,
+            "file_change" | "tool_call" | "context_retrieval" => Importance::Low,
+            _ => Importance::Medium,
+        }
+    }
+
+    /// Half-life in days for recency decay scoring.
+    pub fn half_life_days(&self) -> f64 {
+        match self {
+            Importance::Critical => 365.0,
+            Importance::High => 14.0,
+            Importance::Medium => 7.0,
+            Importance::Low => 3.5,
+        }
+    }
+}
+
+impl std::fmt::Display for Importance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Importance::Critical => write!(f, "critical"),
+            Importance::High => write!(f, "high"),
+            Importance::Medium => write!(f, "medium"),
+            Importance::Low => write!(f, "low"),
+        }
+    }
+}
+
+impl std::str::FromStr for Importance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "critical" => Ok(Importance::Critical),
+            "high" => Ok(Importance::High),
+            "medium" => Ok(Importance::Medium),
+            "low" => Ok(Importance::Low),
+            _ => Err(format!("invalid importance '{s}'; must be one of: critical, high, medium, low")),
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for Importance {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse::<Importance>().map_err(|e| rusqlite::types::FromSqlError::Other(Box::new(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        )))
+    }
+}
+
+impl rusqlite::types::ToSql for Importance {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.to_string()))
+    }
+}
+
 #[derive(Debug)]
 pub struct ObservationRow {
     #[allow(dead_code)]
@@ -21,6 +94,7 @@ pub struct ObservationRow {
     pub stale_reason: Option<String>,
     pub confidence: Option<f64>,
     pub branch: Option<String>,
+    pub importance: Importance,
 }
 
 pub fn upsert_session(
@@ -35,6 +109,7 @@ pub fn upsert_session(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_observation(
     conn: &Connection,
     session_id: &str,
@@ -43,12 +118,13 @@ pub(crate) fn insert_observation(
     symbol_fqn: Option<&str>,
     file_path: Option<&str>,
     branch: Option<&str>,
+    importance: Importance,
 ) -> Result<i64, StoreError> {
     conn.execute(
         "INSERT INTO observations \
-         (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, branch) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-        params![session_id, now_secs(), kind, content, symbol_fqn, file_path, branch],
+         (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, branch, importance) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+        params![session_id, now_secs(), kind, content, symbol_fqn, file_path, branch, importance],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -70,11 +146,17 @@ pub fn insert_auto_observation(
     branch: Option<&str>,
 ) -> Result<i64, StoreError> {
     let ts = now_secs();
+    // AC3: unknown auto-captured kinds default to Low (safe for future kinds),
+    // unlike manual kinds which default to Medium via default_for_kind catch-all.
+    let importance = match Importance::default_for_kind(kind) {
+        Importance::Medium if !matches!(kind, "anti_pattern" | "decision" | "insight" | "error") => Importance::Low,
+        other => other,
+    };
     conn.execute(
         "INSERT INTO observations \
-         (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, branch) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
-        params![session_id, ts, kind, content, symbol_fqn, file_path, branch],
+         (session_id, created_at, kind, content, symbol_fqn, file_path, auto_generated, branch, importance) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
+        params![session_id, ts, kind, content, symbol_fqn, file_path, branch, importance],
     )?;
     let id = conn.last_insert_rowid();
     let confidence = compute_confidence(conn, session_id, ts, id);
@@ -195,7 +277,8 @@ pub(crate) fn score_observations(
         .map(|obs| {
             let age_secs = (now_secs - obs.created_at as f64).max(0.0);
             let age_days = age_secs / 86400.0;
-            let recency = 0.5_f64.powf(age_days / 7.0);
+            let half_life = obs.importance.half_life_days();
+            let recency = 0.5_f64.powf(age_days / half_life);
             let confidence = obs.confidence.unwrap_or(0.5);
             let staleness_penalty = if obs.is_stale { STALENESS_PENALTY } else { 0.0 };
 
@@ -327,7 +410,7 @@ pub(crate) fn get_observations_filtered(
 
     let placeholders: Vec<String> = (1..=session_ids.len()).map(|i| format!("?{i}")).collect();
     let mut sql = format!(
-        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
+        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch, importance \
          FROM observations WHERE session_id IN ({}) AND kind != 'context_retrieval' AND consolidated_into IS NULL ",
         placeholders.join(", ")
     );
@@ -380,6 +463,7 @@ pub(crate) fn get_observations_filtered(
                 stale_reason: r.get(8)?,
                 confidence: r.get(9)?,
                 branch: r.get(10)?,
+                importance: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -442,7 +526,7 @@ pub(crate) fn get_observations_for_context(
     }
 
     let sql = format!(
-        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
+        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch, importance \
          FROM observations WHERE ({}) AND kind != 'context_retrieval' AND consolidated_into IS NULL {}ORDER BY created_at DESC, id DESC LIMIT {}",
         conditions.join(" OR "),
         branch_clause,
@@ -465,6 +549,7 @@ pub(crate) fn get_observations_for_context(
                 stale_reason: r.get(8)?,
                 confidence: r.get(9)?,
                 branch: r.get(10)?,
+                importance: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -520,7 +605,7 @@ pub(crate) fn compress_session(tx: &Transaction, session_id: &str) -> Result<u64
     }
 
     let deleted = tx.execute(
-        "DELETE FROM observations WHERE session_id = ?1 AND kind IN ('tool_call', 'file_change', 'context_retrieval')",
+        "DELETE FROM observations WHERE session_id = ?1 AND kind IN ('tool_call', 'file_change', 'context_retrieval') AND importance NOT IN ('critical', 'high')",
         params![session_id],
     )?;
     tx.execute(
@@ -604,11 +689,14 @@ pub(crate) fn purge_old_sessions(conn: &mut Connection, older_than_secs: i64) ->
         - older_than_secs;
     let tx = conn.transaction()?;
     tx.execute(
-        "DELETE FROM observations WHERE session_id IN (SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1)",
+        "DELETE FROM observations WHERE session_id IN (\
+         SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1 \
+         AND id NOT IN (SELECT DISTINCT session_id FROM observations WHERE importance = 'critical'))",
         params![cutoff],
     )?;
     let purged = tx.execute(
-        "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+        "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1 \
+         AND id NOT IN (SELECT DISTINCT session_id FROM observations WHERE importance = 'critical')",
         params![cutoff],
     )?;
     tx.commit()?;
@@ -661,7 +749,7 @@ pub fn get_session_observations(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch \
+        "SELECT id, session_id, created_at, kind, content, symbol_fqn, file_path, is_stale, stale_reason, confidence, branch, importance \
          FROM observations WHERE session_id = ?1 AND kind != 'context_retrieval' AND consolidated_into IS NULL ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt
@@ -678,6 +766,7 @@ pub fn get_session_observations(
                 stale_reason: r.get(8)?,
                 confidence: r.get(9)?,
                 branch: r.get(10)?,
+                importance: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -749,6 +838,7 @@ mod tests {
             None,
             Some("src/a.rs"),
             None,
+            Importance::Medium,
         )
         .unwrap();
         let auto_generated: i64 = conn
@@ -794,6 +884,7 @@ mod tests {
             Some("src/query.rs::get_context"),
             None,
             None,
+            Importance::Medium,
         )
         .unwrap();
         assert!(id > 0, "must return a positive row id");
@@ -822,6 +913,7 @@ mod tests {
             None,
             Some("src/auth.rs"),
             None,
+            Importance::Medium,
         )
         .unwrap();
         assert!(id > 0);
@@ -848,7 +940,7 @@ mod tests {
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('s3', 300, 'a')", []).unwrap();
         // Add observations to each
         for sid in &["s1", "s2", "s3"] {
-            insert_observation(&conn, sid, "insight", "test", Some("f::x"), None, None).unwrap();
+            insert_observation(&conn, sid, "insight", "test", Some("f::x"), None, None, Importance::Medium).unwrap();
         }
         let ids = get_recent_session_ids(&conn, 2, None).unwrap();
         assert_eq!(ids.len(), 2);
@@ -864,7 +956,7 @@ mod tests {
         insert_auto_observation(&conn, "retrieval-only", "context_retrieval", "get_context: debug", None, None, None).unwrap();
         // Session with real observations
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('real', 400, 'a')", []).unwrap();
-        insert_observation(&conn, "real", "insight", "useful finding", Some("f::x"), None, None).unwrap();
+        insert_observation(&conn, "real", "insight", "useful finding", Some("f::x"), None, None, Importance::Medium).unwrap();
 
         let ids = get_recent_session_ids(&conn, 10, None).unwrap();
         assert_eq!(ids, vec!["real"], "context_retrieval-only session must not appear");
@@ -875,7 +967,7 @@ mod tests {
         let (conn, _dir) = open_test_db();
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('empty', 500, 'a')", []).unwrap();
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('has-obs', 400, 'a')", []).unwrap();
-        insert_observation(&conn, "has-obs", "insight", "test", Some("f::x"), None, None).unwrap();
+        insert_observation(&conn, "has-obs", "insight", "test", Some("f::x"), None, None, Importance::Medium).unwrap();
 
         let ids = get_recent_session_ids(&conn, 10, None).unwrap();
         assert_eq!(ids, vec!["has-obs"], "empty session must be excluded");
@@ -887,8 +979,8 @@ mod tests {
         // Two sessions with identical started_at — rowid tiebreaker
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('first', 100, 'a')", []).unwrap();
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('second', 100, 'a')", []).unwrap();
-        insert_observation(&conn, "first", "insight", "a", Some("f::x"), None, None).unwrap();
-        insert_observation(&conn, "second", "insight", "b", Some("f::x"), None, None).unwrap();
+        insert_observation(&conn, "first", "insight", "a", Some("f::x"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "second", "insight", "b", Some("f::x"), None, None, Importance::Medium).unwrap();
 
         // Run twice to confirm determinism
         let ids1 = get_recent_session_ids(&conn, 10, None).unwrap();
@@ -901,8 +993,8 @@ mod tests {
     fn test_get_observations_filtered_by_symbol_fqn() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "about foo", Some("f::foo"), None, None).unwrap();
-        insert_observation(&conn, "s1", "decision", "about bar", Some("f::bar"), None, None).unwrap();
+        insert_observation(&conn, "s1", "insight", "about foo", Some("f::foo"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "decision", "about bar", Some("f::bar"), None, None, Importance::Medium).unwrap();
 
         let rows = get_observations_filtered(&conn, &["s1".into()], Some("f::foo"), None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
@@ -913,8 +1005,8 @@ mod tests {
     fn test_get_observations_filtered_by_file_path() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "about src", None, Some("src/a.rs"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "about lib", None, Some("src/b.rs"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "about src", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "about lib", None, Some("src/b.rs"), None, Importance::Medium).unwrap();
 
         let rows = get_observations_filtered(&conn, &["s1".into()], None, Some("src/a.rs"), None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
@@ -925,8 +1017,8 @@ mod tests {
     fn test_get_observations_filtered_no_filter_returns_all() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "one", Some("f::a"), None, None).unwrap();
-        insert_observation(&conn, "s1", "decision", "two", None, Some("src/b.rs"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "one", Some("f::a"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "decision", "two", None, Some("src/b.rs"), None, Importance::Medium).unwrap();
 
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2);
@@ -936,9 +1028,9 @@ mod tests {
     fn test_get_observations_for_context_matches_any() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "by fqn", Some("f::foo"), None, None).unwrap();
-        insert_observation(&conn, "s1", "insight", "by path", None, Some("src/a.rs"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "unrelated", Some("f::bar"), Some("src/z.rs"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "by fqn", Some("f::foo"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "by path", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "unrelated", Some("f::bar"), Some("src/z.rs"), None, Importance::Medium).unwrap();
 
         let rows = get_observations_for_context(&conn, &["f::foo"], &["src/a.rs"], 50, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 2);
@@ -951,9 +1043,9 @@ mod tests {
     fn test_get_observations_filtered_excludes_sensitive_paths() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "safe", None, Some("src/a.rs"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "secret", None, Some(".env"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "key", None, Some("certs/server.pem"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "safe", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "secret", None, Some(".env"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "key", None, Some("certs/server.pem"), None, Importance::Medium).unwrap();
 
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
@@ -986,9 +1078,9 @@ mod tests {
             "INSERT INTO sessions (id, started_at, agent, compressed) VALUES ('s2', 200, 'a', 1)",
             [],
         ).unwrap();
-        insert_observation(&conn, "s1", "insight", "obs1", Some("f::x"), None, None).unwrap();
-        insert_observation(&conn, "s1", "insight", "obs2", Some("f::y"), None, None).unwrap();
-        insert_observation(&conn, "s2", "decision", "obs3", None, Some("src/a.rs"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "obs1", Some("f::x"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "obs2", Some("f::y"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s2", "decision", "obs3", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
 
         let sessions = list_sessions(&conn, 10).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -1019,8 +1111,8 @@ mod tests {
     fn test_get_session_observations_valid_session() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "finding", Some("f::x"), None, None).unwrap();
-        insert_observation(&conn, "s1", "decision", "chose A", None, Some("src/a.rs"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "finding", Some("f::x"), None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "decision", "chose A", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
 
         let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap();
         assert!(obs.is_some());
@@ -1039,9 +1131,9 @@ mod tests {
     fn test_get_session_observations_filters_sensitive_paths() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "safe obs", None, Some("src/main.rs"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "secret obs", None, Some(".env"), None).unwrap();
-        insert_observation(&conn, "s1", "insight", "key obs", None, Some("certs/server.pem"), None).unwrap();
+        insert_observation(&conn, "s1", "insight", "safe obs", None, Some("src/main.rs"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "secret obs", None, Some(".env"), None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "key obs", None, Some("certs/server.pem"), None, Importance::Medium).unwrap();
 
         let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap().unwrap();
         assert_eq!(obs.len(), 1);
@@ -1105,7 +1197,7 @@ mod tests {
         let mut conn = crate::db::open(&db_path).unwrap();
 
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "keep me", None, None, None).unwrap();
+        insert_observation(&conn, "s1", "insight", "keep me", None, None, None, Importance::Medium).unwrap();
         insert_auto_observation(&conn, "s1", "tool_call", "delete me", None, None, None).unwrap();
         insert_auto_observation(&conn, "s1", "file_change", "delete me too", None, Some("src/a.rs"), None).unwrap();
 
@@ -1143,6 +1235,7 @@ mod tests {
             stale_reason: stale_reason.map(|s| s.to_string()),
             confidence: None,
             branch: None,
+            importance: Importance::Medium,
         }
     }
 
@@ -1241,7 +1334,7 @@ mod tests {
         let (conn, _dir) = open_test_db();
         // Verify the confidence column exists by inserting and reading it
         upsert_session(&conn, "conf-sess", "test").unwrap();
-        insert_observation(&conn, "conf-sess", "insight", "test obs", None, None, None).unwrap();
+        insert_observation(&conn, "conf-sess", "insight", "test obs", None, None, None, Importance::Medium).unwrap();
         let id: i64 = conn.query_row("SELECT id FROM observations LIMIT 1", [], |r| r.get(0)).unwrap();
         // NULL by default for manual observations
         let conf: Option<f64> = conn.query_row(
@@ -1334,7 +1427,7 @@ mod tests {
     fn test_manual_observation_confidence_stays_null() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "manual-null-sess", "test").unwrap();
-        let id = insert_observation(&conn, "manual-null-sess", "insight", "manual obs", None, None, None).unwrap();
+        let id = insert_observation(&conn, "manual-null-sess", "insight", "manual obs", None, None, None, Importance::Medium).unwrap();
         let conf: Option<f64> = conn.query_row(
             "SELECT confidence FROM observations WHERE id = ?1", rusqlite::params![id], |r| r.get(0)
         ).unwrap();
@@ -1349,13 +1442,13 @@ mod tests {
             id: 1, session_id: "s".into(), created_at: now - 86400,
             kind: "insight".into(), content: "high confidence obs".into(),
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
-            confidence: Some(0.8), branch: None,
+            confidence: Some(0.8), branch: None, importance: Importance::Medium,
         };
         let low_conf = ObservationRow {
             id: 2, session_id: "s".into(), created_at: now - 86400,
             kind: "insight".into(), content: "low confidence obs".into(),
             symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
-            confidence: Some(0.2), branch: None,
+            confidence: Some(0.2), branch: None, importance: Importance::Medium,
         };
         let scored = score_observations(&conn, vec![high_conf, low_conf], None);
         assert!(
@@ -1398,7 +1491,7 @@ mod tests {
     fn test_fts5_trigger_populates_on_insert() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "fts-sess", "test").unwrap();
-        insert_observation(&conn, "fts-sess", "insight", "unique fts trigger test phrase", None, None, None).unwrap();
+        insert_observation(&conn, "fts-sess", "insight", "unique fts trigger test phrase", None, None, None, Importance::Medium).unwrap();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM observations_fts WHERE observations_fts MATCH 'trigger'",
             [], |r| r.get(0),
@@ -1424,8 +1517,8 @@ mod tests {
         ).unwrap();
         let id2: i64 = conn.last_insert_rowid();
 
-        let obs1 = ObservationRow { id: id1, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "rust memory management allocation patterns".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None };
-        let obs2 = ObservationRow { id: id2, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "general programming note".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None };
+        let obs1 = ObservationRow { id: id1, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "rust memory management allocation patterns".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None, importance: Importance::Medium };
+        let obs2 = ObservationRow { id: id2, session_id: "bm25-sess".into(), created_at: now - 100, kind: "insight".into(), content: "general programming note".into(), symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None, confidence: None, branch: None, importance: Importance::Medium };
 
         let scored = score_observations(&conn, vec![obs1, obs2], Some("rust memory management"));
         // obs1 should score higher due to BM25 match
@@ -1441,7 +1534,7 @@ mod tests {
     fn test_fts5_trigger_deletes_on_delete() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "del-sess", "test").unwrap();
-        insert_observation(&conn, "del-sess", "insight", "xyzzy_unique_term", None, None, None).unwrap();
+        insert_observation(&conn, "del-sess", "insight", "xyzzy_unique_term", None, None, None, Importance::Medium).unwrap();
         let id: i64 = conn.query_row("SELECT id FROM observations WHERE content LIKE 'xyzzy%'", [], |r| r.get(0)).unwrap();
         conn.execute("DELETE FROM observations WHERE id = ?1", rusqlite::params![id]).unwrap();
         let n: i64 = conn.query_row(
@@ -1457,7 +1550,7 @@ mod tests {
     fn test_insert_observation_with_branch() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id = insert_observation(&conn, "s1", "insight", "found pattern", None, None, Some("main")).unwrap();
+        let id = insert_observation(&conn, "s1", "insight", "found pattern", None, None, Some("main"), Importance::Medium).unwrap();
         let branch: Option<String> = conn
             .query_row("SELECT branch FROM observations WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
             .unwrap();
@@ -1468,7 +1561,7 @@ mod tests {
     fn test_insert_observation_no_branch() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id = insert_observation(&conn, "s1", "insight", "legacy obs", None, None, None).unwrap();
+        let id = insert_observation(&conn, "s1", "insight", "legacy obs", None, None, None, Importance::Medium).unwrap();
         let branch: Option<String> = conn
             .query_row("SELECT branch FROM observations WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
             .unwrap();
@@ -1490,8 +1583,8 @@ mod tests {
     fn test_observations_filtered_by_branch() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main")).unwrap();
-        insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/y")).unwrap();
+        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/y"), Importance::Medium).unwrap();
 
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1502,8 +1595,8 @@ mod tests {
     fn test_observations_null_branch_globally_visible() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "legacy", None, None, None).unwrap();
-        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main")).unwrap();
+        insert_observation(&conn, "s1", "insight", "legacy", None, None, None, Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main"), Importance::Medium).unwrap();
 
         // NULL-branch obs is visible when filtering by "main"
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
@@ -1514,8 +1607,8 @@ mod tests {
     fn test_observations_no_branch_filter() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main")).unwrap();
-        insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/z")).unwrap();
+        insert_observation(&conn, "s1", "insight", "on main", None, None, Some("main"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "on feature", None, None, Some("feature/z"), Importance::Medium).unwrap();
 
         // No branch filter → all observations returned
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
@@ -1526,9 +1619,9 @@ mod tests {
     fn test_observations_branch_switch_within_session() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        insert_observation(&conn, "s1", "insight", "work on main", None, None, Some("main")).unwrap();
-        insert_observation(&conn, "s1", "insight", "work on dev", None, None, Some("dev")).unwrap();
-        insert_observation(&conn, "s1", "insight", "generic note", None, None, None).unwrap();
+        insert_observation(&conn, "s1", "insight", "work on main", None, None, Some("main"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "work on dev", None, None, Some("dev"), Importance::Medium).unwrap();
+        insert_observation(&conn, "s1", "insight", "generic note", None, None, None, Importance::Medium).unwrap();
 
         let main_rows = get_observations_filtered(&conn, &["s1".into()], None, None, Some("main"), &crate::policy::ContentPolicy::default()).unwrap();
         // main + NULL = 2
@@ -1552,8 +1645,8 @@ mod tests {
     fn test_get_observations_filtered_excludes_consolidated() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id1 = insert_observation(&conn, "s1", "insight", "survivor obs", Some("f::x"), None, None).unwrap();
-        let id2 = insert_observation(&conn, "s1", "insight", "consolidated obs", Some("f::x"), None, None).unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "survivor obs", Some("f::x"), None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "consolidated obs", Some("f::x"), None, None, Importance::Medium).unwrap();
         mark_consolidated(&conn, id2, id1);
 
         let rows = get_observations_filtered(&conn, &["s1".into()], None, None, None, &crate::policy::ContentPolicy::default()).unwrap();
@@ -1565,8 +1658,8 @@ mod tests {
     fn test_get_observations_for_context_excludes_consolidated() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id1 = insert_observation(&conn, "s1", "insight", "survivor context", None, Some("src/a.rs"), None).unwrap();
-        let id2 = insert_observation(&conn, "s1", "insight", "merged context", None, Some("src/a.rs"), None).unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "survivor context", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged context", None, Some("src/a.rs"), None, Importance::Medium).unwrap();
         mark_consolidated(&conn, id2, id1);
 
         let rows = get_observations_for_context(&conn, &[], &["src/a.rs"], 10, None, &crate::policy::ContentPolicy::default()).unwrap();
@@ -1578,8 +1671,8 @@ mod tests {
     fn test_get_recent_session_ids_excludes_consolidated_only_sessions() {
         let (conn, _dir) = open_test_db();
         conn.execute("INSERT INTO sessions (id, started_at, agent) VALUES ('only-consolidated', 100, 'a')", []).unwrap();
-        let id1 = insert_observation(&conn, "only-consolidated", "insight", "obs", Some("f::x"), None, None).unwrap();
-        let id2 = insert_observation(&conn, "only-consolidated", "insight", "obs2", Some("f::x"), None, None).unwrap();
+        let id1 = insert_observation(&conn, "only-consolidated", "insight", "obs", Some("f::x"), None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "only-consolidated", "insight", "obs2", Some("f::x"), None, None, Importance::Medium).unwrap();
         mark_consolidated(&conn, id1, id2);
         mark_consolidated(&conn, id2, id1); // both consolidated — session has no visible obs
 
@@ -1593,8 +1686,8 @@ mod tests {
     fn test_list_sessions_count_excludes_consolidated() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None).unwrap();
-        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None).unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None, Importance::Medium).unwrap();
         mark_consolidated(&conn, id2, id1);
 
         let sessions = list_sessions(&conn, 10).unwrap();
@@ -1606,12 +1699,245 @@ mod tests {
     fn test_get_session_observations_excludes_consolidated() {
         let (conn, _dir) = open_test_db();
         upsert_session(&conn, "s1", "a").unwrap();
-        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None).unwrap();
-        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None).unwrap();
+        let id1 = insert_observation(&conn, "s1", "insight", "visible", Some("f::x"), None, None, Importance::Medium).unwrap();
+        let id2 = insert_observation(&conn, "s1", "insight", "merged", Some("f::x"), None, None, Importance::Medium).unwrap();
         mark_consolidated(&conn, id2, id1);
 
         let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap().unwrap();
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].id, id1);
+    }
+
+    // ─── Story 11.1 Unit Tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_importance_from_str_valid() {
+        assert_eq!("critical".parse::<Importance>().unwrap(), Importance::Critical);
+        assert_eq!("HIGH".parse::<Importance>().unwrap(), Importance::High);
+        assert_eq!("Medium".parse::<Importance>().unwrap(), Importance::Medium);
+        assert_eq!("low".parse::<Importance>().unwrap(), Importance::Low);
+    }
+
+    #[test]
+    fn test_importance_from_str_invalid() {
+        assert!("urgent".parse::<Importance>().is_err());
+        assert!("".parse::<Importance>().is_err());
+    }
+
+    #[test]
+    fn test_importance_display() {
+        assert_eq!(Importance::Critical.to_string(), "critical");
+        assert_eq!(Importance::High.to_string(), "high");
+        assert_eq!(Importance::Medium.to_string(), "medium");
+        assert_eq!(Importance::Low.to_string(), "low");
+    }
+
+    #[test]
+    fn test_importance_from_sql_to_sql_roundtrip() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id = insert_observation(&conn, "s1", "decision", "arch choice", None, Some("src/a.rs"), None, Importance::Critical).unwrap();
+        let stored: String = conn
+            .query_row("SELECT importance FROM observations WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "critical");
+
+        // Read back through ObservationRow
+        let obs = get_session_observations(&conn, "s1", &crate::policy::ContentPolicy::default()).unwrap().unwrap();
+        assert_eq!(obs[0].importance, Importance::Critical);
+    }
+
+    #[test]
+    fn test_importance_default_for_kind() {
+        assert_eq!(Importance::default_for_kind("decision"), Importance::High);
+        assert_eq!(Importance::default_for_kind("anti_pattern"), Importance::Medium);
+        assert_eq!(Importance::default_for_kind("file_change"), Importance::Low);
+        assert_eq!(Importance::default_for_kind("tool_call"), Importance::Low);
+        assert_eq!(Importance::default_for_kind("context_retrieval"), Importance::Low);
+        assert_eq!(Importance::default_for_kind("insight"), Importance::Medium);
+        assert_eq!(Importance::default_for_kind("unknown_future_kind"), Importance::Medium);
+    }
+
+    #[test]
+    fn test_auto_observation_gets_importance_by_kind() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let tool_id = insert_auto_observation(&conn, "s1", "tool_call", "Read file", None, None, None).unwrap();
+        let ap_id = insert_auto_observation(&conn, "s1", "anti_pattern", "dead-end detected", None, None, None).unwrap();
+
+        let tool_imp: String = conn.query_row("SELECT importance FROM observations WHERE id = ?1", params![tool_id], |r| r.get(0)).unwrap();
+        assert_eq!(tool_imp, "low");
+
+        let ap_imp: String = conn.query_row("SELECT importance FROM observations WHERE id = ?1", params![ap_id], |r| r.get(0)).unwrap();
+        assert_eq!(ap_imp, "medium");
+    }
+
+    #[test]
+    fn test_auto_observation_unknown_kind_defaults_to_low() {
+        // AC3: unknown future auto-captured kinds must default to Low, not Medium
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "a").unwrap();
+        let id = insert_auto_observation(&conn, "s1", "future_new_kind", "something new", None, None, None).unwrap();
+        let imp: String = conn.query_row("SELECT importance FROM observations WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(imp, "low", "unknown auto-captured kinds must default to low per AC3");
+    }
+
+    #[test]
+    fn test_scoring_critical_beats_medium_after_30_days() {
+        let (conn, _dir) = open_test_db();
+        let now = now_epoch();
+        let critical_old = ObservationRow {
+            id: 1, session_id: "s".into(), created_at: now - 30 * 86400,
+            kind: "decision".into(), content: "critical arch".into(),
+            symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            confidence: Some(0.5), branch: None, importance: Importance::Critical,
+        };
+        let medium_week = ObservationRow {
+            id: 2, session_id: "s".into(), created_at: now - 7 * 86400,
+            kind: "insight".into(), content: "medium finding".into(),
+            symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            confidence: Some(0.5), branch: None, importance: Importance::Medium,
+        };
+        let scored = score_observations(&conn, vec![critical_old, medium_week], None);
+        assert!(
+            scored[0].relevance_score > scored[1].relevance_score,
+            "critical from 30 days ({:.4}) must score higher than medium from 7 days ({:.4})",
+            scored[0].relevance_score, scored[1].relevance_score
+        );
+    }
+
+    #[test]
+    fn test_scoring_low_decays_faster_than_medium() {
+        let (conn, _dir) = open_test_db();
+        let now = now_epoch();
+        let medium_obs = ObservationRow {
+            id: 1, session_id: "s".into(), created_at: now - 3 * 86400,
+            kind: "insight".into(), content: "medium".into(),
+            symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            confidence: Some(0.5), branch: None, importance: Importance::Medium,
+        };
+        let low_obs = ObservationRow {
+            id: 2, session_id: "s".into(), created_at: now - 3 * 86400,
+            kind: "tool_call".into(), content: "low".into(),
+            symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            confidence: Some(0.5), branch: None, importance: Importance::Low,
+        };
+        let scored = score_observations(&conn, vec![medium_obs, low_obs], None);
+        assert!(
+            scored[0].relevance_score > scored[1].relevance_score,
+            "medium from 3 days ({:.4}) must score higher than low from 3 days ({:.4})",
+            scored[0].relevance_score, scored[1].relevance_score
+        );
+    }
+
+    #[test]
+    fn test_scoring_critical_365_day_old_still_meaningful() {
+        let (conn, _dir) = open_test_db();
+        let now = now_epoch();
+        let old_critical = ObservationRow {
+            id: 1, session_id: "s".into(), created_at: now - 365 * 86400,
+            kind: "decision".into(), content: "ancient decision".into(),
+            symbol_fqn: None, file_path: None, is_stale: false, stale_reason: None,
+            confidence: Some(0.5), branch: None, importance: Importance::Critical,
+        };
+        let scored = score_observations(&conn, vec![old_critical], None);
+        // At 365 days with 365-day half-life, recency = 0.5
+        // Score = 0.35*0 + 0.40*0.5 + 0.15*0.5 = 0.275
+        assert!(scored[0].relevance_score > 0.2, "365-day critical must still have meaningful score, got {:.4}", scored[0].relevance_score);
+        assert!(scored[0].relevance_score < 0.5, "365-day critical should not dominate, got {:.4}", scored[0].relevance_score);
+    }
+
+    #[test]
+    fn test_purge_protects_critical_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+
+        // Old session with a critical observation
+        conn.execute("INSERT INTO sessions (id, started_at, ended_at, agent) VALUES ('critical-sess', 100, 200, 'a')", []).unwrap();
+        insert_observation(&conn, "critical-sess", "decision", "critical arch decision", None, Some("src/a.rs"), None, Importance::Critical).unwrap();
+        insert_observation(&conn, "critical-sess", "tool_call", "Read file", None, None, None, Importance::Low).unwrap();
+
+        // Old session without critical observations
+        conn.execute("INSERT INTO sessions (id, started_at, ended_at, agent) VALUES ('normal-sess', 100, 200, 'a')", []).unwrap();
+        insert_observation(&conn, "normal-sess", "insight", "routine note", None, None, None, Importance::Medium).unwrap();
+
+        let purged = purge_old_sessions(&mut conn, 1).unwrap();
+        assert_eq!(purged, 1, "only non-critical session should be purged");
+
+        // critical-sess and its observations must survive
+        let critical_exists: bool = conn.query_row("SELECT COUNT(*) FROM sessions WHERE id = 'critical-sess'", [], |r| r.get::<_, i64>(0)).unwrap() > 0;
+        assert!(critical_exists, "critical session must survive purge");
+
+        // normal-sess should be gone
+        let normal_exists: bool = conn.query_row("SELECT COUNT(*) FROM sessions WHERE id = 'normal-sess'", [], |r| r.get::<_, i64>(0)).unwrap() > 0;
+        assert!(!normal_exists, "non-critical session must be purged");
+    }
+
+    #[test]
+    fn test_purge_does_not_protect_high_only_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+
+        conn.execute("INSERT INTO sessions (id, started_at, ended_at, agent) VALUES ('high-sess', 100, 200, 'a')", []).unwrap();
+        insert_observation(&conn, "high-sess", "decision", "high importance", None, None, None, Importance::High).unwrap();
+
+        let purged = purge_old_sessions(&mut conn, 1).unwrap();
+        assert_eq!(purged, 1, "high-only session should be purged (only critical protects)");
+    }
+
+    #[test]
+    fn test_compress_respects_importance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+
+        upsert_session(&conn, "s1", "a").unwrap();
+        // A critical tool_call should survive compression
+        insert_observation(&conn, "s1", "tool_call", "critical tool call", None, None, None, Importance::Critical).unwrap();
+        // A low tool_call should be deleted
+        insert_auto_observation(&conn, "s1", "tool_call", "routine tool call", None, None, None).unwrap();
+        // A regular insight should survive (not ephemeral kind)
+        insert_observation(&conn, "s1", "insight", "keep me", None, None, None, Importance::Medium).unwrap();
+
+        let deleted = compress_specific_session(&mut conn, "s1").unwrap();
+        assert_eq!(deleted, 1, "only the low-importance ephemeral obs should be deleted");
+
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM observations WHERE session_id = 's1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 2, "critical tool_call and insight must survive");
+    }
+
+    #[test]
+    fn test_migration_010_importance_column() {
+        let (conn, _dir) = open_test_db();
+        // Verify the importance column exists with DEFAULT and CHECK constraint
+        upsert_session(&conn, "mig-sess", "test").unwrap();
+        // Insert without specifying importance (should default to 'medium')
+        conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content) VALUES ('mig-sess', 1000, 'insight', 'test')",
+            [],
+        ).unwrap();
+        let imp: String = conn.query_row(
+            "SELECT importance FROM observations WHERE session_id = 'mig-sess'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(imp, "medium", "importance must default to 'medium'");
+
+        // CHECK constraint: invalid value must fail
+        let result = conn.execute(
+            "INSERT INTO observations (session_id, created_at, kind, content, importance) VALUES ('mig-sess', 1001, 'insight', 'test', 'urgent')",
+            [],
+        );
+        assert!(result.is_err(), "CHECK constraint must reject invalid importance values");
+    }
+
+    #[test]
+    fn test_importance_index_exists() {
+        let (conn, _dir) = open_test_db();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_observations_importance_session'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1, "composite index on (importance, session_id) must exist");
     }
 }
