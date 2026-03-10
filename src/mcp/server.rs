@@ -9,6 +9,43 @@ use crate::mcp::{
 use crate::activity::MonitorGuard;
 use crate::workspace::Workspace;
 
+/// MCP server instructions — injected into the initialize response so the LLM
+/// knows when to prefer Olaf tools over native Read/Grep/Glob.
+/// Keep under 800 tokens (~600 words) to avoid context bloat.
+const SERVER_INSTRUCTIONS: &str = "\
+Olaf is a codebase context engine that saves ~68% of exploration tokens by returning \
+pre-indexed, token-budgeted results instead of raw file reads.
+
+## When to use Olaf vs native tools
+
+Decision tree — pick the FIRST matching rule:
+
+1. **About to read or edit a file over 200 lines?** → `get_file_skeleton` first \
+(returns signatures, docstrings, and dependency edges — 90%+ fewer tokens than reading the full file)
+2. **Exploring unfamiliar code?** → `get_brief` (replaces 3-5 Grep+Read calls \
+with a single token-budgeted context brief that auto-reindexes)
+3. **Tracing how code connects across files?** → `trace_flow` (finds execution paths in the call graph \
+instead of manual file-by-file reading)
+4. **Analyzing who depends on a symbol?** → `get_impact` (traverses calls/extends/implements edges)
+5. **Debugging a test failure or runtime error?** → `analyze_failure` (extracts file paths and symbols \
+from stack traces, returns a focused context brief)
+6. **Reading a small known file (<200 lines) for a targeted edit?** → native `Read` is fine
+7. **Searching for a keyword in 1-2 files already in context?** → native `Grep` is fine
+8. **Editing or writing files?** → always use native `Edit`/`Write` (Olaf is read-only)
+
+## Key insight
+
+One Olaf call replaces multiple native Read+Grep calls. For exploration and pre-edit understanding, \
+Olaf tools MUST be preferred — they return only what matters within a token budget, while native reads \
+return entire files including irrelevant sections.
+
+## What Olaf does NOT do
+
+Olaf is read-only. Always use Edit/Write for modifications, Bash for commands. \
+Individual tool descriptions in tools/list provide parameter details — this overview covers \
+tool selection strategy only.\
+";
+
 pub(crate) fn run(mut workspace: Workspace, session_id: String, mut monitor: MonitorGuard) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -149,7 +186,8 @@ fn dispatch_request(
                 "serverInfo": {
                     "name": "olaf",
                     "version": env!("CARGO_PKG_VERSION")
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             });
             Response::ok(id, result)
         }

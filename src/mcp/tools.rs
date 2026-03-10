@@ -25,7 +25,7 @@ pub(crate) fn list() -> Vec<Value> {
     vec![
         serde_json::json!({
             "name": "get_brief",
-            "description": "Get a context brief for any task. Runs context retrieval automatically; includes impact analysis when symbol_fqn is provided. Start here — use get_context or get_impact only when you need fine-grained control.",
+            "description": "Get a context brief for any task. Start here — the recommended entry point for codebase exploration. When to use instead of: multiple Grep + Read calls to understand unfamiliar code. Example: {\"intent\": \"understand the authentication flow\"} returns a token-budgeted brief with relevant symbols, dependencies, and session memory in one call. Includes impact analysis when symbol_fqn is provided. Use get_context or get_impact only when you need fine-grained control.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -117,7 +117,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_file_skeleton",
-            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. Accepts exact or partial file paths.",
+            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. When to use instead of: Read for any file over 200 lines that you need to understand before editing. Returns 90%+ fewer tokens than reading the full file while showing the complete structure. Example: {\"file_path\": \"src/mcp/tools.rs\"} returns all function signatures, struct definitions, and imports without method bodies. Accepts exact or partial file paths.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -131,7 +131,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "trace_flow",
-            "description": "Find execution paths between two symbols in the call graph. Traverses calls/extends/implements edges. Returns shortest paths up to max_paths.",
+            "description": "Find execution paths between two symbols in the call graph. When to use instead of: manually reading files one-by-one to trace how code connects. Traverses calls/extends/implements edges and returns shortest paths up to max_paths.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -20,7 +20,7 @@ This project uses Olaf for intelligent codebase context.
 Olaf MCP tools are deferred. Before first use each session, call:
 ToolSearch("select:mcp__olaf__get_brief,mcp__olaf__get_context,mcp__olaf__get_file_skeleton,mcp__olaf__get_impact,mcp__olaf__trace_flow,mcp__olaf__analyze_failure,mcp__olaf__save_observation,mcp__olaf__index_status")
 
-### Tool routing — prefer Olaf over native tools
+### Tool routing — MUST use Olaf for exploration
 
 | Task | Olaf tool | Instead of | Notes |
 |-|-|-|-|
@@ -40,12 +40,17 @@ Other tools (`get_file_skeleton`, `get_impact`, `trace_flow`) do NOT reindex.
 If results seem stale after edits: call `get_brief` or `get_context` to trigger a local reindex, or run `olaf index` from CLI.
 `index_status` is diagnostic only — it reports freshness but does not reindex.
 
+### Pre-edit understanding
+
+Before editing a file over 200 lines, use `get_file_skeleton` to understand its structure first. \
+This saves 90%+ tokens compared to reading the full file and gives you signatures, docstrings, and dependency edges.
+
 ### When to use native tools instead
 
 - **Editing files**: always use Edit/Write (Olaf is read-only)
 - **Running commands**: always use Bash
-- **Reading a specific known file path**: Read is fine for targeted reads
-- **Simple keyword search in 1-2 files**: Grep is fine for narrow searches
+- **Reading a small known file (<200 lines) for a targeted edit**: Read is fine
+- **Searching for a keyword in files already loaded in context**: Grep is fine
 "#;
 
 // ---------------------------------------------------------------------------
@@ -621,6 +626,21 @@ mod tests {
             }
             other => panic!("expected Malformed for non-hex marker, got {:?}", other),
         }
+    }
+
+    // 10.11 — Rules template contains Story 10.11 guidance text
+    #[test]
+    fn test_rules_template_contains_adoption_guidance() {
+        let rendered = render_rules();
+        // MUST use language for exploration (AC3: changed from "prefer")
+        assert!(rendered.contains("MUST use Olaf for exploration"), "rules must use 'MUST use' for exploration");
+        // Narrowed escape hatch: <200 lines (AC3: narrowed from "targeted reads")
+        assert!(rendered.contains("<200 lines"), "rules must narrow Read to <200 lines");
+        // Pre-edit skeleton recommendation (AC3)
+        assert!(rendered.contains("get_file_skeleton"), "rules must recommend get_file_skeleton for pre-edit");
+        assert!(rendered.contains("Pre-edit understanding"), "rules must have pre-edit understanding section");
+        // Narrowed Grep escape hatch (AC3: files already in context)
+        assert!(rendered.contains("already loaded in context"), "rules must narrow Grep to files in context");
     }
 
     // 6.11 — Body edit detected via full-content hash comparison

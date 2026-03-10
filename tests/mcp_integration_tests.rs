@@ -63,6 +63,12 @@ fn test_initialize_handshake() {
     assert!(r["result"]["capabilities"].is_object());
     assert!(r["result"]["serverInfo"]["name"].is_string());
     assert!(r["result"]["serverInfo"]["version"].is_string());
+    // instructions field must be present and non-empty (Story 10.11 AC1)
+    assert!(r["result"]["instructions"].is_string(), "instructions field must be a string");
+    let instructions = r["result"]["instructions"].as_str().unwrap();
+    assert!(!instructions.is_empty(), "instructions must be non-empty");
+    assert!(instructions.contains("get_brief"), "instructions should mention get_brief");
+    assert!(instructions.contains("get_file_skeleton"), "instructions should mention get_file_skeleton");
     // Error field must be absent
     assert!(r.get("error").is_none() || r["error"].is_null());
 }
