@@ -933,6 +933,13 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
     let id = crate::memory::store::insert_observation(conn, session_id, kind, content, symbol_fqn, file_path, branch.as_deref(), importance)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
 
+    // Suppress future nudges when the agent saves a valuable observation
+    if crate::memory::nudge::is_nudge_suppressing_kind(kind)
+        && let Err(e) = crate::memory::nudge::mark_nudge_sent(conn, session_id)
+    {
+        eprintln!("[olaf] failed to suppress nudge on {kind} save: {e}");
+    }
+
     let scope_label = if is_project_scoped { ", scope=project" } else { "" };
     Ok(format!("Observation saved (id={id}, kind={kind}, importance={importance}{scope_label})."))
 }

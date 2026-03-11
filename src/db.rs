@@ -300,9 +300,13 @@ CREATE TABLE observation_embeddings (
 CREATE INDEX idx_obs_embeddings_model ON observation_embeddings(model_id, model_rev);
 ";
 
+const MIGRATION_012: &str = "
+ALTER TABLE sessions ADD COLUMN nudge_sent INTEGER DEFAULT 0;
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 11;
+pub const MIGRATION_COUNT: i64 = 12;
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -317,7 +321,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_009),
         M::up(MIGRATION_010),
         M::up(MIGRATION_011),
-        // Future migrations: append M::up(MIGRATION_012), etc. — never edit existing entries
+        M::up(MIGRATION_012),
+        // Future migrations: append M::up(MIGRATION_013), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

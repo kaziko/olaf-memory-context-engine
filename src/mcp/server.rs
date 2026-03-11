@@ -230,10 +230,33 @@ fn dispatch_request(
             });
 
             match result {
-                Ok(text) => Response::ok(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-                ),
+                Ok(mut text) => {
+                    // Nudge: append struggle hint to eligible plain-text tools only
+                    if crate::memory::nudge::NUDGE_ELIGIBLE_TOOLS.contains(&tool_name.as_str()) {
+                        match crate::memory::nudge::should_nudge(
+                            workspace.local_conn(),
+                            session_id,
+                        ) {
+                            Ok(Some(nudge)) => {
+                                text.push_str(&nudge);
+                                if let Err(e) = crate::memory::nudge::mark_nudge_sent(
+                                    workspace.local_conn(),
+                                    session_id,
+                                ) {
+                                    eprintln!("[olaf] failed to mark nudge sent: {e}");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("[olaf] nudge check failed: {e}");
+                            }
+                        }
+                    }
+                    Response::ok(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
                 Err(tools::ToolError::UnknownTool(name)) => {
                     Response::error(id, -32601, format!("unknown tool: {name}"))
                 }
@@ -247,5 +270,132 @@ fn dispatch_request(
         }
 
         _ => Response::error(id, -32601, format!("method not found: {method}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::MonitorGuard;
+    use crate::memory::store::{insert_auto_observation, upsert_session};
+    use crate::workspace::Workspace;
+    use serde_json::json;
+
+    /// Create a test workspace with a real DB, returning (workspace, monitor, tempdir).
+    fn test_workspace() -> (Workspace, MonitorGuard, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        let conn = crate::db::open(&db_path).expect("open DB");
+        let ws = Workspace::single(conn, dir.path().to_path_buf(), vec![]);
+        let monitor = MonitorGuard::new(dir.path());
+        (ws, monitor, dir)
+    }
+
+    /// Call tools/call via dispatch_request and return the response text content.
+    fn call_tool(ws: &mut Workspace, monitor: &mut MonitorGuard, session_id: &str, tool: &str, args: Value) -> Response {
+        dispatch_request(
+            ws,
+            session_id,
+            json!(1),
+            "tools/call",
+            Some(&json!({"name": tool, "arguments": args})),
+            monitor,
+        )
+    }
+
+    /// Extract text from a successful tool response.
+    fn extract_text(resp: &Response) -> Option<String> {
+        match &resp.body {
+            crate::mcp::protocol::ResponseBody::Result { result } => {
+                result["content"][0]["text"].as_str().map(String::from)
+            }
+            _ => None,
+        }
+    }
+
+    /// Task 2.4: Eligible tool response with struggle pattern → nudge appended
+    #[test]
+    fn test_dispatch_eligible_tool_with_struggle_gets_nudge() {
+        let (mut ws, mut monitor, _dir) = test_workspace();
+        let sid = "test-sess-1";
+        upsert_session(ws.local_conn(), sid, "test").unwrap();
+
+        // Seed 3 auto_generated file_change observations (struggle pattern)
+        for _ in 0..3 {
+            insert_auto_observation(ws.local_conn(), sid, "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+        }
+
+        // Call get_session_history (eligible tool, lightweight — doesn't need index)
+        let resp = call_tool(&mut ws, &mut monitor, sid, "get_session_history", json!({}));
+        let text = extract_text(&resp).expect("should have text response");
+        assert!(text.contains("[Olaf]"), "nudge should be appended to eligible tool response, got: {text}");
+        assert!(text.contains("src/auth.rs"), "nudge should mention the thrashing file");
+    }
+
+    /// Task 2.5: submit_lsp_edges (ineligible tool) with struggle → no nudge
+    #[test]
+    fn test_dispatch_ineligible_tool_no_nudge() {
+        let (mut ws, mut monitor, _dir) = test_workspace();
+        let sid = "test-sess-2";
+        upsert_session(ws.local_conn(), sid, "test").unwrap();
+
+        // Seed struggle pattern
+        for _ in 0..3 {
+            insert_auto_observation(ws.local_conn(), sid, "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+        }
+
+        // Call submit_lsp_edges (ineligible, returns JSON)
+        let resp = call_tool(&mut ws, &mut monitor, sid, "submit_lsp_edges", json!({"edges": []}));
+        let text = extract_text(&resp);
+        if let Some(t) = text {
+            assert!(!t.contains("[Olaf]"), "nudge must NOT be appended to ineligible tool, got: {t}");
+        }
+        // If tool errors (no edges), that's fine — the key assertion is no nudge in any success response
+    }
+
+    /// Task 2.6: save_observation with kind=insight → nudge_sent flag set, suppresses future nudge
+    #[test]
+    fn test_dispatch_save_insight_suppresses_nudge() {
+        let (mut ws, mut monitor, _dir) = test_workspace();
+        let sid = "test-sess-3";
+        upsert_session(ws.local_conn(), sid, "test").unwrap();
+
+        // Seed struggle pattern
+        for _ in 0..3 {
+            insert_auto_observation(ws.local_conn(), sid, "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+        }
+
+        // Save an insight observation via MCP tool
+        let resp = call_tool(&mut ws, &mut monitor, sid, "save_observation", json!({
+            "kind": "insight",
+            "content": "learned something important",
+            "scope": "project"
+        }));
+        let text = extract_text(&resp);
+        assert!(text.is_some(), "save_observation should succeed");
+
+        // Now verify nudge is suppressed: call eligible tool
+        let resp2 = call_tool(&mut ws, &mut monitor, sid, "get_session_history", json!({}));
+        let text2 = extract_text(&resp2).expect("should have text response");
+        assert!(!text2.contains("[Olaf]"), "nudge must be suppressed after insight save, got: {text2}");
+
+        // Double-check via DB
+        assert!(crate::memory::nudge::is_nudge_sent(ws.local_conn(), sid).unwrap());
+    }
+
+    /// Task 2.7: Healthy session (< 3 edits) → no nudge on eligible tool
+    #[test]
+    fn test_dispatch_healthy_session_no_nudge() {
+        let (mut ws, mut monitor, _dir) = test_workspace();
+        let sid = "test-sess-4";
+        upsert_session(ws.local_conn(), sid, "test").unwrap();
+
+        // Only 2 edits — below threshold
+        insert_auto_observation(ws.local_conn(), sid, "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+        insert_auto_observation(ws.local_conn(), sid, "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+
+        let resp = call_tool(&mut ws, &mut monitor, sid, "get_session_history", json!({}));
+        let text = extract_text(&resp).expect("should have text response");
+        assert!(!text.contains("[Olaf]"), "no nudge for healthy session, got: {text}");
     }
 }
