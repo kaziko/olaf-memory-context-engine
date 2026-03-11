@@ -16,8 +16,9 @@ Once connected, Claude can use these tools:
 
 | Tool | Description |
 |-|-|
-| `save_observation` | Record a decision, insight, or error linked to a symbol FQN or file path |
-| `get_session_history` | Observations from recent sessions, filterable by file or symbol; supports relevance-ranked retrieval. Pass `branch: "all"` to include observations from all branches. |
+| `save_observation` | Record a decision, insight, or error linked to a symbol FQN or file path. Supports `scope: "project"` for cross-file observations not tied to a specific symbol. Importance is auto-assigned (project-scoped decisions default to high). |
+| `get_session_history` | Observations from recent sessions, filterable by file or symbol; supports relevance-ranked retrieval with semantic similarity. Pass `branch: "all"` to include observations from all branches. |
+| `memory_health` | Diagnostic report: observation counts by kind/importance, staleness breakdown, consolidation statistics, and actionable recommendations. Accepts optional `branch` param. |
 
 ## Code navigation & status
 

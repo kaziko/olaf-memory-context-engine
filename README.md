@@ -17,6 +17,11 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 - **Impact analysis** — traces callers, implementors, and type-usage edges for any symbol
 - **Execution path tracing** — find how symbol A reaches symbol B through the call graph
 - **Session memory** — decisions, errors, and insights persist across conversations
+- **Importance tiers** — observations are automatically assigned importance (low → critical) based on kind, scope, and context, so retrieval prioritizes what matters most
+- **Project-scoped observations** — save observations with `scope: "project"` for cross-file insights that aren't tied to a single symbol or file
+- **Semantic recall** — observation retrieval uses vector embeddings to rank results by semantic similarity to your current task, not just recency
+- **Smart nudging** — when Olaf detects struggle patterns (repeated edits to the same file without recording insights), it appends a one-time suggestion to save an observation
+- **Memory health diagnostics** — `memory_health` tool reports observation counts, staleness, consolidation stats, and actionable recommendations
 - **Branch-aware memory** — observations are automatically scoped to the branch you're working on, so feature-branch context stays isolated from main
 - **Dead-end detection** — when Claude records a failed approach, Olaf flags it in future context briefs so the same mistake isn't repeated
 - **Observation consolidation** — near-duplicate observations are automatically merged, keeping memory concise without losing information
@@ -91,8 +96,9 @@ This creates the `.olaf/` database, registers the MCP server in `.mcp.json`, ins
 - `analyze_failure` — parse a stack trace or error and get a context brief focused on the failure path
 
 **Session memory:**
-- `save_observation` — record a decision, insight, or error linked to a symbol or file
-- `get_session_history` — retrieve past observations across sessions, ranked by relevance
+- `save_observation` — record a decision, insight, or error linked to a symbol or file (supports `scope: "project"` for cross-file observations)
+- `get_session_history` — retrieve past observations across sessions, ranked by relevance and semantic similarity
+- `memory_health` — observation counts, staleness breakdown, consolidation stats, and actionable recommendations
 
 **Code navigation:**
 - `trace_flow` — trace execution paths between two symbols through the call graph

@@ -21,6 +21,51 @@ Most observations are captured automatically by the PostToolUse hook — you onl
 Use get_session_history filtered to src/db/connection_pool.rs
 ```
 
+## Importance tiers
+
+Every observation is assigned an importance level — **low**, **medium**, **high**, or **critical** — based on its kind and scope:
+
+- `file_change` and `tool_call` (auto-captured) → low
+- `insight` and `error` → medium
+- `decision` → high
+- Project-scoped decisions → high (elevated automatically)
+
+When retrieval results exceed the token budget, lower-importance observations are dropped first. You can override the default by passing `importance` to `save_observation`.
+
+## Project-scoped observations
+
+Some insights apply to the project as a whole, not a specific file or symbol — for example, "this codebase uses the repository pattern for all DB access." Save these with `scope: "project"`:
+
+```
+Use save_observation with scope "project" to record that all database
+access goes through the repository pattern
+```
+
+Project-scoped observations appear in context briefs regardless of which file is being explored.
+
+## Semantic recall
+
+When you retrieve observations via `get_session_history` or through context briefs, Olaf ranks results by **semantic similarity** to your current task — not just recency. This means a two-week-old insight about "connection pool timeout handling" will surface when you're debugging a timeout, even if dozens of unrelated observations were recorded since.
+
+Semantic ranking uses vector embeddings computed in the background. New observations are embedded automatically; no configuration needed.
+
+## Smart nudging
+
+When Olaf detects a **struggle pattern** — the same file edited 3+ times within 5 minutes without any insight, decision, or error observation being recorded — it appends a one-time suggestion to the next eligible tool response:
+
+> [Olaf] Multiple edits to `src/auth.rs` in the last 5 minutes without saving an insight. Consider: save_observation(...)
+
+The nudge fires at most once per session and is automatically suppressed if you save a valuable observation at any point. It only appears on plain-text tools (`get_brief`, `get_context`, `get_session_history`, `memory_health`) — never on JSON-returning tools like `submit_lsp_edges`.
+
+## Memory health
+
+Run `memory_health` to get a diagnostic report of your observation store:
+
+- Observation counts by kind and importance
+- Staleness breakdown (how many observations reference code that has since changed)
+- Consolidation statistics
+- Actionable recommendations (e.g., "42% of observations are stale — consider reviewing")
+
 ## Branch-scoped memory
 
 Observations are automatically tagged with the current git branch at capture time. When you retrieve context or session history, only observations from the current branch (plus branch-less legacy observations) are returned by default.
