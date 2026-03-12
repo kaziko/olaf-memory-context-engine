@@ -263,27 +263,7 @@ pub(crate) fn compute_confidence(
     score.clamp(0.0, 1.0)
 }
 
-/// Layer 3 sensitive-file exclusion for observations (defense-in-depth).
-/// KEEP IN SYNC with `graph/query.rs::is_output_sensitive` and `index::is_sensitive`.
-pub fn is_sensitive_path(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let file_name = match p.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    if matches!(file_name, ".env" | "id_rsa") {
-        return true;
-    }
-    if file_name.starts_with(".env.") || file_name.starts_with("id_rsa.") {
-        return true;
-    }
-    if let Some(ext) = p.extension().and_then(|e| e.to_str())
-        && matches!(ext, "pem" | "key" | "p12")
-    {
-        return true;
-    }
-    false
-}
+pub use crate::sensitive::is_sensitive as is_sensitive_path;
 
 #[derive(Debug)]
 pub(crate) struct ScoredObservation {
@@ -1574,16 +1554,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_sensitive_path() {
+    fn test_is_sensitive_path_re_export_works() {
+        // Smoke test: verifies the public re-export alias resolves to the shared implementation.
         assert!(is_sensitive_path(".env"));
-        assert!(is_sensitive_path(".env.local"));
-        assert!(is_sensitive_path("id_rsa"));
-        assert!(is_sensitive_path("id_rsa.pub"));
-        assert!(is_sensitive_path("certs/server.pem"));
-        assert!(is_sensitive_path("keys/my.key"));
-        assert!(is_sensitive_path("store.p12"));
         assert!(!is_sensitive_path("src/main.rs"));
-        assert!(!is_sensitive_path("config.toml"));
     }
 
     // ─── Story 3.4 Unit Tests ────────────────────────────────────────────────────

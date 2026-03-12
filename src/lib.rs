@@ -8,4 +8,5 @@ pub mod memory;
 pub mod policy;
 pub mod parser;
 pub mod restore;
+mod sensitive;
 pub mod workspace;
