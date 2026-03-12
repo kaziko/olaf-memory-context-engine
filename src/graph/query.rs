@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::graph::skeleton::skeletonize;
 use crate::policy::ContentPolicy;
+use crate::sensitive::is_sensitive;
 use crate::workspace::Workspace;
 
 #[derive(Debug, thiserror::Error)]
@@ -204,22 +205,6 @@ pub(crate) struct PivotScore {
 pub(crate) struct TaggedPivotScore {
     pub pivot: PivotScore,
     pub member_index: usize,
-}
-
-/// Layer 2 sensitive-file exclusion (defense-in-depth).
-/// KEEP IN SYNC with `index::is_sensitive` in src/index/mod.rs.
-/// Cannot import that function directly — would create a circular dependency.
-fn is_output_sensitive(file_path: &str) -> bool {
-    let path = std::path::Path::new(file_path);
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    if matches!(file_name, ".env" | "id_rsa") { return true; }
-    if file_name.starts_with(".env.") || file_name.starts_with("id_rsa.") { return true; }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && matches!(ext, "pem" | "key" | "p12") { return true; }
-    false
 }
 
 fn estimate_tokens(s: &str) -> usize {
@@ -713,7 +698,7 @@ fn build_context_brief(
 
     for id in &pivots {
         let Some(row) = load_symbol_row(conn, *id)? else { continue };
-        if is_output_sensitive(&row.file_path) { continue; }
+        if is_sensitive(&row.file_path) { continue; }
         if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
         all_fqns.insert(row.fqn.clone());
@@ -743,7 +728,7 @@ fn build_context_brief(
         let mut skeleton_tokens = 0usize;
         for (id, reason) in &supporting_with_reasons {
             let Some(row) = load_symbol_row(conn, *id)? else { continue };
-            if is_output_sensitive(&row.file_path) { continue; }
+            if is_sensitive(&row.file_path) { continue; }
             if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
             all_fqns.insert(row.fqn.clone());
@@ -1111,7 +1096,7 @@ pub(crate) fn build_context_brief_multi(
         };
 
         let Some(row) = load_symbol_row(m.conn, tp.pivot.id)? else { continue };
-        if is_output_sensitive(&row.file_path) { continue; }
+        if is_sensitive(&row.file_path) { continue; }
         if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
         // Only collect identifiers from local repo for memory matching
@@ -1160,7 +1145,7 @@ pub(crate) fn build_context_brief_multi(
             let mut skeleton_tokens = 0usize;
             for (id, reason) in &supporting_with_reasons {
                 let Some(row) = load_symbol_row(local.conn, *id)? else { continue };
-                if is_output_sensitive(&row.file_path) { continue; }
+                if is_sensitive(&row.file_path) { continue; }
                 if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
 
                 local_fqns.insert(row.fqn.clone());
@@ -1356,7 +1341,7 @@ fn query_file_candidates(
 
 pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy) -> Result<String, QueryError> {
     // Input-level sensitive check — returns "not permitted" to the caller
-    if is_output_sensitive(file_path) {
+    if is_sensitive(file_path) {
         return Ok(format!("Access to sensitive file '{file_path}' is not permitted.\n"));
     }
 
@@ -1375,7 +1360,7 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
     }
 
     // Sensitive filter on candidates: silently remove — don't reveal that sensitive paths exist
-    candidates.retain(|p| !is_output_sensitive(p));
+    candidates.retain(|p| !is_sensitive(p));
 
     // Content policy deny filter on candidates
     candidates.retain(|p| !content_policy.is_denied(p, None));
@@ -1494,7 +1479,7 @@ pub(crate) fn get_impact(
         for (id, fqn, name, path, kind) in rows {
             if visited.insert(id) {
                 queue.push_back((id, current_depth + 1));
-                if !is_output_sensitive(&path) && !content_policy.is_denied(&path, Some(&fqn)) {
+                if !is_sensitive(&path) && !content_policy.is_denied(&path, Some(&fqn)) {
                     results.push((fqn, name, path, kind, current_depth + 1));
                 }
             }

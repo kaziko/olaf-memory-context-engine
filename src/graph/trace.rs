@@ -1,21 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::policy::ContentPolicy;
-
-/// Layer 2 sensitive-file exclusion (defense-in-depth).
-/// KEEP IN SYNC with `is_output_sensitive` in `graph/query.rs`.
-fn is_output_sensitive(file_path: &str) -> bool {
-    let path = std::path::Path::new(file_path);
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    if matches!(file_name, ".env" | "id_rsa") { return true; }
-    if file_name.starts_with(".env.") || file_name.starts_with("id_rsa.") { return true; }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && matches!(ext, "pem" | "key" | "p12") { return true; }
-    false
-}
+use crate::sensitive::is_sensitive;
 
 pub(crate) const MAX_PATHS_DEFAULT: usize = 5;
 pub(crate) const MAX_PATHS_LIMIT: usize = 20;
@@ -146,7 +132,7 @@ pub(crate) fn format_trace_result(source_fqn: &str, target_fqn: &str, result: &T
     // Defense-in-depth: filter paths that contain any sensitive or denied node.
     let visible_paths: Vec<&Vec<PathNode>> = result.paths.iter()
         .filter(|path| !path.iter().any(|n|
-            is_output_sensitive(&n.file_path) || content_policy.is_denied(&n.file_path, Some(&n.fqn))
+            is_sensitive(&n.file_path) || content_policy.is_denied(&n.file_path, Some(&n.fqn))
         ))
         .collect();
 
