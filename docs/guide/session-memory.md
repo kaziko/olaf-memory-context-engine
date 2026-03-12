@@ -2,6 +2,8 @@
 
 Olaf records observations — decisions, errors, insights, file changes — linked to specific symbols and files. These persist across sessions and surface automatically when Claude retrieves context for the same area of code.
 
+Session memory is for **code-related** knowledge: what was tried, what failed, why a design decision was made, how a particular module works. It is not the place for workflow preferences, output formatting ("use lists instead of tables"), or coding style rules — those belong in `CLAUDE.md`, which Claude reads at the start of every session.
+
 ## Why this matters
 
 Without memory, Claude starts every session from zero. If a previous session tried an approach that failed, Claude has no way to know. With Olaf, past observations appear in the context brief alongside the code, so Claude avoids repeating mistakes and builds on previous work.
@@ -51,11 +53,17 @@ Semantic ranking uses vector embeddings computed in the background. New observat
 
 ## Smart nudging
 
-When Olaf detects a **struggle pattern** — the same file edited 3+ times within 5 minutes without any insight, decision, or error observation being recorded — it appends a one-time suggestion to the next eligible tool response:
+Olaf detects two patterns that suggest Claude could work more effectively and appends a one-time suggestion to the next eligible tool response:
+
+**Repo-wide search detection** — when Claude uses `rg` or `grep -r` three or more times in the recent 10 Bash commands, Olaf suggests switching to `get_brief` for token-budgeted exploration:
+
+> [Olaf] You've used repo-wide search 3 times recently. For exploration, try: get_brief({"intent": "find where auth tokens are validated"})
+
+**File-thrash detection** — when the same file is edited 3+ times within 5 minutes without recording any insight, decision, or error:
 
 > [Olaf] Multiple edits to `src/auth.rs` in the last 5 minutes without saving an insight. Consider: save_observation(...)
 
-The nudge fires at most once per session and is automatically suppressed if you save a valuable observation at any point. It only appears on plain-text tools (`get_brief`, `get_context`, `get_session_history`, `memory_health`) — never on JSON-returning tools like `submit_lsp_edges`.
+Both nudges fire at most once per session (whichever triggers first) and are automatically suppressed if you save a valuable observation at any point. When both signals are present, the bash-search nudge takes priority. Nudges only appear on read-oriented tools (`get_brief`, `get_context`, `get_session_history`, `memory_health`, `get_file_skeleton`, `get_impact`, `trace_flow`, `analyze_failure`) — never on mutation tools like `save_observation` or JSON-returning tools like `submit_lsp_edges`.
 
 ## Memory health
 

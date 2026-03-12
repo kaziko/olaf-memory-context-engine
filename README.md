@@ -20,7 +20,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 - **Importance tiers** — observations are automatically assigned importance (low → critical) based on kind, scope, and context, so retrieval prioritizes what matters most
 - **Project-scoped observations** — save observations with `scope: "project"` for cross-file insights that aren't tied to a single symbol or file
 - **Semantic recall** — observation retrieval uses vector embeddings to rank results by semantic similarity to your current task, not just recency
-- **Smart nudging** — when Olaf detects struggle patterns (repeated edits to the same file without recording insights), it appends a one-time suggestion to save an observation
+- **Smart nudging** — detects two patterns: repeated repo-wide search commands (`rg`, `grep -r`) that `get_brief` would handle more efficiently, and file-thrash (repeated edits without recording insights). Appends a one-time suggestion to the next eligible tool response
 - **Memory health diagnostics** — `memory_health` tool reports observation counts, staleness, consolidation stats, and actionable recommendations
 - **Branch-aware memory** — observations are automatically scoped to the branch you're working on, so feature-branch context stays isolated from main
 - **Dead-end detection** — when Claude records a failed approach, Olaf flags it in future context briefs so the same mistake isn't repeated
