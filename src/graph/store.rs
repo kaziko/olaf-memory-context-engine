@@ -18,7 +18,7 @@ pub(crate) struct SymbolDiff {
 }
 
 /// Index statistics as stored in the DB — shared by `olaf status` (CLI)
-/// and the `index_status` MCP tool (Story 2.3).
+/// and the `index_status` MCP tool.
 pub struct DbStats {
     pub files: i64,
     pub symbols: i64,
@@ -372,8 +372,8 @@ pub(crate) fn collect_fqns_for_unseen_files(
 /// - The file is not in the index
 /// - No symbol spans the given line
 ///
-/// NOTE: This function is implemented as infrastructure for Story 4.3 (PreToolUse correlation)
-/// and is NOT called by the PostToolUse handler in Story 4.1.
+/// Resolves a file-path + line-number to the FQN of the symbol whose definition
+/// spans that line. Returns None if the file is not indexed or no symbol spans the line.
 pub fn lookup_symbol_at_line(
     conn: &Connection,
     rel_path: &str,

@@ -197,7 +197,7 @@ pub fn insert_auto_observation(
     branch: Option<&str>,
 ) -> Result<i64, StoreError> {
     let ts = now_secs();
-    // AC3: unknown auto-captured kinds default to Low (safe for future kinds),
+    // Unknown auto-captured kinds default to Low (safe for future kinds),
     // unlike manual kinds which default to Medium via default_for_kind catch-all.
     let importance = match Importance::default_for_kind(kind) {
         Importance::Medium if !matches!(kind, "anti_pattern" | "decision" | "insight" | "error") => Importance::Low,
