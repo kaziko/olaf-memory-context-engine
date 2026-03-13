@@ -238,14 +238,18 @@ pub(crate) fn rank_symbols_by_keywords(
         .map(|w| w.to_lowercase())
         .collect();
 
+    if unique_words.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut candidates: HashMap<i64, usize> = HashMap::new();
+    let mut kw_stmt = conn.prepare(
+        "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
+         ORDER BY id ASC LIMIT ?2"
+    )?;
     for word in &unique_words {
         let pattern = format!("%{word}%");
-        let mut stmt = conn.prepare(
-            "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
-             ORDER BY id ASC LIMIT ?2"
-        )?;
-        let rows: Vec<i64> = stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
+        let rows: Vec<i64> = kw_stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
             .collect::<Result<_,_>>()?;
         for id in rows { *candidates.entry(id).or_insert(0) += 1; }
     }
@@ -257,12 +261,18 @@ pub(crate) fn rank_symbols_by_keywords(
     const IN_DEG_CHUNK: usize = 500;
     let cand_ids: Vec<i64> = candidates.keys().copied().collect();
     let mut in_degrees: HashMap<i64, i64> = HashMap::new();
+    let mut full_chunk_stmt: Option<rusqlite::Statement<'_>> = None;
+    let mut tail_chunk_stmt: Option<rusqlite::Statement<'_>> = None;
     for chunk in cand_ids.chunks(IN_DEG_CHUNK) {
-        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+        let opt = if chunk.len() == IN_DEG_CHUNK { &mut full_chunk_stmt } else { &mut tail_chunk_stmt };
+        if opt.is_none() {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
+            );
+            *opt = Some(conn.prepare(&sql)?);
+        }
+        let stmt = opt.as_mut().expect("statement was just prepared above");
         let rows: Vec<(i64, i64)> = stmt
             .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -283,18 +293,28 @@ pub(crate) fn rank_symbols_by_keywords(
             .then(a.0.cmp(&b.0))
     });
 
-    let mut result = Vec::new();
-    for (id, kw, in_deg) in scored.into_iter().take(limit) {
-        if let Some(fqn) = conn.query_row(
-            "SELECT fqn FROM symbols WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, String>(0),
-        ).optional()? {
-            result.push(PivotScore {
+    let top: Vec<(i64, usize, i64)> = scored.into_iter().take(limit).collect();
+    if top.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = top.iter().map(|(id, _, _)| *id).collect();
+    let fqn_placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let fqn_sql = format!("SELECT id, fqn FROM symbols WHERE id IN ({fqn_placeholders})");
+    let mut fqn_stmt = conn.prepare(&fqn_sql)?;
+    let fqn_map: HashMap<i64, String> = fqn_stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<_,_>>()?;
+    let mut result: Vec<PivotScore> = Vec::with_capacity(top.len());
+    for (id, kw, in_deg) in top {
+        match fqn_map.get(&id) {
+            Some(fqn) => result.push(PivotScore {
                 id,
-                fqn,
+                fqn: fqn.clone(),
                 reason: SelectionReason::Keyword { kw_score: kw, in_degree: in_deg },
-            });
+            }),
+            None => log::warn!("rank_symbols_by_keywords: symbol id={id} scored but missing from fqn batch query — row may have been deleted"),
         }
     }
     Ok(result)
@@ -306,13 +326,13 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
     // --- File hints branch ---
     if !file_hints.is_empty() {
         let mut result: Vec<PivotScore> = Vec::new();
+        let mut hint_stmt = conn.prepare(
+            "SELECT s.id, s.fqn FROM symbols s JOIN files f ON f.id=s.file_id
+             WHERE f.path LIKE ?1 ORDER BY (s.end_line-s.start_line) DESC LIMIT 10"
+        )?;
         for hint in file_hints {
             let pattern = format!("%{hint}%");
-            let mut stmt = conn.prepare(
-                "SELECT s.id, s.fqn FROM symbols s JOIN files f ON f.id=s.file_id
-                 WHERE f.path LIKE ?1 ORDER BY (s.end_line-s.start_line) DESC LIMIT 10"
-            )?;
-            let rows: Vec<(i64, String)> = stmt.query_map(params![pattern], |r| {
+            let rows: Vec<(i64, String)> = hint_stmt.query_map(params![pattern], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?.collect::<Result<_,_>>()?;
             for (id, fqn) in rows {
@@ -344,6 +364,33 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
     Ok(rows.into_iter().map(|(id, fqn)| PivotScore { id, fqn, reason: SelectionReason::Fallback }).collect())
 }
 
+fn process_inbound_edges(
+    stmt: &mut rusqlite::Statement<'_>,
+    current_id: i64,
+    current_depth: usize,
+    pivot_set: &HashSet<i64>,
+    visited: &mut HashSet<i64>,
+    queue: &mut VecDeque<(i64, usize)>,
+    supporting: &mut Vec<(i64, String)>,
+) -> Result<(), QueryError> {
+    let inbound: Vec<i64> = stmt.query_map(params![current_id], |r| r.get(0))?
+        .collect::<Result<_,_>>()?;
+    for id in inbound {
+        if visited.insert(id) {
+            queue.push_back((id, current_depth + 1));
+            if !pivot_set.contains(&id) {
+                let reason = if current_depth == 0 {
+                    "inbound caller of pivot".to_string()
+                } else {
+                    format!("inbound caller (depth {})", current_depth + 1)
+                };
+                supporting.push((id, reason));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::type_complexity)]
 fn traverse_bfs(
     conn: &Connection,
@@ -355,35 +402,22 @@ fn traverse_bfs(
     let mut queue: VecDeque<(i64, usize)> = pivot_ids.iter().map(|&id| (id, 0)).collect();
     let mut supporting: Vec<(i64, String)> = Vec::new();
 
+    let mut inbound_stmt = conn.prepare(
+        "SELECT DISTINCT source_id FROM edges WHERE target_id=?1 ORDER BY source_id LIMIT 20"
+    )?;
+    let mut outbound_stmt = conn.prepare(
+        "SELECT DISTINCT target_id FROM edges WHERE source_id=?1 ORDER BY target_id LIMIT 20"
+    )?;
+
     while let Some((current_id, current_depth)) = queue.pop_front() {
         if current_depth >= policy.depth { continue; }
 
         if policy.inbound_first {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT source_id FROM edges WHERE target_id=?1 ORDER BY source_id LIMIT 20"
-            )?;
-            let inbound: Vec<i64> = stmt.query_map(params![current_id], |r| r.get(0))?
-                .collect::<Result<_,_>>()?;
-            for id in inbound {
-                if visited.insert(id) {
-                    queue.push_back((id, current_depth + 1));
-                    if !pivot_set.contains(&id) {
-                        let reason = if current_depth == 0 {
-                            "inbound caller of pivot".to_string()
-                        } else {
-                            format!("inbound caller (depth {})", current_depth + 1)
-                        };
-                        supporting.push((id, reason));
-                    }
-                }
-            }
+            process_inbound_edges(&mut inbound_stmt, current_id, current_depth, &pivot_set, &mut visited, &mut queue, &mut supporting)?;
         }
 
         // Outbound edges
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT target_id FROM edges WHERE source_id=?1 ORDER BY target_id LIMIT 20"
-        )?;
-        let outbound: Vec<i64> = stmt.query_map(params![current_id], |r| r.get(0))?
+        let outbound: Vec<i64> = outbound_stmt.query_map(params![current_id], |r| r.get(0))?
             .collect::<Result<_,_>>()?;
         for id in outbound {
             if visited.insert(id) {
@@ -400,24 +434,7 @@ fn traverse_bfs(
         }
 
         if policy.include_inbound && !policy.inbound_first {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT source_id FROM edges WHERE target_id=?1 ORDER BY source_id LIMIT 20"
-            )?;
-            let inbound: Vec<i64> = stmt.query_map(params![current_id], |r| r.get(0))?
-                .collect::<Result<_,_>>()?;
-            for id in inbound {
-                if visited.insert(id) {
-                    queue.push_back((id, current_depth + 1));
-                    if !pivot_set.contains(&id) {
-                        let reason = if current_depth == 0 {
-                            "inbound caller of pivot".to_string()
-                        } else {
-                            format!("inbound caller (depth {})", current_depth + 1)
-                        };
-                        supporting.push((id, reason));
-                    }
-                }
-            }
+            process_inbound_edges(&mut inbound_stmt, current_id, current_depth, &pivot_set, &mut visited, &mut queue, &mut supporting)?;
         }
     }
 
@@ -1461,16 +1478,16 @@ pub(crate) fn get_impact(
     let mut results: Vec<(String, String, String, String, usize)> = Vec::new(); // fqn, name, path, kind, depth
     let mut truncated = false;
 
+    let mut impact_stmt = conn.prepare(
+        "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
+         FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
+         WHERE e.target_id=?1
+           AND e.kind IN ('calls', 'extends', 'implements', 'uses_type')
+         LIMIT ?2"
+    )?;
     while let Some((current_id, current_depth)) = queue.pop_front() {
         if current_depth >= depth { continue; }
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
-             FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
-             WHERE e.target_id=?1
-               AND e.kind IN ('calls', 'extends', 'implements', 'uses_type')
-             LIMIT ?2"
-        )?;
-        let rows: Vec<(i64, String, String, String, String)> = stmt.query_map(
+        let rows: Vec<(i64, String, String, String, String)> = impact_stmt.query_map(
             params![current_id, MAX_IMPACT_PER_HOP as i64],
             |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?,
                     r.get::<_,String>(3)?, r.get::<_,String>(4)?))
@@ -2286,6 +2303,94 @@ mod tests {
         let keywords = vec!["nonexistent_keyword_xyz".to_string()];
         let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
         assert!(result.is_empty(), "no match must return empty vec (no first-in-DB fallback)");
+    }
+
+    #[test]
+    fn rank_symbols_by_keywords_limit_zero_returns_empty() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/a.rs','h')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1,1,'src/a.rs::authentication','authentication','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        let keywords = vec!["authentication".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 0).unwrap();
+        assert!(result.is_empty(), "limit=0 must return empty vec without panicking or invalid SQL");
+    }
+
+    #[test]
+    fn rank_symbols_by_keywords_three_tier_sort_and_metadata() {
+        // Tests all three sort dimensions and verifies kw_score/in_degree survive into PivotScore.
+        //
+        // Keywords: ["alpha", "beta"] (both len > 3)
+        //   sym 10: name="alphabeta" — contains both "alpha" and "beta" → kw_score=2
+        //   sym 20: name="alpha_high" — contains "alpha" only → kw_score=1, in_degree=5
+        //   sym 30: name="alpha_low_a" — contains "alpha" only → kw_score=1, in_degree=2, id=30
+        //   sym 40: name="alpha_low_b" — contains "alpha" only → kw_score=1, in_degree=2, id=40
+        //
+        // Expected order: sym10 (kw dominates), sym20 (in_deg tiebreak), sym30 (id tiebreak), sym40
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'src/a.rs','h')", []).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols VALUES (10,1,'src::alphabeta','alphabeta','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (20,1,'src::alpha_high','alpha_high','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (30,1,'src::alpha_low_a','alpha_low_a','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (40,1,'src::alpha_low_b','alpha_low_b','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+
+        // sym 20: 5 incoming edges (in_degree=5)
+        for src in [101i64, 102, 103, 104, 105] {
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 20, 'calls')",
+                params![src],
+            ).unwrap();
+        }
+        // sym 30 and sym 40: 2 incoming edges each (in_degree=2), same to test id tiebreak
+        for src in [201i64, 202] {
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 30, 'calls')",
+                params![src],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 40, 'calls')",
+                params![src],
+            ).unwrap();
+        }
+
+        let keywords = vec!["alpha".to_string(), "beta".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 10).unwrap();
+        assert_eq!(result.len(), 4);
+
+        // Primary sort: kw_score DESC — sym 10 (kw=2) beats all kw=1 symbols
+        assert_eq!(result[0].id, 10, "kw_score=2 must beat kw_score=1 regardless of in_degree");
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { kw_score: 2, .. }),
+            "kw_score=2 must survive into PivotScore.reason; got {:?}", result[0].reason);
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { in_degree: 0, .. }),
+            "in_degree=0 must survive into PivotScore.reason; got {:?}", result[0].reason);
+
+        // First tiebreak: in_degree DESC — sym 20 (in_deg=5) beats sym 30 and sym 40 (in_deg=2)
+        assert_eq!(result[1].id, 20, "in_degree=5 must beat in_degree=2 at equal kw_score");
+        assert!(matches!(result[1].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 5 }),
+            "kw_score=1 and in_degree=5 must survive for sym 20; got {:?}", result[1].reason);
+
+        // Second tiebreak: id ASC — sym 30 (id=30) beats sym 40 (id=40) at equal kw+in_deg
+        assert_eq!(result[2].id, 30, "lower id=30 must beat id=40 at equal kw_score and in_degree");
+        assert_eq!(result[3].id, 40);
+        assert!(matches!(result[2].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 2 }),
+            "metadata for id=30 must be correct; got {:?}", result[2].reason);
+        assert!(matches!(result[3].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 2 }),
+            "metadata for id=40 must be correct; got {:?}", result[3].reason);
     }
 
     // ─── Story 9.8: Score explainability tests ──────
