@@ -233,6 +233,10 @@ pub(crate) fn rank_symbols_by_keywords(
     keywords: &[String],
     limit: usize,
 ) -> Result<Vec<PivotScore>, QueryError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let unique_words: HashSet<String> = keywords.iter()
         .filter(|w| w.len() > 3)
         .map(|w| w.to_lowercase())
