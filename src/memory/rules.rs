@@ -652,9 +652,9 @@ pub(crate) fn get_active_rules(
     // Populate symbol_fqns and file_paths for each rule via batched queries
     let rule_ids: Vec<i64> = rules.iter().map(|r| r.id).collect();
     if !rule_ids.is_empty() {
-        let sym_placeholders = rule_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = rule_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sym_sql = format!(
-            "SELECT rule_id, symbol_fqn FROM rule_symbols WHERE rule_id IN ({sym_placeholders}) ORDER BY symbol_fqn"
+            "SELECT rule_id, symbol_fqn FROM rule_symbols WHERE rule_id IN ({placeholders}) ORDER BY symbol_fqn"
         );
         let mut sym_stmt = conn.prepare(&sym_sql)?;
         let mut sym_map: HashMap<i64, Vec<String>> = HashMap::new();
@@ -667,7 +667,7 @@ pub(crate) fn get_active_rules(
             sym_map.entry(rule_id).or_default().push(fqn);
         }
 
-        let file_placeholders = rule_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let file_placeholders = &placeholders;
         let file_sql = format!(
             "SELECT rule_id, file_path FROM rule_files WHERE rule_id IN ({file_placeholders}) ORDER BY file_path"
         );
@@ -1372,15 +1372,11 @@ mod tests {
         assert_eq!(rules.len(), 2);
 
         let rule1 = rules.iter().find(|r| r.content == "rule one").expect("rule one must be present");
-        let mut sym1 = rule1.symbol_fqns.clone();
-        sym1.sort();
-        assert_eq!(sym1, vec!["src/a.rs::alpha", "src/a.rs::beta"], "rule1 symbol_fqns must match");
+        assert_eq!(rule1.symbol_fqns, vec!["src/a.rs::alpha", "src/a.rs::beta"], "rule1 symbol_fqns must be in ORDER BY symbol_fqn order");
         assert_eq!(rule1.file_paths, vec!["src/a.rs"], "rule1 file_paths must match");
 
         let rule2 = rules.iter().find(|r| r.content == "rule two").expect("rule two must be present");
         assert_eq!(rule2.symbol_fqns, vec!["src/b.rs::gamma"], "rule2 symbol_fqns must match");
-        let mut paths2 = rule2.file_paths.clone();
-        paths2.sort();
-        assert_eq!(paths2, vec!["src/b.rs", "src/c.rs"], "rule2 file_paths must match");
+        assert_eq!(rule2.file_paths, vec!["src/b.rs", "src/c.rs"], "rule2 file_paths must be in ORDER BY file_path order");
     }
 }

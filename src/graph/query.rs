@@ -238,6 +238,10 @@ pub(crate) fn rank_symbols_by_keywords(
         .map(|w| w.to_lowercase())
         .collect();
 
+    if unique_words.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut candidates: HashMap<i64, usize> = HashMap::new();
     let mut kw_stmt = conn.prepare(
         "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
@@ -268,7 +272,7 @@ pub(crate) fn rank_symbols_by_keywords(
             );
             *opt = Some(conn.prepare(&sql)?);
         }
-        let stmt = opt.as_mut().unwrap();
+        let stmt = opt.as_mut().expect("statement was just prepared above");
         let rows: Vec<(i64, i64)> = stmt
             .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -302,15 +306,17 @@ pub(crate) fn rank_symbols_by_keywords(
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?
         .collect::<Result<_,_>>()?;
-    let result: Vec<PivotScore> = top.into_iter()
-        .filter_map(|(id, kw, in_deg)| {
-            fqn_map.get(&id).map(|fqn| PivotScore {
+    let mut result: Vec<PivotScore> = Vec::with_capacity(top.len());
+    for (id, kw, in_deg) in top {
+        match fqn_map.get(&id) {
+            Some(fqn) => result.push(PivotScore {
                 id,
                 fqn: fqn.clone(),
                 reason: SelectionReason::Keyword { kw_score: kw, in_degree: in_deg },
-            })
-        })
-        .collect();
+            }),
+            None => log::warn!("rank_symbols_by_keywords: symbol id={id} scored but missing from fqn batch query — row may have been deleted"),
+        }
+    }
     Ok(result)
 }
 
