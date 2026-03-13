@@ -1,4 +1,4 @@
-// Restore store — filesystem snapshot operations for Story 4.3+
+// Restore store — filesystem snapshot and restore-point operations
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -175,14 +175,14 @@ pub fn snapshot(storage_root: &std::path::Path, rel_file_path: &str, source_root
     std::fs::create_dir_all(&snap_dir)?;
 
     // Filename: <millis>-<pid>-<seq>.snap
-    // - millis: Story 4.4 sorts by numeric prefix (up to first '-')
+    // - millis: callers parse the numeric prefix (up to first '-') to sort and filter snapshots
     // - pid: prevents concurrent-process collision at same millisecond
     // - seq: prevents same-process same-millisecond collision (e.g. burst edits)
     let tmp_path = snap_dir.join(format!("{}-{}-{}.snap.tmp", ts, pid, seq));
     let snap_path = snap_dir.join(format!("{}-{}-{}.snap", ts, pid, seq));
 
     std::fs::write(&tmp_path, &contents)?;
-    std::fs::rename(&tmp_path, &snap_path)?; // atomic on POSIX (NFR13)
+    std::fs::rename(&tmp_path, &snap_path)?; // atomic replacement on same filesystem — no partial-write visible
 
     Ok(())
 }
@@ -250,7 +250,7 @@ pub fn restore_to_snapshot(cwd: &std::path::Path, rel_file_path: &str, snapshot_
     let contents = std::fs::read(&snap_path)?;
     let abs_path = cwd.join(rel_file_path);
 
-    // Preserve permissions (NFR13): capture before creating temp
+    // Preserve permissions: capture original permissions before creating temp file
     let original_perms = std::fs::metadata(&abs_path).ok().map(|m| m.permissions());
 
     // Atomic write: temp in same directory as target (same filesystem)
@@ -259,7 +259,7 @@ pub fn restore_to_snapshot(cwd: &std::path::Path, rel_file_path: &str, snapshot_
     if let Some(perms) = original_perms {
         let _ = std::fs::set_permissions(&tmp_path, perms); // best-effort, non-fatal
     }
-    std::fs::rename(&tmp_path, &abs_path)?; // atomic on POSIX (NFR13)
+    std::fs::rename(&tmp_path, &abs_path)?; // atomic replacement on same filesystem — no partial-write visible
 
     Ok(())
 }

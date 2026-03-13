@@ -84,7 +84,7 @@ fn relativize_path(abs_path: &str, cwd: &std::path::Path, raw_cwd: &std::path::P
 }
 
 fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Path, raw_cwd: &std::path::Path, monitor_active: bool) -> anyhow::Result<()> {
-    // AC5: Only snapshot for Edit/Write tools
+    // Only snapshot for Edit/Write tools — other tools don't modify files
     match payload.tool_name.as_deref() {
         Some("Edit") | Some("Write") => {}
         _ => return Ok(()),
@@ -100,13 +100,13 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Pat
         None => return Ok(()),
     };
 
-    // AC4: Skip sensitive paths (works on absolute paths via filename/extension check)
+    // Skip sensitive paths — check works on absolute paths via filename/extension matching
     if olaf::memory::is_sensitive_path(abs_file_path) {
         log::debug!("observe pre-tool-use: skipping sensitive path: {abs_file_path}");
         return Ok(());
     }
 
-    // AC8: Enforce project root boundary — reject paths outside cwd.
+    // Enforce project root boundary — reject paths outside cwd.
     let rel_file_path = match relativize_path(abs_file_path, cwd, raw_cwd) {
         Some(p) => p,
         None => {
@@ -117,7 +117,7 @@ fn handle_pre_tool_use(payload: &olaf::memory::HookPayload, cwd: &std::path::Pat
 
     let start = std::time::Instant::now();
 
-    // AC3: non-existent file handled inside snapshot() via NotFound match
+    // Non-existent file handled inside snapshot() via NotFound match — not an error
     // For worktree subagents: read file from raw_cwd (worktree), store snapshot in cwd (main repo)
     let source = if raw_cwd != cwd { Some(raw_cwd) } else { None };
     olaf::restore::snapshot(cwd, &rel_file_path, source)?;

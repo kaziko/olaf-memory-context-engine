@@ -7,7 +7,7 @@ pub struct Symbol {
     pub end_line: u32,   // 1-based
     pub signature: Option<String>,
     pub docstring: Option<String>,
-    /// blake3 hash of this symbol's source bytes — used for staleness detection (Story 3.3)
+    /// blake3 hash of this symbol's source bytes — used to detect staleness when the file changes
     pub source_hash: String,
 }
 
@@ -33,7 +33,7 @@ pub enum SymbolKind {
     Interface,
     TypeAlias,
     Variable,
-    Namespace, // PHP (Story 1.3)
+    Namespace, // PHP-specific
 }
 
 impl SymbolKind {
@@ -58,9 +58,9 @@ pub enum EdgeKind {
     Implements,
     UsesType,
     References,
-    HooksInto, // PHP-only (Story 1.3)
-    FiresHook, // PHP-only (Story 1.3)
-    UsesTrait, // PHP-only (Story 1.3)
+    HooksInto, // PHP-only
+    FiresHook, // PHP-only
+    UsesTrait, // PHP-only
 }
 
 impl EdgeKind {

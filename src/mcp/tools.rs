@@ -326,6 +326,15 @@ fn mcp_normalize(project_root: &Path, file_path: &str) -> Result<String, ToolErr
         .map_err(|e| ToolError::InvalidParams(e.to_string()))
 }
 
+fn reject_if_sensitive_path(file_path: &str) -> Result<(), ToolError> {
+    if crate::memory::store::is_sensitive_path(file_path) {
+        return Err(ToolError::InvalidParams(
+            "sensitive file path rejected — file matches sensitive-path filter".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ─── analyze_failure data structures ──────────────────────────────────────────
 
 #[cfg_attr(test, derive(Debug))]
@@ -881,12 +890,12 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
     let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let file_path  = args.get("file_path").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
 
-    // NFR7: reject observations linked to sensitive files
+    // Reject observations that reference sensitive files — the sensitive-path filter is always-on
     if let Some(fp) = file_path
         && crate::memory::store::is_sensitive_path(fp)
     {
         return Err(ToolError::InvalidParams(
-            "file_path refers to a sensitive file — observation rejected per NFR7".into(),
+            "file_path refers to a sensitive file — observations on sensitive files are not stored".into(),
         ));
     }
     if let Some(fqn) = symbol_fqn
@@ -894,7 +903,7 @@ fn handle_save_observation(conn: &mut rusqlite::Connection, project_root: &Path,
         && crate::memory::store::is_sensitive_path(prefix)
     {
         return Err(ToolError::InvalidParams(
-            "symbol_fqn refers to a sensitive file — observation rejected per NFR7".into(),
+            "symbol_fqn refers to a sensitive file — observations on sensitive files are not stored".into(),
         ));
     }
 
@@ -1216,10 +1225,7 @@ fn handle_list_restore_points(project_root: &Path, args: Option<&Value>) -> Resu
     let file_path = args.get("file_path").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: file_path".into()))?;
 
-    // NFR7: reject sensitive file paths
-    if crate::memory::store::is_sensitive_path(file_path) {
-        return Err(ToolError::InvalidParams("sensitive file path rejected per NFR7".into()));
-    }
+    reject_if_sensitive_path(file_path)?;
 
     let rel = mcp_normalize(project_root, file_path)?;
 
@@ -1252,10 +1258,7 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
     let snapshot_id = args.get("snapshot_id").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: snapshot_id".into()))?;
 
-    // NFR7: reject sensitive file paths
-    if crate::memory::store::is_sensitive_path(file_path) {
-        return Err(ToolError::InvalidParams("sensitive file path rejected per NFR7".into()));
-    }
+    reject_if_sensitive_path(file_path)?;
 
     let rel = mcp_normalize(project_root, file_path)?;
 
@@ -1293,7 +1296,7 @@ fn handle_get_brief(
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
-    // 2.1 Parse args
+    // Parse args
     let intent = args.get("intent").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: intent".to_string()))?;
     let file_hints: Vec<String> = args.get("file_hints").and_then(|v| v.as_array())
@@ -1308,7 +1311,7 @@ fn handle_get_brief(
         .map(|v| (v as usize).clamp(1, 10))
         .unwrap_or(3);
 
-    // 2.2 Trigger incremental re-index (local only)
+    // Trigger incremental re-index (local only)
     {
         let (conn, root) = ws.local_parts();
         crate::index::run_incremental(conn, root)?;
@@ -1324,7 +1327,7 @@ fn handle_get_brief(
         }
     };
 
-    // 2.3 Compute context budget — use workspace-aware path when remotes exist
+    // Compute context budget — use workspace-aware path when remotes exist
     let content_policy = {
         let (_, root) = ws.local_parts();
         ContentPolicy::load(root)
@@ -1339,7 +1342,7 @@ fn handle_get_brief(
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
-    // 2.4 Build impact section (local-only)
+    // Build impact section (local-only)
     let impact_output = if let Some(fqn) = symbol_fqn {
         crate::graph::query::get_impact(ws.local_conn(), fqn, depth, &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
@@ -1347,13 +1350,13 @@ fn handle_get_brief(
         "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
     };
 
-    // 2.5 Assemble output
+    // Assemble output
     let mut output = format!("{context_output}\n---\n{impact_output}");
 
-    // 2.6 Hard-truncate to enforce token budget
+    // Hard-truncate to enforce token budget
     truncate_to_budget(&mut output, token_budget);
 
-    // 2.7 Append budget-exempt sections after truncation
+    // Append budget-exempt sections after truncation
     if ws.has_remotes() {
         output.push_str("\n_Impact analysis: local repo only. Memory: local repo only._\n");
     }

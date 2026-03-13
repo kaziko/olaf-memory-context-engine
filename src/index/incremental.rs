@@ -38,8 +38,9 @@ pub enum ReindexOutcome {
 /// Returns `IndexStats` where `files` = number of files actually re-parsed
 /// (unchanged files and deleted files are NOT counted).
 ///
-/// This is a library function for the MCP query path (Story 2.2). It is NOT
-/// called by the `olaf index` CLI command — that still calls `index::full::run()`.
+/// Runs an incremental index pass, re-parsing only files whose content hash has changed
+/// since the last run. Does NOT rebuild the entire index from scratch; the `olaf index`
+/// CLI command still calls `index::full::run()` for a full rebuild.
 pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexStats> {
     let stored = store::load_file_hash_map(conn)?;
 

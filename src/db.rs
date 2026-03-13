@@ -199,7 +199,7 @@ pub fn open(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
 
     let mut conn = open_with_recovery(db_path)?;
 
-    // WAL mode — load-bearing for multi-process concurrency (NFR11)
+    // WAL mode — improves crash resilience and allows concurrent reads during writes
     conn.pragma_update(None, "journal_mode", "WAL")?;
     // FK enforcement — ON DELETE CASCADE only works with this set
     conn.pragma_update(None, "foreign_keys", "ON")?;
