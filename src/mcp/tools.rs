@@ -488,6 +488,18 @@ fn resolve_trace_pivots(conn: &rusqlite::Connection, extraction: &TraceExtractio
     let mut seen_fqns: HashSet<String> = HashSet::new();
     let mut frame_details: Vec<FrameResolution> = Vec::new();
 
+    let mut tier2_stmt = conn.prepare(
+        "SELECT s.fqn FROM symbols s \
+         JOIN files f ON s.file_id = f.id \
+         WHERE f.path = ?1 \
+         ORDER BY MIN(ABS(s.start_line - ?2), ABS(s.end_line - ?2)) ASC, \
+                  s.start_line ASC, s.id ASC \
+         LIMIT 5"
+    ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 prepare failed: {e}")))?;
+    let mut tier3_stmt = conn.prepare(
+        "SELECT fqn FROM symbols WHERE name = ?1 LIMIT 2"
+    ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 prepare failed: {e}")))?;
+
     for frame in &extraction.frames {
         let mut resolved_fqn: Option<String> = None;
         let mut tier: &str = "unresolved";
@@ -506,15 +518,7 @@ fn resolve_trace_pivots(conn: &rusqlite::Connection, extraction: &TraceExtractio
             && let Some(path) = &frame.file_path
         {
             let line_val = frame.line.unwrap_or(0) as i64;
-            let mut stmt = conn.prepare(
-                "SELECT s.fqn FROM symbols s \
-                 JOIN files f ON s.file_id = f.id \
-                 WHERE f.path = ?1 \
-                 ORDER BY MIN(ABS(s.start_line - ?2), ABS(s.end_line - ?2)) ASC, \
-                          s.start_line ASC, s.id ASC \
-                 LIMIT 5"
-            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 prepare failed: {e}")))?;
-            let fqns: Vec<String> = stmt
+            let fqns: Vec<String> = tier2_stmt
                 .query_map(rusqlite::params![path, line_val], |r| r.get::<_, String>(0))
                 .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 2 query failed: {e}")))?
                 .collect::<Result<Vec<_>, _>>()
@@ -531,10 +535,7 @@ fn resolve_trace_pivots(conn: &rusqlite::Connection, extraction: &TraceExtractio
             && let Some(name) = &frame.symbol_name
             && name.len() >= 4
         {
-            let mut stmt = conn.prepare(
-                "SELECT fqn FROM symbols WHERE name = ?1 LIMIT 2"
-            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 prepare failed: {e}")))?;
-            let fqns: Vec<String> = stmt
+            let fqns: Vec<String> = tier3_stmt
                 .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))
                 .map_err(|e| ToolError::Internal(anyhow::anyhow!("Tier 3 query failed: {e}")))?
                 .collect::<Result<Vec<_>, _>>()

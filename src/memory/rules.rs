@@ -649,17 +649,43 @@ pub(crate) fn get_active_rules(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Populate symbol_fqns and file_paths for each rule
-    for rule in &mut rules {
-        rule.symbol_fqns = conn
-            .prepare("SELECT symbol_fqn FROM rule_symbols WHERE rule_id = ?1")?
-            .query_map(params![rule.id], |r| r.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
+    // Populate symbol_fqns and file_paths for each rule via batched queries
+    let rule_ids: Vec<i64> = rules.iter().map(|r| r.id).collect();
+    if !rule_ids.is_empty() {
+        let sym_placeholders = rule_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sym_sql = format!(
+            "SELECT rule_id, symbol_fqn FROM rule_symbols WHERE rule_id IN ({sym_placeholders}) ORDER BY symbol_fqn"
+        );
+        let mut sym_stmt = conn.prepare(&sym_sql)?;
+        let mut sym_map: HashMap<i64, Vec<String>> = HashMap::new();
+        let sym_rows: Vec<(i64, String)> = sym_stmt
+            .query_map(rusqlite::params_from_iter(rule_ids.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (rule_id, fqn) in sym_rows {
+            sym_map.entry(rule_id).or_default().push(fqn);
+        }
 
-        rule.file_paths = conn
-            .prepare("SELECT file_path FROM rule_files WHERE rule_id = ?1")?
-            .query_map(params![rule.id], |r| r.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
+        let file_placeholders = rule_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let file_sql = format!(
+            "SELECT rule_id, file_path FROM rule_files WHERE rule_id IN ({file_placeholders}) ORDER BY file_path"
+        );
+        let mut file_stmt = conn.prepare(&file_sql)?;
+        let mut file_map: HashMap<i64, Vec<String>> = HashMap::new();
+        let file_rows: Vec<(i64, String)> = file_stmt
+            .query_map(rusqlite::params_from_iter(rule_ids.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (rule_id, path) in file_rows {
+            file_map.entry(rule_id).or_default().push(path);
+        }
+
+        for rule in &mut rules {
+            rule.symbol_fqns = sym_map.remove(&rule.id).unwrap_or_default();
+            rule.file_paths = file_map.remove(&rule.id).unwrap_or_default();
+        }
     }
 
     Ok(rules)
@@ -1306,5 +1332,55 @@ mod tests {
             .query_row("SELECT is_active FROM project_rules WHERE id = ?1", params![r1], |r| r.get(0))
             .unwrap();
         assert_eq!(is_active, -1, "pending rule must also be marked inactive");
+    }
+
+    #[test]
+    fn test_get_active_rules_batched_associations() {
+        let conn = open_test_db();
+        let now = now_secs();
+
+        // Rule 1 with two symbol FQNs and one file path
+        conn.execute(
+            "INSERT INTO project_rules (content, scope_fingerprint, support_count, session_count, \
+             last_seen_at, is_active, created_at, updated_at) VALUES ('rule one', 'fp_r1', 3, 3, ?1, 1, ?1, ?1)",
+            params![now],
+        ).unwrap();
+        let r1 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, 'src/a.rs::alpha')", params![r1]).unwrap();
+        conn.execute("INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, 'src/a.rs::beta')", params![r1]).unwrap();
+        conn.execute("INSERT INTO rule_files (rule_id, file_path) VALUES (?1, 'src/a.rs')", params![r1]).unwrap();
+
+        // Rule 2 with one symbol FQN and two file paths
+        conn.execute(
+            "INSERT INTO project_rules (content, scope_fingerprint, support_count, session_count, \
+             last_seen_at, is_active, created_at, updated_at) VALUES ('rule two', 'fp_r2', 3, 3, ?1, 1, ?1, ?1)",
+            params![now],
+        ).unwrap();
+        let r2 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO rule_symbols (rule_id, symbol_fqn) VALUES (?1, 'src/b.rs::gamma')", params![r2]).unwrap();
+        conn.execute("INSERT INTO rule_files (rule_id, file_path) VALUES (?1, 'src/b.rs')", params![r2]).unwrap();
+        conn.execute("INSERT INTO rule_files (rule_id, file_path) VALUES (?1, 'src/c.rs')", params![r2]).unwrap();
+
+        let rules = get_active_rules(
+            &conn,
+            &["src/a.rs::alpha".into(), "src/b.rs::gamma".into()],
+            &["src/a.rs".into()],
+            None,
+            10,
+        ).unwrap();
+
+        assert_eq!(rules.len(), 2);
+
+        let rule1 = rules.iter().find(|r| r.content == "rule one").expect("rule one must be present");
+        let mut sym1 = rule1.symbol_fqns.clone();
+        sym1.sort();
+        assert_eq!(sym1, vec!["src/a.rs::alpha", "src/a.rs::beta"], "rule1 symbol_fqns must match");
+        assert_eq!(rule1.file_paths, vec!["src/a.rs"], "rule1 file_paths must match");
+
+        let rule2 = rules.iter().find(|r| r.content == "rule two").expect("rule two must be present");
+        assert_eq!(rule2.symbol_fqns, vec!["src/b.rs::gamma"], "rule2 symbol_fqns must match");
+        let mut paths2 = rule2.file_paths.clone();
+        paths2.sort();
+        assert_eq!(paths2, vec!["src/b.rs", "src/c.rs"], "rule2 file_paths must match");
     }
 }
