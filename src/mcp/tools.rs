@@ -326,6 +326,15 @@ fn mcp_normalize(project_root: &Path, file_path: &str) -> Result<String, ToolErr
         .map_err(|e| ToolError::InvalidParams(e.to_string()))
 }
 
+fn reject_if_sensitive_path(file_path: &str) -> Result<(), ToolError> {
+    if crate::memory::store::is_sensitive_path(file_path) {
+        return Err(ToolError::InvalidParams(
+            "sensitive file path rejected — file matches sensitive-path filter".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ─── analyze_failure data structures ──────────────────────────────────────────
 
 #[cfg_attr(test, derive(Debug))]
@@ -1216,10 +1225,7 @@ fn handle_list_restore_points(project_root: &Path, args: Option<&Value>) -> Resu
     let file_path = args.get("file_path").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: file_path".into()))?;
 
-    // Reject sensitive file paths — the sensitive-path filter is always-on
-    if crate::memory::store::is_sensitive_path(file_path) {
-        return Err(ToolError::InvalidParams("sensitive file path rejected — file matches sensitive-path filter".into()));
-    }
+    reject_if_sensitive_path(file_path)?;
 
     let rel = mcp_normalize(project_root, file_path)?;
 
@@ -1252,10 +1258,7 @@ fn handle_undo_change(conn: &mut rusqlite::Connection, project_root: &Path, sess
     let snapshot_id = args.get("snapshot_id").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: snapshot_id".into()))?;
 
-    // Reject sensitive file paths — the sensitive-path filter is always-on
-    if crate::memory::store::is_sensitive_path(file_path) {
-        return Err(ToolError::InvalidParams("sensitive file path rejected — file matches sensitive-path filter".into()));
-    }
+    reject_if_sensitive_path(file_path)?;
 
     let rel = mcp_normalize(project_root, file_path)?;
 
