@@ -1561,3 +1561,216 @@ fn test_get_brief_retrieval_notes_after_truncation() {
         assert!(notes_pos > trunc_pos, "retrieval notes must appear after truncation marker");
     }
 }
+
+// ─── Story 12.5 — Core Pipeline E2E Integration Tests ───────────────────────
+
+/// Creates a TempDir with a TypeScript fixture containing a call chain:
+/// handleRequest → authenticate → validate, plus an isolated formatOutput.
+fn prepare_pipeline_fixture() -> tempfile::TempDir {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmpdir.path().join("app.ts"),
+        r#"/** Validates user credentials. */
+export function validate(user: string): boolean { return true; }
+/** Authenticates using validation. */
+export function authenticate(user: string): boolean { return validate(user); }
+/** Handles incoming requests. */
+export function handleRequest(): boolean { return authenticate("u"); }
+/** Formats output text. */
+export function formatOutput(): string { return ""; }
+"#,
+    )
+    .expect("write app.ts");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_olaf"))
+        .arg("index")
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("olaf index failed to run");
+    assert!(
+        status.status.success(),
+        "olaf index must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    tmpdir
+}
+
+// Task 2 — AC1: pivot symbol rendered for matching query
+#[test]
+fn test_pipeline_pivot_symbol_in_output() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": {
+            "intent": "authenticate user",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    // Pivot section (before Supporting Symbols) must contain authenticate inside a code block
+    let pivot_section = text.split("## Supporting Symbols").next().unwrap_or(text);
+    assert!(pivot_section.contains("authenticate"),
+        "pivot 'authenticate' must appear in Pivot section; got: {text}");
+    assert!(pivot_section.contains("```"),
+        "pivot section must contain a fenced code block; got pivot section:\n{pivot_section}");
+    // Verify authenticate actually appears between ``` fences in pivot section
+    let in_code_block = pivot_section.split("```").enumerate()
+        .any(|(i, chunk)| i % 2 == 1 && chunk.contains("authenticate"));
+    assert!(in_code_block,
+        "authenticate must appear inside a fenced code block, not just near one; got pivot section:\n{pivot_section}");
+    // Unrelated symbol must not appear
+    assert!(!text.contains("formatOutput"), "unrelated 'formatOutput' must not appear; got: {text}");
+}
+
+// Task 3 — AC2: supporting symbols rendered as skeletons
+#[test]
+fn test_pipeline_supporting_symbols_as_skeletons() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": {
+            "intent": "handleRequest",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+
+    // handleRequest should be a pivot with code block
+    let pivot_section = text.split("## Supporting Symbols").next().unwrap_or(text);
+    assert!(pivot_section.contains("handleRequest"), "handleRequest must be a pivot; got: {text}");
+
+    // authenticate should appear in Supporting Symbols as skeleton: signature present, no code block
+    let supporting = text.split("## Supporting Symbols").nth(1)
+        .unwrap_or_else(|| panic!("Expected Supporting Symbols section; got: {text}"));
+    assert!(supporting.contains("authenticate"),
+        "authenticate must appear as supporting symbol; got: {text}");
+    // Skeleton must show the function signature
+    assert!(supporting.contains("authenticate("),
+        "supporting skeleton must include function signature; got supporting section:\n{supporting}");
+    // Supporting section must NOT contain fenced code blocks (skeletons don't use ```)
+    // Split at ## Retrieval Notes to isolate Supporting Symbols content
+    let supporting_only = supporting.split("## Retrieval Notes").next().unwrap_or(supporting);
+    assert!(!supporting_only.contains("```"),
+        "supporting symbols must be skeletons without fenced code blocks; got supporting section:\n{supporting_only}");
+}
+
+// Task 4 — AC3: intent classification affects traversal
+#[test]
+fn test_pipeline_bugfix_intent_includes_callers() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": {
+            "intent": "fix bug in validate",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+
+    // Header must show bug-fix intent (hyphenated)
+    assert!(text.contains("intent_mode: bug-fix"), "must show intent_mode: bug-fix; got: {text}");
+
+    // BugFix explores inbound edges — authenticate is a caller of validate
+    if let Some(supporting) = text.split("## Supporting Symbols").nth(1) {
+        assert!(supporting.contains("authenticate"),
+            "BugFix must include caller 'authenticate' in Supporting Symbols; got: {text}");
+    } else {
+        panic!("Expected Supporting Symbols section for BugFix traversal; got: {text}");
+    }
+}
+
+#[test]
+fn test_pipeline_implementation_intent_excludes_callers() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": {
+            "intent": "implement authenticate",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+
+    // Header must show implementation intent
+    assert!(text.contains("intent_mode: implementation"), "must show intent_mode: implementation; got: {text}");
+
+    // Implementation traverses outbound only — validate (callee) should appear, handleRequest (caller) must NOT
+    if let Some(supporting) = text.split("## Supporting Symbols").nth(1) {
+        assert!(!supporting.contains("handleRequest"),
+            "Implementation must NOT include caller 'handleRequest'; got: {text}");
+        assert!(supporting.contains("validate"),
+            "Implementation must include outbound callee 'validate' in Supporting Symbols; got: {text}");
+    } else {
+        // Must have Supporting Symbols — authenticate calls validate, so outbound traversal produces results
+        panic!("Implementation intent must still produce Supporting Symbols (outbound callees); got: {text}");
+    }
+}
+
+// Task 5 — AC4: zero-symbol repo returns informative message
+#[test]
+fn test_pipeline_zero_symbols_returns_message() {
+    let dir = prepare_indexed_tmpdir_no_symbols();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_context", "arguments": {
+            "intent": "anything",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must be successful, not an error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let lower = text.to_lowercase();
+    assert!(lower.contains("no symbols"), "must contain 'no symbols' message; got: {text}");
+}
+
+// Task 7 — AC6: get_brief e2e
+#[test]
+fn test_pipeline_get_brief_structure() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_brief", "arguments": {
+            "intent": "authenticate",
+            "token_budget": 4000
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("# Context Brief"), "must contain Context Brief header; got: {text}");
+    assert!(text.contains("---"), "must contain --- separator; got: {text}");
+    assert!(text.contains("No primary symbol specified"),
+        "must contain 'No primary symbol specified' when no symbol_fqn given; got: {text}");
+    // Verify the brief actually used the fixture — authenticate must appear in the context section
+    let before_sep = text.split("---").next().unwrap_or(text);
+    assert!(before_sep.contains("authenticate"),
+        "context brief must contain fixture symbol 'authenticate'; got before separator:\n{before_sep}");
+}
+
+#[test]
+fn test_pipeline_get_brief_with_symbol_fqn() {
+    let dir = prepare_pipeline_fixture();
+    let responses = run_requests_in(dir.path(), &[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "get_brief", "arguments": {
+            "intent": "authenticate",
+            "token_budget": 4000,
+            "symbol_fqn": "app.ts::authenticate"
+        }}
+    })]);
+    assert!(responses[0].get("error").is_none(), "must not error; got: {}", responses[0]);
+    let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("---"), "must contain --- separator; got: {text}");
+    // Impact section must start with the standard header and reference the requested symbol
+    let after_sep = text.split("---").nth(1).unwrap_or("");
+    assert!(after_sep.contains("# Impact Analysis: app.ts::authenticate"),
+        "must contain impact analysis header for requested symbol; got after ---:\n{after_sep}");
+    assert!(after_sep.contains("dependent(s) found"),
+        "must contain dependent count line; got after ---:\n{after_sep}");
+    // handleRequest calls authenticate, so it should appear as a dependent
+    assert!(after_sep.contains("handleRequest"),
+        "handleRequest is a caller of authenticate and must appear as dependent; got after ---:\n{after_sep}");
+}

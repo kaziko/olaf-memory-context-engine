@@ -150,3 +150,37 @@ fn extract_nodes(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_file_returns_no_symbols() {
+        let (symbols, edges) = parse("empty.rs", b"").unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_macro_heavy_file_does_not_panic() {
+        let src = b"macro_rules! my_macro {\n    ($x:expr) => { $x + 1 };\n}\nmy_macro!(42);\n";
+        let result = parse("macros.rs", src);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_unsafe_block_extracts_fn() {
+        let src = b"pub fn danger() {\n    unsafe { };\n}\n";
+        let (symbols, _edges) = parse("unsafe.rs", src).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "danger"));
+    }
+
+    #[test]
+    fn parse_file_with_only_comments() {
+        let src = b"// just a comment\n/// doc comment\n/* block */\n";
+        let (symbols, edges) = parse("comments.rs", src).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+}

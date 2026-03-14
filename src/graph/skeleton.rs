@@ -25,3 +25,51 @@ pub(crate) fn skeletonize(conn: &Connection, symbol_id: i64) -> Result<String, S
     s.push('\n');
     Ok(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_skeleton_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL, hash TEXT);
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
+                 name TEXT NOT NULL, kind TEXT, start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+             );
+             CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);",
+        ).unwrap();
+        conn.execute("INSERT INTO files (id, path) VALUES (1, 'src/lib.rs')", []).unwrap();
+        conn
+    }
+
+    #[test]
+    fn skeletonize_symbol_with_no_edges() {
+        let conn = setup_skeleton_db();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1, 1, 'lib::Foo', 'Foo', 'struct', 1, 10, 'pub struct Foo', 'A foo struct', NULL)",
+            [],
+        ).unwrap();
+        let result = skeletonize(&conn, 1).unwrap();
+        assert!(result.contains("Foo"));
+        assert!(result.contains("pub struct Foo"));
+        assert!(result.contains("A foo struct"));
+        assert!(!result.contains("Dependencies"));
+    }
+
+    #[test]
+    fn skeletonize_symbol_with_only_docstring_no_signature() {
+        let conn = setup_skeleton_db();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1, 1, 'lib::Bar', 'Bar', 'function', 5, 15, NULL, 'Does something important', NULL)",
+            [],
+        ).unwrap();
+        let result = skeletonize(&conn, 1).unwrap();
+        assert!(result.contains("Bar"));
+        assert!(result.contains("Does something important"));
+        assert!(!result.contains("Signature"));
+    }
+}

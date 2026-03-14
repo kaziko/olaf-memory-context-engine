@@ -157,3 +157,30 @@ fn extract_nodes(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_file_returns_no_symbols() {
+        let (symbols, edges) = parse("empty.py", b"").unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_file_with_only_comments() {
+        let src = b"# just a comment\n# another comment\n";
+        let (symbols, edges) = parse("comments.py", src).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_malformed_syntax_does_not_panic() {
+        let src = b"def foo(\n  x = 1\n    y = 2\n";
+        let result = parse("indent.py", src);
+        assert!(result.is_ok());
+    }
+}

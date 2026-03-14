@@ -399,3 +399,37 @@ fn extract_nodes(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_file_returns_no_symbols() {
+        let (symbols, edges) = parse("empty.ts", b"", TsDialect::TypeScript).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_file_with_only_comments() {
+        let src = b"// This is a comment\n/* block comment */\n";
+        let (symbols, edges) = parse("comments.ts", src, TsDialect::TypeScript).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_malformed_syntax_does_not_panic() {
+        let src = b"function foo( { return; }\nclass {";
+        let result = parse("bad.ts", src, TsDialect::TypeScript);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_jsx_dialect_empty_file() {
+        let (symbols, edges) = parse("empty.jsx", b"", TsDialect::Jsx).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+}
