@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking Changes
+
+- **`EmbedError::DimensionMismatch` removed** — this variant was never constructed; external crates with exhaustive `match` on `EmbedError` must remove the arm.
+
+### Changed
+
+- `IntentProfile.bugfix_score` and `refactor_score` are now `#[cfg(test)]`-only; `impl_score` removed entirely. Production code never read these raw counts.
+- `ProjectRule` drops unused fields (`scope_fingerprint`, `is_active`, `stale_reason`, `created_at`, `updated_at`, `branch`); `get_active_rules` SELECT narrowed to match.
+- Removed spurious `#[allow(dead_code)]` from `ObservationRow.id` and `created_at`.
+
 ## 0.5.0 — 2026-03-09
 
 ### Added
