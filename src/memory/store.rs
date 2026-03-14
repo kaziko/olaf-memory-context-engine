@@ -81,10 +81,8 @@ impl rusqlite::types::ToSql for Importance {
 
 #[derive(Debug)]
 pub struct ObservationRow {
-    #[allow(dead_code)]
     pub id: i64,
     pub session_id: String,
-    #[allow(dead_code)]
     pub created_at: i64,
     pub kind: String,
     pub content: String,
