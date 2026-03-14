@@ -2518,6 +2518,83 @@ mod tests {
         assert!(entry.contains("STALE"), "stale marker must be preserved");
         assert!(entry.contains("symbol changed"), "stale_reason must be preserved");
     }
+
+    #[test]
+    fn traverse_bfs_empty_pivots_returns_empty() {
+        let conn = setup_db();
+        conn.execute("INSERT INTO files (id, path) VALUES (1, 'src/lib.rs')", []).unwrap();
+        let policy = TraversalPolicy { depth: 2, include_inbound: true, inbound_first: false, pivot_pool_size: 5 };
+        let (pivots, supporting) = traverse_bfs(&conn, &[], &policy).unwrap();
+        assert!(pivots.is_empty());
+        assert!(supporting.is_empty());
+    }
+
+    #[test]
+    fn traverse_bfs_single_isolated_symbol() {
+        let conn = setup_db();
+        conn.execute("INSERT INTO files (id, path) VALUES (1, 'src/lib.rs')", []).unwrap();
+        insert_symbol(&conn, 1, "lib::lonely", "lonely", 1);
+        let policy = TraversalPolicy { depth: 2, include_inbound: true, inbound_first: false, pivot_pool_size: 5 };
+        let (pivots, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        assert_eq!(pivots, vec![1]);
+        assert!(supporting.is_empty());
+    }
+
+    #[test]
+    fn traverse_bfs_depth_limit_exactly_hit() {
+        // Chain: a→b→c→d. With depth=2 starting from pivot a (depth 0),
+        // BFS reaches b at depth 1, c at depth 2, but d at depth 3 is excluded.
+        let conn = setup_db();
+        conn.execute("INSERT INTO files (id, path) VALUES (1, 'src/lib.rs')", []).unwrap();
+        insert_symbol(&conn, 1, "lib::a", "a", 1);
+        insert_symbol(&conn, 2, "lib::b", "b", 1);
+        insert_symbol(&conn, 3, "lib::c", "c", 1);
+        insert_symbol(&conn, 4, "lib::d", "d", 1);
+        conn.execute("INSERT INTO edges (source_id, target_id) VALUES (1, 2)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id) VALUES (2, 3)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id) VALUES (3, 4)", []).unwrap();
+        let policy = TraversalPolicy { depth: 2, include_inbound: false, inbound_first: false, pivot_pool_size: 5 };
+        let (_, supporting) = traverse_bfs(&conn, &[1], &policy).unwrap();
+        let ids: Vec<i64> = supporting.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&2), "depth-1 neighbor should be included");
+        assert!(ids.contains(&3), "depth-2 neighbor should be included");
+        assert!(!ids.contains(&4), "depth-3 neighbor should be excluded by depth limit");
+    }
+
+    #[test]
+    fn test_sensitive_path_excluded_from_context_output() {
+        let conn = build_test_db();
+        // Sensitive file — should be filtered by is_sensitive() in build_context_brief
+        conn.execute("INSERT INTO files VALUES (1, '.env', 'h')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (1, 1, '.env::SECRET_KEY', 'SECRET_KEY', 'const', 1, 1, 'const SECRET_KEY: &str', NULL, NULL)",
+            [],
+        ).unwrap();
+        // Non-sensitive canary symbol — proves the pipeline produces output and the
+        // sensitive filter is what excludes the .env symbol, not a vacuous empty result.
+        conn.execute("INSERT INTO files VALUES (2, 'src/config.rs', 'h2')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (2, 2, 'config::load', 'load', 'function', 1, 5, 'pub fn load()', NULL, NULL)",
+            [],
+        ).unwrap();
+        let (result, _notes) = get_context(
+            &conn,
+            Path::new("/nonexistent"),
+            "load config",
+            &[],
+            4000,
+            None,
+            &ContentPolicy::default(),
+        ).unwrap();
+        // Canary must appear — proves the pipeline found and rendered symbols
+        assert!(result.contains("load"),
+            "canary symbol 'load' must appear in output to prove non-vacuous result; got: {result}");
+        // Sensitive symbol and path must be excluded
+        assert!(!result.contains("SECRET_KEY"),
+            "sensitive-path symbol must not appear in output; got: {result}");
+        assert!(!result.contains(".env"),
+            "sensitive file path must not appear in output; got: {result}");
+    }
 }
 
 #[cfg(test)]

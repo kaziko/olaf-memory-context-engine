@@ -268,3 +268,42 @@ fn extract_nodes(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_php_file() {
+        let src = b"<?php\n?>";
+        let (symbols, edges) = parse("empty.php", src).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_html_php() {
+        let src = b"<html><body><?php function greet() { echo 'hi'; } ?></body></html>";
+        let result = parse("mixed.php", src);
+        assert!(result.is_ok());
+        let (symbols, _) = result.unwrap();
+        assert!(symbols.iter().any(|s| s.name == "greet"));
+    }
+
+    #[test]
+    fn parse_unclosed_php_tag() {
+        let src = b"<?php\nfunction broken() { return 1; }\n";
+        let result = parse("unclosed.php", src);
+        assert!(result.is_ok());
+        let (symbols, _) = result.unwrap();
+        assert!(symbols.iter().any(|s| s.name == "broken"));
+    }
+
+    #[test]
+    fn parse_php_only_comments() {
+        let src = b"<?php\n// comment\n/* block */\n?>";
+        let (symbols, edges) = parse("comments.php", src).unwrap();
+        assert!(symbols.is_empty());
+        assert!(edges.is_empty());
+    }
+}
