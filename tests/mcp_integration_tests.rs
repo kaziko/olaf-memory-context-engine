@@ -1649,8 +1649,9 @@ fn test_pipeline_supporting_symbols_as_skeletons() {
     // Skeleton must show the function signature
     assert!(supporting.contains("authenticate("),
         "supporting skeleton must include function signature; got supporting section:\n{supporting}");
-    // Supporting section must NOT contain fenced code blocks (skeletons don't use ```)
-    // Split at ## Retrieval Notes to isolate Supporting Symbols content
+    // skeletonize() outputs inline backticks (Signature: `...`) but never fenced code blocks.
+    // This is a contractual assertion — if skeletonize() changes format, this test should catch it.
+    // Split at ## Retrieval Notes to isolate Supporting Symbols content.
     let supporting_only = supporting.split("## Retrieval Notes").next().unwrap_or(supporting);
     assert!(!supporting_only.contains("```"),
         "supporting symbols must be skeletons without fenced code blocks; got supporting section:\n{supporting_only}");

@@ -2542,6 +2542,8 @@ mod tests {
 
     #[test]
     fn traverse_bfs_depth_limit_exactly_hit() {
+        // Chain: a→b→c→d. With depth=2 starting from pivot a (depth 0),
+        // BFS reaches b at depth 1, c at depth 2, but d at depth 3 is excluded.
         let conn = setup_db();
         conn.execute("INSERT INTO files (id, path) VALUES (1, 'src/lib.rs')", []).unwrap();
         insert_symbol(&conn, 1, "lib::a", "a", 1);
@@ -2562,21 +2564,32 @@ mod tests {
     #[test]
     fn test_sensitive_path_excluded_from_context_output() {
         let conn = build_test_db();
+        // Sensitive file — should be filtered by is_sensitive() in build_context_brief
         conn.execute("INSERT INTO files VALUES (1, '.env', 'h')", []).unwrap();
         conn.execute(
             "INSERT INTO symbols VALUES (1, 1, '.env::SECRET_KEY', 'SECRET_KEY', 'const', 1, 1, 'const SECRET_KEY: &str', NULL, NULL)",
             [],
         ).unwrap();
-        // Use intent that doesn't literally contain the symbol name to avoid matching the header
+        // Non-sensitive canary symbol — proves the pipeline produces output and the
+        // sensitive filter is what excludes the .env symbol, not a vacuous empty result.
+        conn.execute("INSERT INTO files VALUES (2, 'src/config.rs', 'h2')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols VALUES (2, 2, 'config::load', 'load', 'function', 1, 5, 'pub fn load()', NULL, NULL)",
+            [],
+        ).unwrap();
         let (result, _notes) = get_context(
             &conn,
             Path::new("/nonexistent"),
-            "find the secret config",
+            "load config",
             &[],
             4000,
             None,
             &ContentPolicy::default(),
         ).unwrap();
+        // Canary must appear — proves the pipeline found and rendered symbols
+        assert!(result.contains("load"),
+            "canary symbol 'load' must appear in output to prove non-vacuous result; got: {result}");
+        // Sensitive symbol and path must be excluded
         assert!(!result.contains("SECRET_KEY"),
             "sensitive-path symbol must not appear in output; got: {result}");
         assert!(!result.contains(".env"),
