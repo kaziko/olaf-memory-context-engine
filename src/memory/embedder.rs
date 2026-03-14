@@ -51,9 +51,6 @@ pub enum EmbedError {
     #[allow(dead_code)] // Constructed by FastEmbedder (cfg-gated)
     #[error("embedding model error: {0}")]
     Model(String),
-    #[allow(dead_code)]
-    #[error("dimension mismatch: expected {expected}, got {actual}")]
-    DimensionMismatch { expected: usize, actual: usize },
 }
 
 // ── Production embedder (feature-gated) ──

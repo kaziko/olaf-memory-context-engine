@@ -67,10 +67,9 @@ pub(crate) enum IntentMode {
 
 /// Scored result of intent classification.
 pub(crate) struct IntentProfile {
-    #[allow(dead_code)] pub bugfix_score: usize,   // read only in tests; production uses normalized weights
-    #[allow(dead_code)] pub refactor_score: usize,
-    #[allow(dead_code)] pub impl_score: usize,
-    #[allow(dead_code)] pub total: usize,
+    #[cfg(test)] pub bugfix_score: usize,   // read only in tests; production uses normalized weights
+    #[cfg(test)] pub refactor_score: usize,
+    pub total: usize,
     pub confidence: f32,              // dominance = top/total (0.0 if total==0)
     pub dominant_mode: IntentMode,    // winning mode by score, BEFORE confidence fallback
     pub execution_mode: IntentMode,   // actual mode used for traversal (Balanced when low-confidence)
@@ -146,8 +145,12 @@ pub(crate) fn detect_intent_profile(intent: &str) -> IntentProfile {
         }
     };
 
-    IntentProfile { bugfix_score: b, refactor_score: r, impl_score: i, total,
-                    confidence, dominant_mode, execution_mode, w_bugfix, w_refactor, w_impl, matched_signals }
+    IntentProfile {
+        #[cfg(test)] bugfix_score: b,
+        #[cfg(test)] refactor_score: r,
+        total,
+        confidence, dominant_mode, execution_mode, w_bugfix, w_refactor, w_impl, matched_signals,
+    }
 }
 
 pub(crate) fn derive_traversal_policy(profile: &IntentProfile) -> TraversalPolicy {

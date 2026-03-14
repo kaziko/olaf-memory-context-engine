@@ -12,19 +12,12 @@ fn now_secs() -> i64 {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct ProjectRule {
     pub id: i64,
     pub content: String,
-    pub scope_fingerprint: String,
     pub support_count: i64,
     pub session_count: i64,
     pub last_seen_at: i64,
-    pub is_active: i32,
-    pub stale_reason: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub branch: Option<String>,
     pub symbol_fqns: Vec<String>,
     pub file_paths: Vec<String>,
 }
@@ -594,8 +587,7 @@ pub(crate) fn get_active_rules(
     };
 
     let sql = format!(
-        "SELECT r.id, r.content, r.scope_fingerprint, r.support_count, r.session_count, \
-         r.last_seen_at, r.is_active, r.stale_reason, r.created_at, r.updated_at, r.branch, \
+        "SELECT r.id, r.content, r.support_count, r.session_count, r.last_seen_at, \
          COALESCE(sym_match.cnt, 0) + COALESCE(file_match.cnt, 0) as relevance \
          FROM project_rules r \
          LEFT JOIN ({}) sym_match ON sym_match.rule_id = r.id \
@@ -634,15 +626,9 @@ pub(crate) fn get_active_rules(
             Ok(ProjectRule {
                 id: r.get(0)?,
                 content: r.get(1)?,
-                scope_fingerprint: r.get(2)?,
-                support_count: r.get(3)?,
-                session_count: r.get(4)?,
-                last_seen_at: r.get(5)?,
-                is_active: r.get(6)?,
-                stale_reason: r.get(7)?,
-                created_at: r.get(8)?,
-                updated_at: r.get(9)?,
-                branch: r.get(10)?,
+                support_count: r.get(2)?,
+                session_count: r.get(3)?,
+                last_seen_at: r.get(4)?,
                 symbol_fqns: vec![],
                 file_paths: vec![],
             })
