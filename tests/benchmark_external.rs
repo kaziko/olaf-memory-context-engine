@@ -265,11 +265,17 @@ fn parse_index_stderr(stderr: &str) -> (usize, usize, usize) {
                     continue;
                 }
                 if word.starts_with("files") {
-                    files = Some(parts[i - 1].parse::<usize>().unwrap_or(0));
+                    files = Some(parts[i - 1].parse::<usize>().unwrap_or_else(|e| {
+                        panic!("failed to parse file count '{}'  from stderr: {e}\nLine: {line}", parts[i - 1])
+                    }));
                 } else if word.starts_with("symbols") {
-                    symbols = Some(parts[i - 1].trim_end_matches(',').parse::<usize>().unwrap_or(0));
+                    symbols = Some(parts[i - 1].trim_end_matches(',').parse::<usize>().unwrap_or_else(|e| {
+                        panic!("failed to parse symbol count '{}' from stderr: {e}\nLine: {line}", parts[i - 1])
+                    }));
                 } else if word.starts_with("edges") {
-                    edges = Some(parts[i - 1].trim_end_matches(',').parse::<usize>().unwrap_or(0));
+                    edges = Some(parts[i - 1].trim_end_matches(',').parse::<usize>().unwrap_or_else(|e| {
+                        panic!("failed to parse edge count '{}' from stderr: {e}\nLine: {line}", parts[i - 1])
+                    }));
                 }
             }
         }
@@ -306,7 +312,7 @@ fn compute_baseline_a_tokens(steps: &[BaselineStep]) -> usize {
         .map(|s| match s.action.as_str() {
             "read" => s.tokens.unwrap_or(0),
             "grep" => s.estimated_output_tokens.unwrap_or(0),
-            _ => 0,
+            other => panic!("unknown baseline_steps action '{other}' — add handling or fix the TOML config"),
         })
         .sum()
 }
@@ -385,7 +391,7 @@ fn collect_environment_info(olaf_commit_sha: String) -> EnvironmentInfo {
         os,
         cpu,
         ram_bytes,
-        build_profile: "release".to_string(),
+        build_profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
         olaf_commit_sha,
     }
 }
@@ -429,12 +435,14 @@ fn benchmark_external_repo() {
     client.initialize();
 
     // ── Cold query (warm-up, triggers run_incremental) ──
-    let first_query = &config.query[0];
+    // Uses a fixed minimal intent with no symbol_fqn/file_hints so the cold
+    // measurement isolates server startup + incremental reindex cost, independent
+    // of whichever query happens to be first in the TOML config.
     let (_cold_resp, cold_first_query_ms) = client.get_brief(
-        &first_query.intent,
+        "warm up",
         config.thresholds.budget,
-        first_query.symbol_fqn.as_deref(),
-        first_query.file_hints.as_deref(),
+        None,
+        None,
     );
     eprintln!("Cold first query: {cold_first_query_ms:.1}ms");
 
@@ -681,7 +689,7 @@ fn verify_commit_sha(repo_dir: &std::path::Path, expected: &str) {
         .expect("failed to get repo HEAD");
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(
-        actual.starts_with(expected) || expected.starts_with(&actual),
+        actual.starts_with(expected),
         "repo HEAD is {actual}, expected {expected} — refusing to benchmark wrong snapshot",
     );
 }
@@ -746,7 +754,9 @@ fn compute_aggregates(results: &[QueryResult], budgets: &[usize]) -> AggregateRe
         })
         .collect();
 
-    // Warm latency from budget=4000 measurements (excluding first query which was cold)
+    // Warm latency from budget=4000 measurements. The cold warm-up query is a separate
+    // fixed-intent call, so all queries measured here are warm (including query[0] which
+    // is re-measured in the main loop after the warm-up).
     let mut latencies: Vec<f64> = results
         .iter()
         .filter_map(|q| {
