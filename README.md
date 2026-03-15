@@ -36,14 +36,23 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 ### How much does it save?
 
-We benchmarked two real tasks on Olaf's own codebase — understanding the ranking algorithm and tracing an MCP request across modules:
+**On a large codebase** — benchmarked on **kubernetes/kubernetes** (16,789 files, 302k symbols):
+
+| | Regular tools (Grep + Read) | Olaf | Savings |
+|-|-|-|-|
+| Mean across 10 queries | ~11k tokens / 3-5 calls | ~1.2k tokens / 1 call | **78%** |
+| Best case (file hint) | ~37k tokens | ~67 tokens | **99.8%** |
+
+**On a small codebase** — benchmarked on Olaf's own source (15 modules, ~5,500 lines):
 
 | | Regular tools (Grep + Read) | Olaf | Savings |
 |-|-|-|-|
 | Ranking algorithm | ~6,000 tokens / 5-7 calls | ~1,950 tokens / 1 call | **68%** |
 | Cross-module trace | ~5,550 tokens / 7 calls | ~1,800 tokens / 1 call | **68%** |
 
-One tool call instead of seven. The gap widens on larger codebases where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
+One tool call instead of many. The gap widens on larger codebases where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
+
+**Important caveat**: The external benchmark achieved 0% recall on expected pivots (Go parser produced 0 edges, limiting retrieval to keyword-only on a flat symbol table). The 78% figure validates token *reduction*, not retrieval *accuracy*.
 
 ## Install
 

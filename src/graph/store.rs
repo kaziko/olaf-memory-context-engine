@@ -89,7 +89,20 @@ pub(crate) fn replace_file_symbols(
     symbols: &[Symbol],
 ) -> Result<(), StoreError> {
     tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+
+    // Deduplicate by FQN — keep first occurrence. This handles cases where
+    // the parser emits duplicate FQNs from the same file (e.g., Rust files
+    // with multiple impl blocks for the same type producing identical
+    // path::Type::method FQNs for different trait implementations).
+    let mut seen_fqns = HashSet::new();
     for sym in symbols {
+        if !seen_fqns.insert(&sym.fqn) {
+            log::debug!(
+                "skipping duplicate FQN within file_id {file_id}: {}",
+                sym.fqn,
+            );
+            continue;
+        }
         tx.execute(
             "INSERT INTO symbols
              (file_id, fqn, name, kind, start_line, end_line, signature, docstring, source_hash)
@@ -554,6 +567,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "replace_file_symbols must not duplicate symbols");
+    }
+
+    #[test]
+    fn test_replace_file_symbols_dedup_fqn() {
+        // Regression test: Rust files with multiple impl blocks for the same type
+        // produce duplicate FQNs (e.g., `impl Foo { fn method() }` and
+        // `impl Trait for Foo { fn method() }` both yield `path::Foo::method`).
+        // replace_file_symbols must handle this without crashing.
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let file_id = upsert_file(&tx, "src/lib.rs", "aaa", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        let sym_a = crate::parser::symbols::Symbol {
+            fqn: "src/lib.rs::Foo::method".to_string(),
+            name: "method".to_string(),
+            kind: crate::parser::SymbolKind::Method,
+            start_line: 10,
+            end_line: 15,
+            signature: Some("fn method(&self)".to_string()),
+            docstring: None,
+            source_hash: "aaa".to_string(),
+        };
+        let sym_b = crate::parser::symbols::Symbol {
+            fqn: "src/lib.rs::Foo::method".to_string(), // same FQN, different impl block
+            name: "method".to_string(),
+            kind: crate::parser::SymbolKind::Method,
+            start_line: 20,
+            end_line: 25,
+            signature: Some("fn method(&self) -> bool".to_string()),
+            docstring: None,
+            source_hash: "bbb".to_string(),
+        };
+
+        let tx = conn.transaction().unwrap();
+        replace_file_symbols(&tx, file_id, &[sym_a, sym_b]).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE fqn = 'src/lib.rs::Foo::method'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate FQN must be deduplicated to one row");
+
+        // Verify the first occurrence was kept (start_line=10, not 20)
+        let start_line: u32 = conn
+            .query_row(
+                "SELECT start_line FROM symbols WHERE fqn = 'src/lib.rs::Foo::method'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(start_line, 10, "first occurrence must be kept");
     }
 
     #[test]

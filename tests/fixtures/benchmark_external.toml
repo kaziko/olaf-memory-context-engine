@@ -1,0 +1,248 @@
+# External Repository Benchmark Configuration
+#
+# Run with: cargo test --release benchmark_external -- --ignored
+# Optional: BENCHMARK_REPO_DIR=/path/to/local/clone to skip network clone
+
+[repo]
+url = "https://github.com/kubernetes/kubernetes.git"
+commit_sha = "040ca59611d5bb5976ad4cb47f1e80f8c877d0d8"
+min_indexable_files = 2000
+
+[thresholds]
+budget = 4000
+min_mean_savings_a_pct = 30.0
+max_p95_warm_latency_ms = 2000
+min_recall_hit_rate = 0.50
+
+# ─── Query 1: Exact symbol (keyword) ────────────────────────────────────────
+
+[[query]]
+name = "keyword-exact-scheduleone"
+intent = "ScheduleOne function in the Kubernetes scheduler"
+tool = "get_brief"
+tag = "keyword"
+expected_pivots = ["pkg/scheduler/schedule_one.go::Scheduler::ScheduleOne"]
+selection_rationale = "Entry point of the scheduler main loop; unique function name with 12+ internal callers across scheduling framework"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find files referencing ScheduleOne"
+estimated_output_tokens = 80
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/scheduler/schedule_one.go"
+tokens = 13322
+
+# ─── Query 2: Module-level (keyword) ────────────────────────────────────────
+
+[[query]]
+name = "keyword-module-garbage-collector"
+intent = "garbage collector module in controller manager"
+tool = "get_brief"
+tag = "keyword"
+expected_pivots = [
+    "pkg/controller/garbagecollector/garbagecollector.go::NewGarbageCollector",
+    "pkg/controller/garbagecollector/garbagecollector.go::GarbageCollector::attemptToDeleteItem",
+]
+selection_rationale = "Self-contained controller module with constructor and core deletion path spanning multiple internal methods"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find GarbageCollector references in controller dir"
+estimated_output_tokens = 200
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/controller/garbagecollector/garbagecollector.go"
+tokens = 8121
+
+# ─── Query 3: Cross-module trace (keyword) ──────────────────────────────────
+
+[[query]]
+name = "keyword-cross-module-reflector-informer"
+intent = "how the Reflector feeds events into a shared informer in client-go"
+tool = "get_brief"
+tag = "keyword"
+expected_pivots = [
+    "staging/src/k8s.io/client-go/tools/cache/reflector.go::Reflector::ListAndWatch",
+    "staging/src/k8s.io/client-go/tools/cache/controller.go::NewInformer",
+]
+selection_rationale = "Spans two files in same package but different conceptual roles (watch source vs consumer); classic cross-module trace"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find ListAndWatch and NewInformer references in client-go cache"
+estimated_output_tokens = 150
+
+[[query.baseline_steps]]
+action = "read"
+file = "staging/src/k8s.io/client-go/tools/cache/reflector.go"
+tokens = 13733
+
+[[query.baseline_steps]]
+action = "read"
+file = "staging/src/k8s.io/client-go/tools/cache/controller.go"
+tokens = 7628
+
+# ─── Query 4: Broad/vague (low_confidence) ──────────────────────────────────
+
+[[query]]
+name = "lowconf-broad-handle-errors"
+intent = "handle errors in controllers"
+tool = "get_brief"
+tag = "low_confidence"
+expected_pivots = [
+    "pkg/controller/deployment/deployment_controller.go::DeploymentController::handleErr",
+    "pkg/controller/endpoint/endpoints_controller.go::Controller::handleErr",
+]
+selection_rationale = "Generic phrase matching dozens of handleErr functions across controllers; tests graceful handling of broad queries"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find handleErr functions across all controllers"
+estimated_output_tokens = 500
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/controller/deployment/deployment_controller.go"
+tokens = 6147
+
+# ─── Query 5: Bug-fix intent (bugfix) ───────────────────────────────────────
+
+[[query]]
+name = "bugfix-sync-deployment-stuck"
+intent = "fix bug in syncDeployment where rollout gets stuck"
+tool = "get_brief"
+tag = "bugfix"
+expected_pivots = [
+    "pkg/controller/deployment/deployment_controller.go::DeploymentController::syncDeployment",
+    "pkg/controller/deployment/rolling.go::DeploymentController::reconcileNewReplicaSet",
+]
+selection_rationale = "Bug-fix phrasing around a real complex function that delegates to rolling.go; tests whether engine traces into callees"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find syncDeployment references in deployment controller"
+estimated_output_tokens = 100
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/controller/deployment/deployment_controller.go"
+tokens = 6147
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find reconcileNewReplicaSet references"
+estimated_output_tokens = 60
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/controller/deployment/rolling.go"
+tokens = 2539
+
+# ─── Query 6: Implementation intent (impl) ──────────────────────────────────
+
+[[query]]
+name = "impl-pod-eviction-threshold"
+intent = "implement memory pressure pod eviction based on threshold"
+tool = "get_brief"
+tag = "impl"
+expected_pivots = [
+    "pkg/kubelet/eviction/eviction_manager.go::managerImpl::evictPod",
+]
+selection_rationale = "Clear implementation intent for a real subsystem; eviction manager is a non-trivial bounded module with well-named target function"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find evictPod and eviction references in kubelet/eviction"
+estimated_output_tokens = 150
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/kubelet/eviction/eviction_manager.go"
+tokens = 6615
+
+# ─── Query 7: Refactor intent (refactor) ────────────────────────────────────
+
+[[query]]
+name = "refactor-endpoint-controller-sync"
+intent = "refactor endpoint controller sync loop"
+tool = "get_brief"
+tag = "refactor"
+expected_pivots = [
+    "pkg/controller/endpoint/endpoints_controller.go::Controller::syncService",
+    "pkg/controller/endpoint/endpoints_controller.go::Controller::handleErr",
+]
+selection_rationale = "Refactor intent over a bounded controller file with clear sync-loop structure; representative of common refactor queries"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find syncService and sync references in endpoint controller"
+estimated_output_tokens = 120
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/controller/endpoint/endpoints_controller.go"
+tokens = 7216
+
+# ─── Query 8: File-hint (file_hint) ─────────────────────────────────────────
+
+[[query]]
+name = "filehint-kubelet-syncpod"
+intent = "pod lifecycle sync logic"
+tool = "get_brief"
+tag = "file_hint"
+file_hints = ["pkg/kubelet/kubelet.go"]
+expected_pivots = [
+    "pkg/kubelet/kubelet.go::Kubelet::SyncPod",
+    "pkg/kubelet/kubelet.go::Kubelet::SyncTerminatingPod",
+]
+selection_rationale = "Large file (37k tokens) where reading in full is prohibitive; file_hint constrains search and tests whether engine uses the hint efficiently"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find SyncPod and SyncTerminatingPod in kubelet.go"
+estimated_output_tokens = 80
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/kubelet/kubelet.go"
+tokens = 36882
+
+# ─── Query 9: Low-confidence (low_confidence) ───────────────────────────────
+
+[[query]]
+name = "lowconf-ambiguous-token"
+intent = "token"
+tool = "get_brief"
+tag = "low_confidence"
+expected_pivots = [
+    "pkg/kubelet/token/token_manager.go::Manager",
+]
+selection_rationale = "Single common word with no context; many modules contain 'token'; tests graceful handling of highly ambiguous short queries"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "find token references across pkg/ (hundreds of hits)"
+estimated_output_tokens = 2000
+
+[[query.baseline_steps]]
+action = "read"
+file = "pkg/kubelet/token/token_manager.go"
+tokens = 1700
+
+# ─── Query 10: Zero-match (fallback) ────────────────────────────────────────
+
+[[query]]
+name = "fallback-zookeeper-leader"
+intent = "find ZookeeperLeaderElector implementation"
+tool = "get_brief"
+tag = "fallback"
+expected_pivots = []
+selection_rationale = "Kubernetes uses etcd-based leader election, not Zookeeper; query should return empty results and trigger fallback behavior"
+
+[[query.baseline_steps]]
+action = "grep"
+description = "search entire repo for Zookeeper references (no hits expected)"
+estimated_output_tokens = 0
