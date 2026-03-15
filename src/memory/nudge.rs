@@ -1,9 +1,17 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::store::StoreError;
+use crate::graph::query::IMPACT_EDGE_KINDS;
+use crate::sensitive::is_sensitive;
 
 /// Observation kinds that indicate the agent is persisting valuable knowledge.
 const VALUABLE_KINDS: &[&str] = &["insight", "decision", "error"];
+
+/// Minimum number of distinct dependent files before a blast radius nudge fires.
+const BLAST_RADIUS_THRESHOLD: usize = 3;
+
+/// Maximum number of dependent file paths shown in the nudge message.
+const BLAST_RADIUS_MAX_SHOWN: usize = 3;
 
 /// Tools eligible for nudge append — plain-text exploratory tools only.
 /// JSON-returning tools (submit_lsp_edges) and mutation tools (save_observation, undo_change) are excluded.
@@ -159,6 +167,75 @@ fn format_bash_nudge(signal: &BashNudgeSignal) -> String {
     )
 }
 
+/// Detect blast radius: recently edited files with many downstream dependents.
+/// Scans the 5 most recently edited distinct files in this session.
+/// Returns a nudge for the first file that crosses the threshold.
+pub(crate) fn detect_blast_radius_nudge(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<String>, StoreError> {
+    // Find the 5 most recently edited distinct files in this session
+    let mut candidates_stmt = conn.prepare(
+        "SELECT file_path, MAX(created_at) AS last_seen FROM observations \
+         WHERE session_id = ?1 AND kind = 'file_change' AND auto_generated = 1 AND file_path IS NOT NULL \
+         GROUP BY file_path \
+         ORDER BY last_seen DESC LIMIT 5",
+    )?;
+    let candidates: Vec<String> = candidates_stmt
+        .query_map(params![session_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    // For each candidate, check dependent file count
+    let edge_in_clause = IMPACT_EDGE_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+    let deps_sql = format!(
+        "SELECT DISTINCT f2.path \
+         FROM edges e \
+         JOIN symbols s_src ON e.source_id = s_src.id \
+         JOIN files f2 ON f2.id = s_src.file_id \
+         WHERE e.target_id IN ( \
+           SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE f.path = ?1 \
+         ) \
+         AND f2.path != ?1 \
+         AND e.kind IN ({edge_in_clause})"
+    );
+    let mut deps_stmt = conn.prepare(&deps_sql)?;
+
+    for candidate in &candidates {
+        let all_deps: Vec<String> = deps_stmt
+            .query_map(params![candidate], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Filter through is_sensitive() in Rust
+        let mut filtered: Vec<String> = all_deps
+            .into_iter()
+            .filter(|p| !is_sensitive(p))
+            .collect();
+
+        if filtered.len() < BLAST_RADIUS_THRESHOLD {
+            continue;
+        }
+
+        let total = filtered.len();
+
+        // Sort alphabetically, then take first BLAST_RADIUS_MAX_SHOWN for deterministic output
+        filtered.sort();
+        let shown: Vec<&str> = filtered.iter().take(BLAST_RADIUS_MAX_SHOWN).map(|s| s.as_str()).collect();
+
+        return Ok(Some(format!(
+            "\n\n[Olaf] `{}` has {} downstream dependents. Verify: {}",
+            candidate,
+            total,
+            shown.join(", ")
+        )));
+    }
+
+    Ok(None)
+}
+
 /// Detect struggle pattern: same file edited ≥ 3 times in any 5-minute tumbling window.
 /// Returns the top file_path if found, None otherwise.
 pub(crate) fn detect_struggle(
@@ -241,9 +318,13 @@ pub(crate) fn should_nudge(
     if has_valuable_observation(conn, session_id)? {
         return Ok(None);
     }
-    // Bash search nudge takes priority over file-thrash
+    // Bash search nudge takes priority over blast-radius and file-thrash
     if let Some(signal) = detect_bash_search_nudge(conn, session_id)? {
         return Ok(Some(format_bash_nudge(&signal)));
+    }
+    // Blast radius nudge: edited file has many downstream dependents
+    if let Some(nudge) = detect_blast_radius_nudge(conn, session_id)? {
+        return Ok(Some(nudge));
     }
     match detect_struggle(conn, session_id)? {
         Some(file) => Ok(Some(format!(
@@ -736,5 +817,310 @@ mod tests {
         insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/a.rs"), None).unwrap();
         insert_bash_obs(&conn, "s1", "cargo test --lib memory");
         assert!(should_nudge(&conn, "s1").unwrap().is_none());
+    }
+
+    // --- detect_blast_radius_nudge ---
+
+    /// Set up graph fixtures: a core file with symbols depended on by multiple other files.
+    /// Returns the core file path.
+    fn setup_blast_radius_graph(conn: &Connection, dep_count: usize) -> String {
+        let core_path = "src/core.rs";
+        conn.execute(
+            "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (1, ?1, 'h1', 0)",
+            params![core_path],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (1, 1, 'src/core.rs::CoreFn', 'CoreFn', 'function', 1, 10, 'sh1')",
+            [],
+        ).unwrap();
+
+        for i in 0..dep_count {
+            let file_id = (i + 2) as i64;
+            let sym_id = (i + 2) as i64;
+            let path = format!("src/dep_{}.rs", i);
+            let fqn = format!("src/dep_{}.rs::caller_{}", i, i);
+            conn.execute(
+                "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (?1, ?2, ?3, 0)",
+                params![file_id, path, format!("h{}", file_id)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 'function', 1, 5, ?5)",
+                params![sym_id, file_id, fqn, format!("caller_{}", i), format!("sh{}", sym_id)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 1, 'calls')",
+                params![sym_id],
+            ).unwrap();
+        }
+
+        core_path.to_string()
+    }
+
+    #[test]
+    fn test_blast_radius_3_dependents_fires() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 3);
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some(&core), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("src/core.rs"));
+        assert!(text.contains("3 downstream dependents"));
+        // Should show ≤3 dependent paths
+        assert!(text.contains("src/dep_"));
+    }
+
+    #[test]
+    fn test_blast_radius_2_dependents_no_nudge() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 2);
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some(&core), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_blast_radius_no_symbols_no_nudge() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // File exists in observations but has no indexed symbols → no edges → no nudge
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/unknown.rs"), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_blast_radius_no_file_change_no_nudge() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // Session with no file_change observations at all
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_blast_radius_nudge_wording() {
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 4);
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some(&core), None).unwrap();
+
+        let text = detect_blast_radius_nudge(&conn, "s1").unwrap().unwrap();
+        // AC6: contains rel_path and dependent paths
+        assert!(text.contains("`src/core.rs`"));
+        assert!(text.contains("4 downstream dependents"));
+        assert!(text.contains("Verify:"));
+        // AC6: does not claim breakage
+        assert!(!text.contains("broke"));
+        assert!(!text.contains("error"));
+        // AC5: exactly 3 paths shown (4 deps, capped at BLAST_RADIUS_MAX_SHOWN=3)
+        let verify_part = text.split("Verify: ").nth(1).unwrap();
+        let shown_paths: Vec<&str> = verify_part.split(", ").collect();
+        assert_eq!(shown_paths.len(), 3, "Should show exactly 3 paths when 4 deps exist");
+        // Verify alphabetical sort: dep_0 < dep_1 < dep_2 (dep_3 truncated)
+        assert_eq!(shown_paths[0], "src/dep_0.rs");
+        assert_eq!(shown_paths[1], "src/dep_1.rs");
+        assert_eq!(shown_paths[2], "src/dep_2.rs");
+    }
+
+    #[test]
+    fn test_blast_radius_multiple_symbols_same_dep_file_below_threshold() {
+        // 5 edge rows but only 2 distinct dependent files → below threshold
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+
+        conn.execute(
+            "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (1, 'src/core.rs', 'h1', 0)", [],
+        ).unwrap();
+        // Two target symbols in core.rs
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (1, 1, 'src/core.rs::fn_a', 'fn_a', 'function', 1, 5, 'sh1')", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (2, 1, 'src/core.rs::fn_b', 'fn_b', 'function', 6, 10, 'sh2')", [],
+        ).unwrap();
+
+        // Two dependent files, each with multiple symbols calling core
+        conn.execute("INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (2, 'src/a.rs', 'h2', 0)", []).unwrap();
+        conn.execute("INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (3, 'src/b.rs', 'h3', 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (10, 2, 'src/a.rs::c1', 'c1', 'function', 1, 5, 'sha1')", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (11, 2, 'src/a.rs::c2', 'c2', 'function', 6, 10, 'sha2')", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (12, 3, 'src/b.rs::c3', 'c3', 'function', 1, 5, 'shb1')", [],
+        ).unwrap();
+        // 5 edges, but only 2 distinct source files
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (10, 1, 'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (11, 1, 'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (11, 2, 'uses_type')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (12, 1, 'calls')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (12, 2, 'extends')", []).unwrap();
+
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/core.rs"), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none(), "Only 2 distinct dependent files, should be below threshold");
+    }
+
+    #[test]
+    fn test_blast_radius_high_blast_edit_followed_by_low_blast() {
+        // High-blast edit first, then low-blast edit → high-blast still triggers (scanning last 5)
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 3);
+
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some(&core), None).unwrap();
+        // Low-blast edit to a file not in the graph
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/readme.rs"), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_some(), "High-blast file should still be found when scanning last 5");
+        let text = result.unwrap();
+        assert!(text.contains("src/core.rs"), "Nudge should identify the high-blast file, not the low-blast one");
+    }
+
+    #[test]
+    fn test_blast_radius_sensitive_dependent_drops_below_threshold() {
+        // 3 raw deps, 1 sensitive → 2 non-sensitive → below threshold → no nudge
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+
+        conn.execute(
+            "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (1, 'src/core.rs', 'h1', 0)", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (1, 1, 'src/core.rs::CoreFn', 'CoreFn', 'function', 1, 10, 'sh1')", [],
+        ).unwrap();
+
+        for (i, path) in ["src/a.rs", "src/b.rs", ".env"].iter().enumerate() {
+            let fid = (i + 2) as i64;
+            let sid = (i + 2) as i64;
+            conn.execute(
+                "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (?1, ?2, ?3, 0)",
+                params![fid, path, format!("h{}", fid)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 'function', 1, 5, ?5)",
+                params![sid, fid, format!("{}::fn_{}", path, i), format!("fn_{}", i), format!("sh{}", sid)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 1, 'calls')",
+                params![sid],
+            ).unwrap();
+        }
+
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/core.rs"), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none(), "Sensitive dependent filtered, leaving only 2 non-sensitive deps");
+    }
+
+    #[test]
+    fn test_blast_radius_sensitive_dependent_excluded_from_output() {
+        // 4 raw deps, 1 sensitive → 3 non-sensitive → fires, but .env must not appear in output
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+
+        conn.execute(
+            "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (1, 'src/core.rs', 'h1', 0)", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (1, 1, 'src/core.rs::CoreFn', 'CoreFn', 'function', 1, 10, 'sh1')", [],
+        ).unwrap();
+
+        for (i, path) in ["src/a.rs", "src/b.rs", "src/c.rs", ".env"].iter().enumerate() {
+            let fid = (i + 2) as i64;
+            let sid = (i + 2) as i64;
+            conn.execute(
+                "INSERT INTO files (id, path, blake3_hash, last_indexed_at) VALUES (?1, ?2, ?3, 0)",
+                params![fid, path, format!("h{}", fid)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO symbols (id, file_id, fqn, name, kind, start_line, end_line, source_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 'function', 1, 5, ?5)",
+                params![sid, fid, format!("{}::fn_{}", path, i), format!("fn_{}", i), format!("sh{}", sid)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, kind) VALUES (?1, 1, 'calls')",
+                params![sid],
+            ).unwrap();
+        }
+
+        insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/core.rs"), None).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_some(), "3 non-sensitive deps should cross threshold");
+        let text = result.unwrap();
+        assert!(text.contains("3 downstream dependents"), "Count should reflect only non-sensitive deps");
+        assert!(!text.contains(".env"), "Sensitive path must not appear in nudge output");
+        assert!(text.contains("src/a.rs"));
+        assert!(text.contains("src/b.rs"));
+        assert!(text.contains("src/c.rs"));
+    }
+
+    #[test]
+    fn test_blast_radius_manual_observation_no_nudge() {
+        // Only manual save_observation(kind="file_change") (auto_generated=0) → no nudge
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 3);
+
+        // Use insert_observation (not insert_auto_observation) → auto_generated = 0
+        insert_observation(&conn, "s1", "file_change", "manual edit", None, Some(&core), None, Importance::Low).unwrap();
+
+        let result = detect_blast_radius_nudge(&conn, "s1").unwrap();
+        assert!(result.is_none(), "Manual observations should not trigger blast radius");
+    }
+
+    #[test]
+    fn test_struggle_still_fires_without_blast_radius() {
+        // When no blast radius signal, struggle should still work
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        // 3 edits to same file (struggle) but no graph data
+        for _ in 0..3 {
+            insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some("src/auth.rs"), None).unwrap();
+        }
+        let result = should_nudge(&conn, "s1").unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("save_observation"), "Struggle nudge should fire");
+    }
+
+    #[test]
+    fn test_blast_radius_wins_over_struggle_in_should_nudge() {
+        // When both blast radius and struggle would fire, blast radius wins (higher priority)
+        let (conn, _dir) = open_test_db();
+        upsert_session(&conn, "s1", "test").unwrap();
+        let core = setup_blast_radius_graph(&conn, 3);
+
+        // 3 edits to a high-blast file triggers both struggle and blast radius
+        for _ in 0..3 {
+            insert_auto_observation(&conn, "s1", "file_change", "edit", None, Some(&core), None).unwrap();
+        }
+
+        let result = should_nudge(&conn, "s1").unwrap();
+        assert!(result.is_some());
+        let text = result.unwrap();
+        // Blast radius nudge contains "downstream dependents", struggle contains "save_observation"
+        assert!(text.contains("downstream dependents"), "Blast radius should win over struggle");
+        assert!(!text.contains("save_observation"), "Struggle should not fire when blast radius fires");
     }
 }

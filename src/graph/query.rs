@@ -7,6 +7,10 @@ use crate::policy::ContentPolicy;
 use crate::sensitive::is_sensitive;
 use crate::workspace::Workspace;
 
+/// Edge kinds used for impact analysis (callers, extenders, implementors, type users).
+/// Shared between get_impact() and blast-radius nudge detection.
+pub const IMPACT_EDGE_KINDS: &[&str] = &["calls", "extends", "implements", "uses_type"];
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueryError {
     #[error("SQLite error: {0}")]
@@ -1485,13 +1489,15 @@ pub(crate) fn get_impact(
     let mut results: Vec<(String, String, String, String, usize)> = Vec::new(); // fqn, name, path, kind, depth
     let mut truncated = false;
 
-    let mut impact_stmt = conn.prepare(
+    let edge_in_clause = IMPACT_EDGE_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+    let impact_sql = format!(
         "SELECT DISTINCT s.id, s.fqn, s.name, f.path, e.kind
          FROM edges e JOIN symbols s ON s.id=e.source_id JOIN files f ON f.id=s.file_id
          WHERE e.target_id=?1
-           AND e.kind IN ('calls', 'extends', 'implements', 'uses_type')
+           AND e.kind IN ({edge_in_clause})
          LIMIT ?2"
-    )?;
+    );
+    let mut impact_stmt = conn.prepare(&impact_sql)?;
     while let Some((current_id, current_depth)) = queue.pop_front() {
         if current_depth >= depth { continue; }
         let rows: Vec<(i64, String, String, String, String)> = impact_stmt.query_map(
