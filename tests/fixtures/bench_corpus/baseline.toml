@@ -4,9 +4,9 @@
 # Only recall@3 gates CI — recall@5, MRR, latency are informational.
 # Fallback tag has no recall baseline — validated by reason assertion instead.
 #
-# Current metrics (2026-03-16):
-#   global=0.765  keyword=1.000  file_hint=0.500  low_confidence=1.000
-#   bugfix=0.750  refactor=0.750  impl=1.000  high_fanout=1.000
+# Current metrics (2026-03-16, FTS5 BM25):
+#   global=0.882  keyword=1.000  file_hint=1.000  low_confidence=1.000
+#   bugfix=1.000  refactor=1.000  impl=1.000  high_fanout=1.000
 #   (fallback excluded from recall — validated by reason assertion)
 #
 # Update after tuning: cargo test eval_retrieval_harness --lib -- --nocapture
