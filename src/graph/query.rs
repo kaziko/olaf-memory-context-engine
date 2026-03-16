@@ -448,7 +448,7 @@ pub(crate) fn rank_symbols_by_keywords(
         return Ok(Vec::new());
     }
 
-    // FTS5 MATCH with BM25 ranking — 3x over-fetch for in-degree tiebreaking
+    // FTS5 MATCH with BM25 ranking — 20x over-fetch for in-degree tiebreaking
     let over_fetch = (limit * 20).max(100) as i64;
     let mut fts_stmt = conn.prepare(
         "SELECT rowid, bm25(symbols_fts, ?1, ?2, ?3, ?4) AS score
@@ -2430,7 +2430,7 @@ mod tests {
     // --- Story 6.4: Hybrid pivot ranking tests ---
 
     #[test]
-    fn pivot_ranking_kw_score_dominates_in_degree() {
+    fn pivot_ranking_fts5_returns_both_exact_and_segment_matches() {
         // With FTS5+in-degree composite scoring, in-degree provides a ranking bonus.
         // Y (name="pipeline_stage", in_degree=5) gets a -2.5 composite bonus that can
         // outrank X (name="pipeline", in_degree=0) even though X is an exact name match.
@@ -2452,11 +2452,11 @@ mod tests {
     }
 
     #[test]
-    fn pivot_ranking_in_degree_tiebreak() {
+    fn pivot_ranking_exact_match_classified_correctly() {
         // With FTS5+in-degree composite scoring, both BM25 and in-degree influence ranking.
         // P (name="processor") and Q (name="processor_v2") both match "processor".
         // Q has 5 incoming edges (in-degree=5), getting a composite bonus.
-        // Both must be returned with appropriate match classes.
+        // Both must be returned; P must be classified as Exact match.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "pkg::processor", "processor", "fn", 1, 10, None, None, None);
@@ -2806,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn lexicographic_ranking_strict_ordering() {
+    fn bm25_ranking_with_match_class_metadata() {
         // Verify FTS5 BM25-primary ranking:
         // - BM25 is the primary sort signal
         // - In-degree is a tiebreaker (only matters when BM25 scores are identical)

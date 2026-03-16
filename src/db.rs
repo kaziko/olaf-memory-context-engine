@@ -366,11 +366,15 @@ fn backfill_name_tokens(conn: &rusqlite::Connection) -> Result<(), DbError> {
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
+    drop(stmt);
 
+    conn.execute_batch("BEGIN")?;
     let mut update = conn.prepare("UPDATE symbols SET name_tokens = ?1 WHERE id = ?2")?;
     for (id, name) in &rows {
         update.execute(params![expand_name_tokens(name), id])?;
     }
+    drop(update);
+    conn.execute_batch("COMMIT")?;
 
     log::info!("backfilled name_tokens for {} symbols", rows.len());
     Ok(())
