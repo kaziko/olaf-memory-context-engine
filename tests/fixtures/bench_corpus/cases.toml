@@ -160,6 +160,29 @@ depth = 2
 include_inbound = false
 inbound_first = false
 
+# --- high_fanout tag: exercises truncation bypass with >50 colliding symbols ---
+
+[[case]]
+name = "highfanout-exact-name-wins"
+intent = "ScheduleOne function in the scheduler"
+expected_pivots = ["src/scheduler.rs::ScheduleOne"]
+tag = "high_fanout"
+exercises = ["CANDIDATE_GATHER_LIMIT"]
+
+[[case]]
+name = "highfanout-camelcase-tokenization"
+intent = "scheduler.ScheduleOne"
+expected_pivots = ["src/scheduler.rs::ScheduleOne", "src/scheduler.rs::Scheduler"]
+tag = "high_fanout"
+exercises = ["CANDIDATE_GATHER_LIMIT"]
+
+[[case]]
+name = "highfanout-dot-separated-query"
+intent = "scheduler.ScheduleConfig settings"
+expected_pivots = ["src/scheduler.rs::ScheduleConfig", "src/scheduler.rs::Scheduler"]
+tag = "high_fanout"
+exercises = ["CANDIDATE_GATHER_LIMIT"]
+
 # --- fallback tag: no keyword matches (all terms <=3 chars or nonsense) ---
 
 [[case]]
