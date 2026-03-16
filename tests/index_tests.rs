@@ -600,3 +600,81 @@ fn test_performance_500_files() {
         elapsed
     );
 }
+
+/// E2E: Go function in file_a calls unique function in file_b → edge persists after indexer resolution.
+#[test]
+fn test_go_calls_edge_persists_cross_file() {
+    let dir = tempdir().unwrap();
+
+    std::fs::write(
+        dir.path().join("a.go"),
+        "package main\nfunc Caller() { UniqueTarget() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.go"),
+        "package main\nfunc UniqueTarget() {}\n",
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("index::run failed");
+
+    let calls_count = query_count_where(&conn, "edges", "kind", "calls");
+    assert!(
+        calls_count >= 1,
+        "Go cross-file call edge must persist when target is unambiguous; got {}",
+        calls_count
+    );
+    // Verify the specific edge FQNs, not just count
+    let has_expected: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e
+             JOIN symbols s1 ON e.source_id = s1.id
+             JOIN symbols s2 ON e.target_id = s2.id
+             WHERE s1.fqn = 'a.go::Caller' AND s2.fqn = 'b.go::UniqueTarget' AND e.kind = 'calls'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0;
+    assert!(
+        has_expected,
+        "expected Caller -> UniqueTarget edge with resolved FQNs"
+    );
+}
+
+/// E2E: Go function calls a name that exists in multiple files → edge dropped (ambiguous).
+#[test]
+fn test_go_ambiguous_call_edge_dropped() {
+    let dir = tempdir().unwrap();
+
+    std::fs::write(
+        dir.path().join("a.go"),
+        "package main\nfunc Caller() { Ambiguous() }\n",
+    )
+    .unwrap();
+    // Same function name in two different files — ambiguous
+    std::fs::write(
+        dir.path().join("b.go"),
+        "package main\nfunc Ambiguous() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("c.go"),
+        "package main\nfunc Ambiguous() {}\n",
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+    index::run(&mut conn, dir.path()).expect("index::run failed");
+
+    let calls_count = query_count_where(&conn, "edges", "kind", "calls");
+    assert_eq!(
+        calls_count, 0,
+        "ambiguous Go call should NOT persist — 2 candidates; got {}",
+        calls_count
+    );
+}
