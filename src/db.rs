@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use rusqlite::params;
 use rusqlite_migration::{M, Migrations};
 
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +208,7 @@ pub fn open(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
     conn.busy_timeout(Duration::from_millis(5000))?;
 
     apply_migrations(&mut conn)?;
+    backfill_name_tokens(&conn)?;
     Ok(conn)
 }
 
@@ -304,9 +306,75 @@ const MIGRATION_012: &str = "
 ALTER TABLE sessions ADD COLUMN nudge_sent INTEGER DEFAULT 0;
 ";
 
+const MIGRATION_013: &str = "
+ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT '';
+
+CREATE VIRTUAL TABLE symbols_fts USING fts5(
+    name_tokens, fqn, signature, docstring,
+    content=symbols, content_rowid=id
+);
+
+CREATE TRIGGER symbols_fts_ai AFTER INSERT ON symbols BEGIN
+    INSERT INTO symbols_fts(rowid, name_tokens, fqn, signature, docstring)
+    VALUES (new.id, new.name_tokens, new.fqn, new.signature, new.docstring);
+END;
+
+CREATE TRIGGER symbols_fts_au AFTER UPDATE OF name_tokens, fqn, signature, docstring ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name_tokens, fqn, signature, docstring)
+    VALUES('delete', old.id, old.name_tokens, old.fqn, old.signature, old.docstring);
+    INSERT INTO symbols_fts(rowid, name_tokens, fqn, signature, docstring)
+    VALUES (new.id, new.name_tokens, new.fqn, new.signature, new.docstring);
+END;
+
+CREATE TRIGGER symbols_fts_ad AFTER DELETE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name_tokens, fqn, signature, docstring)
+    VALUES('delete', old.id, old.name_tokens, old.fqn, old.signature, old.docstring);
+END;
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 12;
+pub const MIGRATION_COUNT: i64 = 13;
+
+/// Backfill `name_tokens` for symbols that still have the default empty value.
+/// Each UPDATE fires the `symbols_fts_au` trigger, populating the FTS index incrementally.
+/// Runs once after MIGRATION_013 on existing databases.
+fn backfill_name_tokens(conn: &rusqlite::Connection) -> Result<(), DbError> {
+    use crate::graph::query::expand_name_tokens;
+
+    let has_fts: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbols_fts')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_fts {
+        return Ok(());
+    }
+
+    let needs_backfill: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM symbols WHERE name_tokens = '' LIMIT 1)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !needs_backfill {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare("SELECT id, name FROM symbols WHERE name_tokens = ''")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    let mut update = conn.prepare("UPDATE symbols SET name_tokens = ?1 WHERE id = ?2")?;
+    for (id, name) in &rows {
+        update.execute(params![expand_name_tokens(name), id])?;
+    }
+
+    log::info!("backfilled name_tokens for {} symbols", rows.len());
+    Ok(())
+}
 
 fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
     let migrations = Migrations::new(vec![
@@ -322,7 +390,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_010),
         M::up(MIGRATION_011),
         M::up(MIGRATION_012),
-        // Future migrations: append M::up(MIGRATION_013), etc. — never edit existing entries
+        M::up(MIGRATION_013),
+        // Future migrations: append M::up(MIGRATION_014), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;
@@ -440,6 +509,67 @@ mod tests {
         let result = open_readonly(&db_path);
         assert!(result.is_err());
         assert!(!dir.path().join("new-dir").exists(), "should not create directories");
+    }
+
+    #[test]
+    fn test_migration_013_fts5_symbols() {
+        use crate::graph::query::expand_name_tokens;
+
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        // Verify symbols_fts table exists
+        let fts_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbols_fts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fts_exists, "symbols_fts virtual table must exist after migration");
+
+        // Insert a symbol with name_tokens and verify triggers
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, language, last_indexed_at) VALUES ('t.rs', 'h', 'rust', 1000)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE path = 't.rs'", [], |r| r.get(0)).unwrap();
+
+        let tokens = expand_name_tokens("GarbageCollector");
+        conn.execute(
+            "INSERT INTO symbols (file_id, fqn, name, name_tokens, kind, start_line, end_line, source_hash)
+             VALUES (?1, 't.rs::GC', 'GarbageCollector', ?2, 'struct', 1, 5, 'h')",
+            params![file_id, tokens],
+        ).unwrap();
+
+        // INSERT trigger: FTS5 must be populated
+        let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(fts_count, 1, "INSERT trigger must populate symbols_fts");
+
+        let found: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM symbols_fts WHERE symbols_fts MATCH 'garbage')", [], |r| r.get(0))
+            .unwrap();
+        assert!(found, "FTS5 MATCH must find 'garbage' from name_tokens");
+
+        // UPDATE trigger: old entry removed, new entry added
+        let new_tokens = expand_name_tokens("TrashCollector");
+        conn.execute(
+            "UPDATE symbols SET name = 'TrashCollector', name_tokens = ?1 WHERE fqn = 't.rs::GC'",
+            params![new_tokens],
+        ).unwrap();
+        let found_old: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM symbols_fts WHERE symbols_fts MATCH 'garbage')", [], |r| r.get(0))
+            .unwrap();
+        assert!(!found_old, "UPDATE trigger must remove old FTS entry");
+        let found_new: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM symbols_fts WHERE symbols_fts MATCH 'trash')", [], |r| r.get(0))
+            .unwrap();
+        assert!(found_new, "UPDATE trigger must add new FTS entry");
+
+        // DELETE trigger: FTS entry removed
+        conn.execute("DELETE FROM symbols WHERE fqn = 't.rs::GC'", []).unwrap();
+        let fts_after: i64 = conn.query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(fts_after, 0, "DELETE trigger must remove FTS entry");
     }
 
     #[test]

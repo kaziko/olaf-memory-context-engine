@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, Transaction, params};
 
+use crate::graph::query::expand_name_tokens;
 use crate::parser::Symbol;
 
 /// Diff returned by `update_file_symbols()` describing which symbols changed.
@@ -103,14 +104,16 @@ pub(crate) fn replace_file_symbols(
             );
             continue;
         }
+        let name_tokens = expand_name_tokens(&sym.name);
         tx.execute(
             "INSERT INTO symbols
-             (file_id, fqn, name, kind, start_line, end_line, signature, docstring, source_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 file_id,
                 sym.fqn,
                 sym.name,
+                name_tokens,
                 sym.kind.as_str(),
                 sym.start_line,
                 sym.end_line,
@@ -165,11 +168,12 @@ pub(crate) fn update_file_symbols(
             );
             continue;
         }
+        let name_tokens = expand_name_tokens(&sym.name);
         if let Some((existing_id, old_hash)) = current.remove(&sym.fqn) {
             // UPDATE in-place — preserves id, preserves FK edges pointing to this symbol
             tx.execute(
                 "UPDATE symbols SET name=?1, kind=?2, start_line=?3, end_line=?4,
-                 signature=?5, docstring=?6, source_hash=?7 WHERE id=?8",
+                 signature=?5, docstring=?6, source_hash=?7, name_tokens=?8 WHERE id=?9",
                 params![
                     sym.name,
                     sym.kind.as_str(),
@@ -178,6 +182,7 @@ pub(crate) fn update_file_symbols(
                     sym.signature,
                     sym.docstring,
                     sym.source_hash,
+                    name_tokens,
                     existing_id
                 ],
             )?;
@@ -186,12 +191,13 @@ pub(crate) fn update_file_symbols(
             // INSERT new symbol
             tx.execute(
                 "INSERT INTO symbols
-                 (file_id, fqn, name, kind, start_line, end_line, signature, docstring, source_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     file_id,
                     sym.fqn,
                     sym.name,
+                    name_tokens,
                     sym.kind.as_str(),
                     sym.start_line,
                     sym.end_line,
