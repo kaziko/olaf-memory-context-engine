@@ -155,7 +155,16 @@ pub(crate) fn update_file_symbols(
 
     let mut diff = SymbolDiff { changed: Vec::new(), added: 0, removed: Vec::new() };
 
+    // Deduplicate by FQN — keep first occurrence (same pattern as replace_file_symbols)
+    let mut seen_fqns = HashSet::new();
     for sym in new_symbols {
+        if !seen_fqns.insert(&sym.fqn) {
+            log::debug!(
+                "skipping duplicate FQN in update_file_symbols for file_id {file_id}: {}",
+                sym.fqn,
+            );
+            continue;
+        }
         if let Some((existing_id, old_hash)) = current.remove(&sym.fqn) {
             // UPDATE in-place — preserves id, preserves FK edges pointing to this symbol
             tx.execute(
@@ -1037,5 +1046,56 @@ mod tests {
         assert!(result.contains_key("src/a.rs::foo"));
         assert!(result.contains_key("src/a.rs::bar"));
         assert!(!result.contains_key("nonexistent::sym"));
+    }
+
+    #[test]
+    fn test_update_file_symbols_dedup_fqn() {
+        use crate::parser::{SymbolKind, Symbol};
+
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let file_id = upsert_file(&tx, "src/dup.rs", "hash1", "rust", 1000).unwrap();
+
+        let symbols = vec![
+            Symbol {
+                fqn: "src/dup.rs::Foo::fmt".into(),
+                name: "fmt".into(),
+                kind: SymbolKind::Method,
+                start_line: 1,
+                end_line: 5,
+                signature: None,
+                docstring: None,
+                source_hash: "h1".into(),
+            },
+            Symbol {
+                fqn: "src/dup.rs::Foo::fmt".into(),
+                name: "fmt".into(),
+                kind: SymbolKind::Method,
+                start_line: 10,
+                end_line: 15,
+                signature: None,
+                docstring: None,
+                source_hash: "h2".into(),
+            },
+        ];
+
+        let diff = update_file_symbols(&tx, file_id, &symbols).unwrap();
+        assert_eq!(diff.added, 1, "only first occurrence should be inserted");
+
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE file_id = ?1",
+            [file_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "exactly one symbol should exist after dedup");
+
+        // Verify first-wins: persisted symbol should have first symbol's data
+        let (start, hash): (u32, String) = tx.query_row(
+            "SELECT start_line, source_hash FROM symbols WHERE file_id = ?1",
+            [file_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(start, 1, "first-wins: should keep first symbol's start_line");
+        assert_eq!(hash, "h1", "first-wins: should keep first symbol's source_hash");
     }
 }
