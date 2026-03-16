@@ -62,6 +62,96 @@ const LOW_CONFIDENCE_PIVOT_POOL: usize = 8;
 /// Avoids cluttering output for unambiguous single-mode queries or low-confidence noise.
 const NON_TRIVIAL_MIX_THRESHOLD: f32 = 0.20;
 
+/// Split a camelCase, PascalCase, or snake_case identifier into sub-tokens (lowercase).
+/// Returns only the sub-tokens — does NOT include the original identifier.
+/// Single-word identifiers (no split points) return empty vec.
+///
+/// Examples:
+/// - `"ScheduleOne"` → `["schedule", "one"]`
+/// - `"execute_query"` → `["execute", "query"]`
+/// - `"XMLParser"` → `["xml", "parser"]`
+/// - `"auth"` → `[]` (single word, no split)
+pub(crate) fn tokenize_identifier(s: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '_' || c == '-' {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if c.is_uppercase() {
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            let prev_is_lower = i > 0 && chars[i - 1].is_lowercase();
+            // Split before uppercase that follows lowercase (camelCase boundary)
+            // OR before uppercase followed by lowercase when current is uppercase run (XMLParser → XML|Parser)
+            if (prev_is_lower || (!current.is_empty() && next_is_lower && chars[i - 1].is_uppercase()))
+                && !current.is_empty()
+            {
+                parts.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    // Single word (no split) returns empty
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    parts
+}
+
+/// Normalize a query string into search terms by:
+/// 1. Splitting on whitespace into coarse tokens
+/// 2. Preserving each coarse token (lowercased) — this keeps snake_case compounds intact
+/// 3. Further splitting each coarse token on ASCII punctuation into fine atoms
+/// 4. Preserving each fine atom (lowercased)
+/// 5. Expanding camelCase/PascalCase sub-tokens from each fine atom
+/// 6. Filtering tokens ≤3 chars, deduplicating
+///
+/// Does NOT include stop-word filtering — that is caller-specific.
+///
+/// Note: identifiers ≤3 chars (e.g., "run", "get", "pod") are filtered out.
+/// This is intentional noise reduction but means short exact names cannot benefit
+/// from Stage 1 exact-match rescue.
+pub(crate) fn normalize_query_terms(input: &str) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let push = |token: String, seen: &mut HashSet<String>, result: &mut Vec<String>| {
+        if token.len() > 3 && seen.insert(token.clone()) {
+            result.push(token);
+        }
+    };
+
+    for coarse in input.split_whitespace() {
+        // Preserve the full whitespace-delimited token (e.g., "execute_query", "scheduler.ScheduleOne")
+        push(coarse.to_lowercase(), &mut seen, &mut result);
+
+        // Split on punctuation into fine atoms
+        for atom in coarse.split(|c: char| c.is_ascii_punctuation()) {
+            if atom.is_empty() {
+                continue;
+            }
+            // Preserve each fine atom (e.g., "scheduler", "ScheduleOne" → "scheduleone")
+            push(atom.to_lowercase(), &mut seen, &mut result);
+
+            // Add sub-tokens from camelCase/PascalCase splitting
+            for sub in tokenize_identifier(atom) {
+                push(sub, &mut seen, &mut result);
+            }
+        }
+    }
+    result
+}
+
 pub(crate) enum IntentMode {
     BugFix,
     Refactor,
@@ -193,9 +283,26 @@ struct SymbolRow {
     signature: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchClass {
+    Exact,
+    Segment,
+    Substring,
+}
+
+impl std::fmt::Display for MatchClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchClass::Exact => write!(f, "exact"),
+            MatchClass::Segment => write!(f, "segment"),
+            MatchClass::Substring => write!(f, "substring"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum SelectionReason {
-    Keyword { kw_score: usize, in_degree: i64 },
+    Keyword { match_class: MatchClass, kw_score: usize, in_degree: i64 },
     FileHint { hint: String },
     CallerSupplied,
     Fallback,
@@ -235,6 +342,21 @@ fn now_secs() -> i64 {
 /// File hints take priority: when `file_hints` is non-empty and at least one hint matches
 /// a symbol, those symbols are returned and keyword ranking is skipped. If hints match
 /// nothing, the function falls through to keyword ranking.
+/// Candidate info gathered during staged retrieval.
+struct CandidateInfo {
+    fqn: String,
+    like_hits: usize,
+    exact_name: bool,
+}
+
+/// Split an FQN into segments for segment matching.
+fn split_fqn_segments(fqn: &str) -> Vec<String> {
+    fqn.split([':', '/', '_', '-', '.'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
 pub(crate) fn rank_symbols_by_keywords(
     conn: &Connection,
     keywords: &[String],
@@ -244,31 +366,67 @@ pub(crate) fn rank_symbols_by_keywords(
         return Ok(Vec::new());
     }
 
-    let unique_words: HashSet<String> = keywords.iter()
-        .filter(|w| w.len() > 3)
-        .map(|w| w.to_lowercase())
-        .collect();
+    let unique_words: Vec<String> = {
+        let mut seen = HashSet::new();
+        keywords.iter()
+            .filter(|w| w.len() > 3)
+            .filter_map(|w| {
+                let lower = w.to_lowercase();
+                if seen.insert(lower.clone()) { Some(lower) } else { None }
+            })
+            .collect()
+    };
 
     if unique_words.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut candidates: HashMap<i64, usize> = HashMap::new();
-    let mut kw_stmt = conn.prepare(
-        "SELECT id FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
+    let mut candidates: HashMap<i64, CandidateInfo> = HashMap::new();
+
+    // Stage 1 — Exact name hits (bypasses CANDIDATE_GATHER_LIMIT)
+    let mut exact_stmt = conn.prepare(
+        "SELECT id, fqn FROM symbols WHERE lower(name) = ?1"
+    )?;
+    for word in &unique_words {
+        let rows: Vec<(i64, String)> = exact_stmt.query_map(params![word], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?.collect::<Result<_,_>>()?;
+        for (id, fqn) in rows {
+            let entry = candidates.entry(id).or_insert_with(|| CandidateInfo {
+                fqn: fqn.clone(),
+                like_hits: 0,
+                exact_name: false,
+            });
+            entry.exact_name = true;
+        }
+    }
+
+    // Stage 2 — LIKE substring gather (existing, modified to fetch fqn)
+    let mut like_stmt = conn.prepare(
+        "SELECT id, fqn FROM symbols WHERE lower(name) LIKE ?1 OR lower(fqn) LIKE ?1
          ORDER BY id ASC LIMIT ?2"
     )?;
     for word in &unique_words {
         let pattern = format!("%{word}%");
-        let rows: Vec<i64> = kw_stmt.query_map(params![pattern, CANDIDATE_GATHER_LIMIT as i64], |r| r.get(0))?
-            .collect::<Result<_,_>>()?;
-        for id in rows { *candidates.entry(id).or_insert(0) += 1; }
+        let rows: Vec<(i64, String)> = like_stmt.query_map(
+            params![pattern, CANDIDATE_GATHER_LIMIT as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        )?.collect::<Result<_,_>>()?;
+        for (id, fqn) in rows {
+            let entry = candidates.entry(id).or_insert_with(|| CandidateInfo {
+                fqn: fqn.clone(),
+                like_hits: 0,
+                exact_name: false,
+            });
+            entry.like_hits += 1;
+        }
     }
 
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
 
+    // Compute in-degrees
     const IN_DEG_CHUNK: usize = 500;
     let cand_ids: Vec<i64> = candidates.keys().copied().collect();
     let mut in_degrees: HashMap<i64, i64> = HashMap::new();
@@ -292,41 +450,52 @@ pub(crate) fn rank_symbols_by_keywords(
         for (id, count) in rows { in_degrees.insert(id, count); }
     }
 
-    let mut scored: Vec<(i64, usize, i64)> = candidates.into_iter()
-        .map(|(id, kw)| {
-            let in_deg = in_degrees.get(&id).copied().unwrap_or(0);
-            (id, kw, in_deg)
+    // Lexicographic ranking: (exact_name DESC, fqn_segment_hits DESC, like_hits DESC, in_degree DESC, id ASC)
+    struct ScoredCandidate {
+        id: i64,
+        exact_name: bool,
+        fqn_segment_hits: usize,
+        like_hits: usize,
+        in_degree: i64,
+    }
+
+    let mut scored: Vec<ScoredCandidate> = candidates.iter()
+        .map(|(&id, info)| {
+            let segments = split_fqn_segments(&info.fqn);
+            let fqn_segment_hits = unique_words.iter()
+                .filter(|w| segments.contains(w))
+                .count();
+            let in_degree = in_degrees.get(&id).copied().unwrap_or(0);
+            ScoredCandidate { id, exact_name: info.exact_name, fqn_segment_hits, like_hits: info.like_hits, in_degree }
         })
         .collect();
     scored.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then(b.2.cmp(&a.2))
-            .then(a.0.cmp(&b.0))
+        b.exact_name.cmp(&a.exact_name)
+            .then(b.fqn_segment_hits.cmp(&a.fqn_segment_hits))
+            .then(b.like_hits.cmp(&a.like_hits))
+            .then(b.in_degree.cmp(&a.in_degree))
+            .then(a.id.cmp(&b.id))
     });
 
-    let top: Vec<(i64, usize, i64)> = scored.into_iter().take(limit).collect();
-    if top.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids: Vec<i64> = top.iter().map(|(id, _, _)| *id).collect();
-    let fqn_placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let fqn_sql = format!("SELECT id, fqn FROM symbols WHERE id IN ({fqn_placeholders})");
-    let mut fqn_stmt = conn.prepare(&fqn_sql)?;
-    let fqn_map: HashMap<i64, String> = fqn_stmt
-        .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<Result<_,_>>()?;
-    let mut result: Vec<PivotScore> = Vec::with_capacity(top.len());
-    for (id, kw, in_deg) in top {
-        match fqn_map.get(&id) {
-            Some(fqn) => result.push(PivotScore {
-                id,
-                fqn: fqn.clone(),
-                reason: SelectionReason::Keyword { kw_score: kw, in_degree: in_deg },
-            }),
-            None => log::warn!("rank_symbols_by_keywords: symbol id={id} scored but missing from fqn batch query — row may have been deleted"),
-        }
+    let mut result: Vec<PivotScore> = Vec::with_capacity(limit.min(scored.len()));
+    for sc in scored.into_iter().take(limit) {
+        let fqn = candidates.get(&sc.id).map(|c| c.fqn.clone()).unwrap_or_default();
+        let match_class = if sc.exact_name {
+            MatchClass::Exact
+        } else if sc.fqn_segment_hits > 0 {
+            MatchClass::Segment
+        } else {
+            MatchClass::Substring
+        };
+        result.push(PivotScore {
+            id: sc.id,
+            fqn,
+            reason: SelectionReason::Keyword {
+                match_class,
+                kw_score: sc.exact_name as usize + sc.like_hits,
+                in_degree: sc.in_degree,
+            },
+        });
     }
     Ok(result)
 }
@@ -360,7 +529,7 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
     }
 
     // --- Keyword branch: delegate to shared ranking function ---
-    let keywords: Vec<String> = intent.split_whitespace().map(|s| s.to_string()).collect();
+    let keywords = normalize_query_terms(intent);
     let ranked = rank_symbols_by_keywords(conn, &keywords, pool_size)?;
 
     if !ranked.is_empty() {
@@ -600,7 +769,7 @@ fn format_retrieval_notes(rendered_pivots: &[&PivotScore], intent_label: &str, o
     for ps in rendered_pivots {
         let short_name = ps.fqn.rsplit("::").next().unwrap_or(&ps.fqn);
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { kw_score, in_degree } => format!("kw={kw_score} deg={in_degree}"),
+            SelectionReason::Keyword { match_class, kw_score, in_degree } => format!("{match_class} kw={kw_score} deg={in_degree}"),
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -632,7 +801,7 @@ fn format_retrieval_notes_multi(
             .unwrap_or("unknown");
         let strategy = if *is_local { "local-priority" } else { "remote-round-robin" };
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { kw_score, in_degree } => format!("kw={kw_score} deg={in_degree}"),
+            SelectionReason::Keyword { match_class, kw_score, in_degree } => format!("{match_class} kw={kw_score} deg={in_degree}"),
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -1554,6 +1723,83 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    // ─── Story 13.3: tokenize_identifier / normalize_query_terms tests ──────
+
+    #[test]
+    fn tokenize_identifier_camel_case() {
+        assert_eq!(tokenize_identifier("scheduleOne"), vec!["schedule", "one"]);
+    }
+
+    #[test]
+    fn tokenize_identifier_pascal_case() {
+        assert_eq!(tokenize_identifier("ScheduleOne"), vec!["schedule", "one"]);
+    }
+
+    #[test]
+    fn tokenize_identifier_snake_case() {
+        assert_eq!(tokenize_identifier("execute_query"), vec!["execute", "query"]);
+    }
+
+    #[test]
+    fn tokenize_identifier_consecutive_uppercase() {
+        assert_eq!(tokenize_identifier("XMLParser"), vec!["xml", "parser"]);
+    }
+
+    #[test]
+    fn tokenize_identifier_single_word() {
+        assert!(tokenize_identifier("auth").is_empty(), "single word should not split");
+    }
+
+    #[test]
+    fn tokenize_identifier_all_uppercase() {
+        assert!(tokenize_identifier("HTTP").is_empty(), "all-caps single word should not split");
+    }
+
+    #[test]
+    fn tokenize_identifier_mixed_case_complex() {
+        assert_eq!(tokenize_identifier("getHTTPSConnection"), vec!["get", "https", "connection"]);
+    }
+
+    #[test]
+    fn normalize_query_terms_dot_separated() {
+        let terms = normalize_query_terms("scheduler.ScheduleOne");
+        assert!(terms.contains(&"scheduler.scheduleone".to_string()), "full coarse token must be preserved");
+        assert!(terms.contains(&"scheduler".to_string()));
+        assert!(terms.contains(&"scheduleone".to_string()), "fine atom must be preserved");
+        assert!(terms.contains(&"schedule".to_string()));
+        // "one" is ≤3 chars, filtered out
+        assert!(!terms.contains(&"one".to_string()));
+    }
+
+    #[test]
+    fn normalize_query_terms_whitespace_and_punctuation() {
+        let terms = normalize_query_terms("fix the scheduler::ScheduleOne bug");
+        assert!(terms.contains(&"scheduler::scheduleone".to_string()), "coarse token with :: preserved");
+        assert!(terms.contains(&"scheduler".to_string()));
+        assert!(terms.contains(&"scheduleone".to_string()));
+        assert!(terms.contains(&"schedule".to_string()));
+        // "fix", "the", "bug" are ≤3 chars
+        assert!(!terms.contains(&"fix".to_string()));
+        assert!(!terms.contains(&"the".to_string()));
+        assert!(!terms.contains(&"bug".to_string()));
+    }
+
+    #[test]
+    fn normalize_query_terms_deduplication() {
+        let terms = normalize_query_terms("schedule Schedule");
+        // Both lowered to "schedule", should appear only once
+        assert_eq!(terms.iter().filter(|t| *t == "schedule").count(), 1);
+    }
+
+    #[test]
+    fn normalize_query_terms_snake_case_preserves_compound() {
+        // The full whitespace-delimited token is preserved before punctuation splitting
+        let terms = normalize_query_terms("execute_query");
+        assert!(terms.contains(&"execute_query".to_string()), "snake_case compound must be preserved for Stage 1 exact-name match");
+        assert!(terms.contains(&"execute".to_string()));
+        assert!(terms.contains(&"query".to_string()));
+    }
+
     fn detect_intent(intent: &str) -> IntentMode {
         detect_intent_profile(intent).dominant_mode
     }
@@ -2045,8 +2291,10 @@ mod tests {
 
     #[test]
     fn pivot_ranking_in_degree_tiebreak() {
-        // P and Q both match "processor" → kw_score=1 each.
-        // Q has in_degree=5, P has in_degree=0. Q must rank first.
+        // With lexicographic ranking: exact name match beats everything else.
+        // P (name="processor") gets exact_name=true for query term "processor".
+        // Q (name="processor_v2") gets exact_name=false despite higher in_degree.
+        // P must rank first because exact > non-exact.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         conn.execute("INSERT INTO symbols VALUES (1,1,'pkg::processor','processor','fn',1,10,NULL,NULL,NULL)", []).unwrap();
@@ -2061,10 +2309,11 @@ mod tests {
         }
 
         // Intent: "processor data" — "processor" (len=9) and "data" (len=4) both qualify.
-        // Only "processor" yields matches; "data" yields none.
         let result = find_pivot_symbols(&conn, "processor data", &[], 5).unwrap();
         assert_eq!(result.len(), 2, "both processor symbols must be returned");
-        assert_eq!(result[0].id, 2, "processor_v2 (in_degree=5) must rank before processor (in_degree=0)");
+        // Exact name match ("processor" == "processor") wins over in_degree
+        assert_eq!(result[0].id, 1, "exact name match must rank first regardless of in_degree");
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { match_class: MatchClass::Exact, .. }));
     }
 
     #[test]
@@ -2332,19 +2581,24 @@ mod tests {
     }
 
     #[test]
-    fn rank_symbols_by_keywords_three_tier_sort_and_metadata() {
-        // Tests all three sort dimensions and verifies kw_score/in_degree survive into PivotScore.
+    fn rank_symbols_by_keywords_lexicographic_sort_and_metadata() {
+        // Tests lexicographic sort: (exact_name DESC, fqn_segment_hits DESC, like_hits DESC, in_degree DESC, id ASC)
         //
         // Keywords: ["alpha", "beta"] (both len > 3)
-        //   sym 10: name="alphabeta" — contains both "alpha" and "beta" → kw_score=2
-        //   sym 20: name="alpha_high" — contains "alpha" only → kw_score=1, in_degree=5
-        //   sym 30: name="alpha_low_a" — contains "alpha" only → kw_score=1, in_degree=2, id=30
-        //   sym 40: name="alpha_low_b" — contains "alpha" only → kw_score=1, in_degree=2, id=40
+        //   sym 5:  name="alpha" — exact name match for "alpha" → exact=true
+        //   sym 10: name="alphabeta" — substring match for both → exact=false, seg=0, like=2
+        //   sym 20: name="alpha_high" — FQN "src::alpha_high" has segment "alpha" → exact=false, seg=1, like=1, in_degree=5
+        //   sym 30: name="alpha_low_a" — FQN "src::alpha_low_a" has segment "alpha" → exact=false, seg=1, like=1, in_degree=2
+        //   sym 40: name="alpha_low_b" — FQN "src::alpha_low_b" has segment "alpha" → exact=false, seg=1, like=1, in_degree=2
         //
-        // Expected order: sym10 (kw dominates), sym20 (in_deg tiebreak), sym30 (id tiebreak), sym40
+        // Expected order: sym5 (exact), sym20 (seg=1, deg=5), sym30 (seg=1, deg=2, id=30), sym40 (seg=1, deg=2, id=40), sym10 (seg=0, like=2)
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'src/a.rs','h')", []).unwrap();
 
+        conn.execute(
+            "INSERT INTO symbols VALUES (5,1,'src::alpha','alpha','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
         conn.execute(
             "INSERT INTO symbols VALUES (10,1,'src::alphabeta','alphabeta','fn',1,10,NULL,NULL,NULL)",
             [],
@@ -2383,27 +2637,109 @@ mod tests {
 
         let keywords = vec!["alpha".to_string(), "beta".to_string()];
         let result = rank_symbols_by_keywords(&conn, &keywords, 10).unwrap();
-        assert_eq!(result.len(), 4);
+        assert_eq!(result.len(), 5);
 
-        // Primary sort: kw_score DESC — sym 10 (kw=2) beats all kw=1 symbols
-        assert_eq!(result[0].id, 10, "kw_score=2 must beat kw_score=1 regardless of in_degree");
-        assert!(matches!(result[0].reason, SelectionReason::Keyword { kw_score: 2, .. }),
-            "kw_score=2 must survive into PivotScore.reason; got {:?}", result[0].reason);
-        assert!(matches!(result[0].reason, SelectionReason::Keyword { in_degree: 0, .. }),
-            "in_degree=0 must survive into PivotScore.reason; got {:?}", result[0].reason);
+        // Primary sort: exact_name DESC — sym 5 (exact match for "alpha") beats all
+        assert_eq!(result[0].id, 5, "exact name match must rank first");
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { match_class: MatchClass::Exact, .. }),
+            "exact name match must report 'exact' match_class; got {:?}", result[0].reason);
 
-        // First tiebreak: in_degree DESC — sym 20 (in_deg=5) beats sym 30 and sym 40 (in_deg=2)
-        assert_eq!(result[1].id, 20, "in_degree=5 must beat in_degree=2 at equal kw_score");
-        assert!(matches!(result[1].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 5 }),
-            "kw_score=1 and in_degree=5 must survive for sym 20; got {:?}", result[1].reason);
+        // Second: fqn_segment_hits DESC — sym 20 (seg=1, in_deg=5) beats sym 30/40 (seg=1, in_deg=2)
+        assert_eq!(result[1].id, 20, "segment match with highest in_degree must be second");
 
-        // Second tiebreak: id ASC — sym 30 (id=30) beats sym 40 (id=40) at equal kw+in_deg
-        assert_eq!(result[2].id, 30, "lower id=30 must beat id=40 at equal kw_score and in_degree");
+        // Third/fourth: id tiebreak at equal seg+like+deg
+        assert_eq!(result[2].id, 30, "lower id=30 must beat id=40");
         assert_eq!(result[3].id, 40);
-        assert!(matches!(result[2].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 2 }),
-            "metadata for id=30 must be correct; got {:?}", result[2].reason);
-        assert!(matches!(result[3].reason, SelectionReason::Keyword { kw_score: 1, in_degree: 2 }),
-            "metadata for id=40 must be correct; got {:?}", result[3].reason);
+
+        // Fifth: sym 10 (seg=0, like=2) — substring-only despite higher like_hits
+        assert_eq!(result[4].id, 10, "substring-only match ranks last despite higher like_hits");
+        assert!(matches!(result[4].reason, SelectionReason::Keyword { match_class: MatchClass::Substring, .. }),
+            "substring-only match must report 'substring' match_class; got {:?}", result[4].reason);
+    }
+
+    #[test]
+    fn exact_name_bypasses_candidate_gather_limit() {
+        // Stage 1 exact-name hits must be gathered even when CANDIDATE_GATHER_LIMIT
+        // would have excluded them from LIKE results.
+        //
+        // Setup: 60 decoy symbols whose names contain "schedule" as a substring,
+        // all with lower IDs than the target. The LIKE '%schedule%' query with
+        // ORDER BY id ASC LIMIT 50 will return only the first 50 decoys,
+        // never reaching the target at ID 9999. Stage 1 must rescue it.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+
+        // Insert the target: name="schedule" (exact match for keyword "schedule")
+        // with a high ID that LIKE+LIMIT would exclude
+        conn.execute(
+            "INSERT INTO symbols VALUES (9999,1,'pkg::scheduler::schedule','schedule','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        // Insert 60 decoy symbols with lower IDs that also match LIKE '%schedule%'
+        for i in 1..=60_i64 {
+            conn.execute(
+                &format!("INSERT INTO symbols VALUES ({i},1,'pkg::schedule_helper_{i}','schedule_helper_{i}','fn',1,10,NULL,NULL,NULL)"),
+                [],
+            ).unwrap();
+        }
+
+        // Query for "schedule" — LIKE '%schedule%' matches all 61 symbols but
+        // ORDER BY id ASC LIMIT 50 returns only IDs 1-50. Without Stage 1,
+        // symbol 9999 would never enter the candidate pool.
+        let keywords = vec!["schedule".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+
+        // Symbol 9999 must appear (via Stage 1 exact-name) despite LIKE truncation
+        assert!(result.iter().any(|p| p.id == 9999),
+            "exact-name hit must bypass CANDIDATE_GATHER_LIMIT; got ids: {:?}",
+            result.iter().map(|p| p.id).collect::<Vec<_>>());
+        // And it must be ranked first (exact name match outranks substring-only)
+        assert_eq!(result[0].id, 9999, "exact name match must rank first");
+        assert!(matches!(result[0].reason, SelectionReason::Keyword { match_class: MatchClass::Exact, .. }),
+            "must report exact match class; got {:?}", result[0].reason);
+    }
+
+    #[test]
+    fn lexicographic_ranking_strict_ordering() {
+        // Verify strict lexicographic ordering: exact > segment > substring
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'pkg/scheduler/schedule.rs','h')", []).unwrap();
+
+        // Exact name match
+        conn.execute(
+            "INSERT INTO symbols VALUES (1,1,'pkg/scheduler/schedule.rs::scheduler','scheduler','fn',1,10,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        // Segment match (FQN contains "scheduler" as segment but name doesn't match exactly)
+        conn.execute(
+            "INSERT INTO symbols VALUES (2,1,'pkg/scheduler/schedule.rs::init_scheduler_pool','init_scheduler_pool','fn',11,20,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        // Substring-only match (name contains "scheduler" as substring, no segment match)
+        conn.execute(
+            "INSERT INTO symbols VALUES (3,1,'src::myschedulerconfig','myschedulerconfig','fn',21,30,NULL,NULL,NULL)",
+            [],
+        ).unwrap();
+        // Give substring-only the highest in_degree to prove it doesn't override match class
+        for i in 100..110_i64 {
+            conn.execute(
+                &format!("INSERT INTO symbols VALUES ({i},1,'src::caller{i}','caller{i}','fn',1,10,NULL,NULL,NULL)"),
+                [],
+            ).unwrap();
+            conn.execute(&format!("INSERT INTO edges VALUES ({i},{i},3,'calls')"), []).unwrap();
+        }
+
+        let keywords = vec!["scheduler".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert!(result.len() >= 3, "all three match types must be returned");
+
+        // Strict ordering: exact > segment > substring (regardless of in_degree)
+        let ids: Vec<i64> = result.iter().map(|p| p.id).collect();
+        let pos_exact = ids.iter().position(|&id| id == 1).unwrap();
+        let pos_segment = ids.iter().position(|&id| id == 2).unwrap();
+        let pos_substring = ids.iter().position(|&id| id == 3).unwrap();
+        assert!(pos_exact < pos_segment, "exact must rank before segment");
+        assert!(pos_segment < pos_substring, "segment must rank before substring");
     }
 
     // ─── Story 9.8: Score explainability tests ──────
@@ -2728,8 +3064,8 @@ mod eval {
 
     fn format_reason(reason: &SelectionReason) -> String {
         match reason {
-            SelectionReason::Keyword { kw_score, in_degree } => {
-                format!("Keyword(kw={}, deg={})", kw_score, in_degree)
+            SelectionReason::Keyword { match_class, kw_score, in_degree } => {
+                format!("Keyword({} kw={}, deg={})", match_class, kw_score, in_degree)
             }
             SelectionReason::FileHint { hint } => format!("FileHint({})", hint),
             SelectionReason::CallerSupplied => "CallerSupplied".to_string(),

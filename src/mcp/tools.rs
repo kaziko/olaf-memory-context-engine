@@ -736,17 +736,11 @@ fn handle_analyze_failure(
             "that", "this", "have", "been", "were", "will", "would", "could", "should",
         ].into_iter().collect();
 
-        let mut keywords: Vec<String> = Vec::new();
-        let mut seen_kw: HashSet<String> = HashSet::new();
-        for word in trace.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
-            if word.len() >= 4 {
-                let lower = word.to_lowercase();
-                if !stop_words.contains(lower.as_str()) && seen_kw.insert(lower.clone()) {
-                    keywords.push(lower);
-                    if keywords.len() >= 10 { break; }
-                }
-            }
-        }
+        let normalized = crate::graph::query::normalize_query_terms(trace);
+        let keywords: Vec<String> = normalized.into_iter()
+            .filter(|w| !stop_words.contains(w.as_str()))
+            .take(10)
+            .collect();
 
         let mut keyword_pivots = Vec::new();
         if !keywords.is_empty() {

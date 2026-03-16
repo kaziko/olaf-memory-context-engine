@@ -4,15 +4,15 @@
 # Only recall@3 gates CI — recall@5, MRR, latency are informational.
 # Fallback tag has no recall baseline — validated by reason assertion instead.
 #
-# Current metrics (2026-03-09):
-#   global=0.714  keyword=1.000  file_hint=0.500  low_confidence=1.000
-#   bugfix=0.750  refactor=0.750  impl=1.000
+# Current metrics (2026-03-16):
+#   global=0.765  keyword=1.000  file_hint=0.500  low_confidence=1.000
+#   bugfix=0.750  refactor=0.750  impl=1.000  high_fanout=1.000
 #   (fallback excluded from recall — validated by reason assertion)
 #
 # Update after tuning: cargo test eval_retrieval_harness --lib -- --nocapture
 # Then check target/bench_retrieval_results.json for actual metrics.
 
-min_recall_at_3 = 0.65
+min_recall_at_3 = 0.70
 
 [tag.keyword]
 min_recall_at_3 = 0.90
@@ -30,4 +30,7 @@ min_recall_at_3 = 0.65
 min_recall_at_3 = 0.65
 
 [tag.impl]
+min_recall_at_3 = 0.90
+
+[tag.high_fanout]
 min_recall_at_3 = 0.90
