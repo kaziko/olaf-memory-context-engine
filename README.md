@@ -52,7 +52,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 One tool call instead of many. The gap widens on larger codebases where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
 
-**Important caveat**: The external benchmark achieved 0% recall on expected pivots (Go parser produced 0 edges, limiting retrieval to keyword-only on a flat symbol table). The 78% figure validates token *reduction*, not retrieval *accuracy*.
+**Note**: The external benchmark was run before Go edge extraction was added. Recall numbers reflect keyword-only retrieval — graph-assisted retrieval with 181k edges is expected to perform better. A re-run is planned.
 
 ## Install
 

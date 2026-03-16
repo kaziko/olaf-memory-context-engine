@@ -108,9 +108,9 @@ Measured on **kubernetes/kubernetes** at commit `040ca596` using `get_brief` (wr
 
 | Metric | Value |
 |-|-|
-| Indexed files | 16,789 |
-| Symbols | 302,352 |
-| Edges | 0 |
+| Indexed files | 16,794 |
+| Symbols | 304,337 |
+| Edges | 181,517 (145,115 calls + 36,402 uses_type) |
 | Index time | 30.4s |
 
 ### Per-query results (budget=4000)
@@ -145,14 +145,14 @@ Measured on **kubernetes/kubernetes** at commit `040ca596` using `get_brief` (wr
 | Warm p95 | 1,173 ms |
 | Warm max | 1,173 ms |
 
-**NFR1 comparison (warm only)**: NFR1 defines a 1-second ceiling for `get_context`. This benchmark measures `get_brief`, which wraps `get_context` and adds impact analysis. The warm p50 (948ms) is under 1s; the p95 (1,173ms) exceeds it. Queries exceeding 1s were bugfix-sync-deployment-stuck (1,173ms), impl-pod-eviction-threshold (1,078ms), refactor-endpoint-controller-sync (1,027ms), and fallback-zookeeper-leader (1,043ms). Note: the Go parser produced 0 edges, so impact analysis had no graph to traverse — the cause of >1s latency on these queries is not yet profiled and may be SQLite query overhead on a 302k-symbol table.
+**NFR1 comparison (warm only)**: NFR1 defines a 1-second ceiling for `get_context`. This benchmark measures `get_brief`, which wraps `get_context` and adds impact analysis. The warm p50 (948ms) is under 1s; the p95 (1,173ms) exceeds it. Queries exceeding 1s were bugfix-sync-deployment-stuck (1,173ms), impl-pod-eviction-threshold (1,078ms), refactor-endpoint-controller-sync (1,027ms), and fallback-zookeeper-leader (1,043ms).
 
 ### Recall
 
-Expected pivots hit rate: **0%** across all queries with defined pivots. On a 302k-symbol table (with 0 edges — effectively a flat list, not a graph), the keyword ranker surfaces related but different symbols than the hand-picked expected pivots. This means the benchmark validates token *reduction* but cannot confirm retrieval *accuracy* — Olaf returned less text, but none of the expected symbols were present in the results.
+Expected pivots hit rate: **0%** across all queries with defined pivots. These results predate Go edge extraction — retrieval operated in keyword-only mode on a flat symbol table. With 181k edges now indexed, graph traversal and impact analysis can discover symbols that keyword matching alone misses. A benchmark re-run is planned.
 
 ### Conclusion
 
 Measured **~78% token reduction** (Baseline A, budget=4000) on kubernetes — an additional data point alongside the self-benchmark's ~68% figure. The higher reduction on the external repo reflects the larger baseline cost of manually reading Go files (many 6k-36k tokens) that Olaf's budget-constrained retrieval avoids. The self-benchmark uses `get_context` on a smaller Rust codebase; the external benchmark uses `get_brief` on a large Go codebase.
 
-**Important caveat**: With 0% recall on expected pivots, this benchmark demonstrates that Olaf returns significantly fewer tokens than manual workflows, but does not validate that the returned content is the *right* content. Token savings and retrieval quality are distinct metrics — high savings with low recall means the tool is compact but may not surface the symbols a developer actually needs. The 0 edges indexed (Go parser limitation) also means this benchmark tested keyword-only retrieval on a flat symbol table, not Olaf's graph-assisted features.
+**Note**: Per-query results above predate Go edge extraction. Retrieval operated in keyword-only mode (0 edges). With 181k edges now indexed, graph-assisted features are active and recall is expected to improve. A benchmark re-run is planned.

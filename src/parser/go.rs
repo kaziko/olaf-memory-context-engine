@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_symbol};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -12,7 +12,7 @@ pub(crate) fn parse(
     let root = tree.root_node();
     let mut symbols = Vec::new();
     let mut edges = Vec::new();
-    extract_nodes(root, source, relative_path, &mut symbols, &mut edges)?;
+    extract_nodes(root, source, relative_path, None, &mut symbols, &mut edges)?;
     Ok((symbols, edges))
 }
 
@@ -42,6 +42,21 @@ fn extract_type_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Optio
             node.child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
         }
+        // Composite type wrappers — unwrap to the element type
+        "slice_type" | "array_type" | "channel_type" => {
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                if let Some(name) = extract_type_name(child, source) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        "map_type" => {
+            // Map has "key" and "value" fields — extract the value type
+            node.child_by_field_name("value")
+                .and_then(|n| extract_type_name(n, source))
+        }
         _ => None,
     }
 }
@@ -68,6 +83,7 @@ fn extract_nodes(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     relative_path: &str,
+    current_fqn: Option<&str>,
     symbols: &mut Vec<Symbol>,
     edges: &mut Vec<Edge>,
 ) -> Result<(), ParserError> {
@@ -75,6 +91,7 @@ fn extract_nodes(
         "function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source)?;
+                let fqn = make_fqn(relative_path, None, name);
                 symbols.push(make_symbol(
                     relative_path,
                     None,
@@ -83,6 +100,10 @@ fn extract_nodes(
                     node,
                     source,
                 ));
+                extract_type_edges(node, source, &fqn, edges)?;
+                if let Some(body) = node.child_by_field_name("body") {
+                    extract_nodes(body, source, relative_path, Some(&fqn), symbols, edges)?;
+                }
             }
         }
         "method_declaration" => {
@@ -91,6 +112,7 @@ fn extract_nodes(
                 let receiver_type = node
                     .child_by_field_name("receiver")
                     .and_then(|r| extract_receiver_type(r, source));
+                let fqn = make_fqn(relative_path, receiver_type, name);
                 symbols.push(make_symbol(
                     relative_path,
                     receiver_type,
@@ -99,6 +121,10 @@ fn extract_nodes(
                     node,
                     source,
                 ));
+                extract_type_edges(node, source, &fqn, edges)?;
+                if let Some(body) = node.child_by_field_name("body") {
+                    extract_nodes(body, source, relative_path, Some(&fqn), symbols, edges)?;
+                }
             }
         }
         "type_declaration" => {
@@ -160,13 +186,115 @@ fn extract_nodes(
                 }
             }
         }
+        "call_expression" => {
+            if let Some(fqn) = current_fqn
+                && let Some(func_node) = node.child_by_field_name("function")
+            {
+                match func_node.kind() {
+                    "identifier" => {
+                        let target = func_node.utf8_text(source)?;
+                        edges.push(Edge {
+                            source_fqn: fqn.to_string(),
+                            target_fqn: target.to_string(),
+                            kind: EdgeKind::Calls,
+                        });
+                    }
+                    "selector_expression" => {
+                        if let Some(field) = func_node.child_by_field_name("field") {
+                            let target = field.utf8_text(source)?;
+                            edges.push(Edge {
+                                source_fqn: fqn.to_string(),
+                                target_fqn: target.to_string(),
+                                kind: EdgeKind::Calls,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Always recurse into children (arguments may contain nested calls)
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                extract_nodes(child, source, relative_path, current_fqn, symbols, edges)?;
+            }
+        }
         _ => {
             let mut walker = node.walk();
             for child in node.children(&mut walker) {
-                extract_nodes(child, source, relative_path, symbols, edges)?;
+                extract_nodes(child, source, relative_path, current_fqn, symbols, edges)?;
             }
         }
     }
+    Ok(())
+}
+
+const GO_BUILTIN_TYPES: &[&str] = &[
+    "error", "string", "bool", "byte", "rune", "any",
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+    "float32", "float64", "complex64", "complex128",
+];
+
+/// Extract `UsesType` edges from function/method parameter and return types.
+fn extract_type_edges(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    fqn: &str,
+    edges: &mut Vec<Edge>,
+) -> Result<(), ParserError> {
+    // Walk parameter_list children
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut walker = params.walk();
+        for child in params.children(&mut walker) {
+            if matches!(child.kind(), "parameter_declaration" | "variadic_parameter_declaration")
+                && let Some(type_node) = child.child_by_field_name("type")
+                && let Some(type_name) = extract_type_name(type_node, source)
+                && !GO_BUILTIN_TYPES.contains(&type_name)
+            {
+                edges.push(Edge {
+                    source_fqn: fqn.to_string(),
+                    target_fqn: type_name.to_string(),
+                    kind: EdgeKind::UsesType,
+                });
+            }
+        }
+    }
+
+    // Walk result (return type)
+    if let Some(result) = node.child_by_field_name("result") {
+        match result.kind() {
+            "parameter_list" => {
+                // Multiple return values: (Type1, Type2)
+                let mut walker = result.walk();
+                for child in result.children(&mut walker) {
+                    if child.kind() == "parameter_declaration"
+                        && let Some(type_node) = child.child_by_field_name("type")
+                        && let Some(type_name) = extract_type_name(type_node, source)
+                        && !GO_BUILTIN_TYPES.contains(&type_name)
+                    {
+                        edges.push(Edge {
+                            source_fqn: fqn.to_string(),
+                            target_fqn: type_name.to_string(),
+                            kind: EdgeKind::UsesType,
+                        });
+                    }
+                }
+            }
+            _ => {
+                // Single return type
+                if let Some(type_name) = extract_type_name(result, source)
+                    && !GO_BUILTIN_TYPES.contains(&type_name)
+                {
+                    edges.push(Edge {
+                        source_fqn: fqn.to_string(),
+                        target_fqn: type_name.to_string(),
+                        kind: EdgeKind::UsesType,
+                    });
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -312,7 +440,7 @@ func Env(key string) string {
 
         assert!(targets.contains(&"fmt"), "missing fmt import; got {targets:?}");
         assert!(targets.contains(&"os"), "missing os import; got {targets:?}");
-        for e in &edges {
+        for e in edges.iter().filter(|e| e.kind == EdgeKind::Imports) {
             assert_eq!(e.source_fqn, "pkg/server.go");
         }
     }
@@ -344,5 +472,196 @@ func Env(key string) string {
         let (symbols, edges) = parse("empty.go", b"package main\n").unwrap();
         assert!(symbols.is_empty());
         assert!(edges.is_empty());
+    }
+
+    // --- Edge extraction tests (Task 4) ---
+
+    fn has_edge(edges: &[Edge], source: &str, target: &str, kind: EdgeKind) -> bool {
+        edges
+            .iter()
+            .any(|e| e.source_fqn == source && e.target_fqn == target && e.kind == kind)
+    }
+
+    #[test]
+    fn test_call_edge_function_to_function() {
+        let src = b"package main\nfunc B() {}\nfunc A() { B() }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::A", "B", EdgeKind::Calls),
+            "A should call B; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_call_edge_selector_expression() {
+        let src = b"package main\nimport \"fmt\"\nfunc A() { fmt.Println(\"hi\") }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::A", "Println", EdgeKind::Calls),
+            "selector call should extract field name; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_edge_param() {
+        let src = b"package main\ntype Config struct{}\nfunc Init(c *Config) {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Init", "Config", EdgeKind::UsesType),
+            "function param should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_method_selector_call() {
+        let src = b"package main\ntype S struct{}\nfunc (s *S) Run() { s.Start() }\nfunc (s *S) Start() {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::S::Run", "Start", EdgeKind::Calls),
+            "method selector call should extract field; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_calls() {
+        let src = b"package main\nfunc outer(x int) int { return 0 }\nfunc inner() int { return 1 }\nfunc caller() { outer(inner()) }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::caller", "outer", EdgeKind::Calls),
+            "outer call missing; edges: {edges:?}"
+        );
+        assert!(
+            has_edge(&edges, "main.go::caller", "inner", EdgeKind::Calls),
+            "nested inner call missing; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_builtin_types_excluded() {
+        let src = b"package main\nfunc Foo(s string, e error, n int) bool { return true }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        let type_edges: Vec<&Edge> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::UsesType)
+            .collect();
+        assert!(
+            type_edges.is_empty(),
+            "builtin types should not produce uses_type edges; got: {type_edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_existing_imports_still_work() {
+        let src = b"package main\nimport (\n\t\"fmt\"\n\t\"os\"\n)\nfunc main() {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        let imports: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .map(|e| e.target_fqn.as_str())
+            .collect();
+        assert!(imports.contains(&"fmt"), "missing fmt; got {imports:?}");
+        assert!(imports.contains(&"os"), "missing os; got {imports:?}");
+    }
+
+    #[test]
+    fn test_call_inside_closure() {
+        let src = b"package main\nfunc Target() {}\nfunc Outer() { go func() { Target() }() }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Outer", "Target", EdgeKind::Calls),
+            "call inside closure should be attributed to enclosing function; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_interface_method_call() {
+        let src = b"package main\ntype Runner interface { Run() }\nfunc Execute(r Runner) { r.Run() }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Execute", "Run", EdgeKind::Calls),
+            "interface method call should emit calls edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_return_type_edge() {
+        let src = b"package main\ntype Config struct{}\nfunc NewConfig() *Config { return nil }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::NewConfig", "Config", EdgeKind::UsesType),
+            "return type should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_call_edge_outside_function() {
+        // Calls at top-level (e.g., in var initializers) have no enclosing function
+        let src = b"package main\nvar x = make([]int, 0)\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        let calls: Vec<&Edge> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "no call edges should be emitted outside a function; got: {calls:?}"
+        );
+    }
+
+    // --- Review fix tests ---
+
+    #[test]
+    fn test_uses_type_slice_param() {
+        let src = b"package main\ntype Config struct{}\nfunc Init(cs []Config) {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Init", "Config", EdgeKind::UsesType),
+            "slice param type should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_map_param() {
+        let src = b"package main\ntype Config struct{}\nfunc Init(m map[string]Config) {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Init", "Config", EdgeKind::UsesType),
+            "map value type should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_variadic_param() {
+        let src = b"package main\ntype Config struct{}\nfunc Init(cs ...Config) {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Init", "Config", EdgeKind::UsesType),
+            "variadic param type should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_channel_param() {
+        let src = b"package main\ntype Event struct{}\nfunc Listen(ch chan Event) {}\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Listen", "Event", EdgeKind::UsesType),
+            "channel param type should produce uses_type edge; edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_multi_return() {
+        let src = b"package main\ntype Config struct{}\nfunc Load() (*Config, error) { return nil, nil }\n";
+        let (_, edges) = parse("main.go", src).unwrap();
+        assert!(
+            has_edge(&edges, "main.go::Load", "Config", EdgeKind::UsesType),
+            "multi-return type should produce uses_type edge; edges: {edges:?}"
+        );
+        // error is builtin — should NOT appear
+        assert!(
+            !has_edge(&edges, "main.go::Load", "error", EdgeKind::UsesType),
+            "builtin error in multi-return should be excluded"
+        );
     }
 }
