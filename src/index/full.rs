@@ -15,6 +15,7 @@ pub struct IndexStats {
     pub files: usize,
     pub symbols: usize,
     pub edges: usize,
+    pub centrality_computed: usize,
 }
 
 /// Walk `project_root`, parse all supported source files, and persist their
@@ -217,6 +218,7 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
     //
     // If the project root itself doesn't exist or isn't a directory, something is
     // wrong with the invocation — skip cleanup to preserve the prior index state.
+    let mut centrality_count = 0;
     if project_root.is_dir() {
         let tx = conn.transaction()?;
         let doomed_fqns = store::collect_fqns_for_unseen_files(&tx, &seen_paths)?;
@@ -235,9 +237,18 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
                 deleted
             );
         }
+
+        let centrality_start = std::time::Instant::now();
+        centrality_count = store::compute_and_store_centrality(conn)?;
+        let centrality_ms = centrality_start.elapsed().as_millis();
+        log::info!(
+            "computed PageRank centrality for {} symbols in {}ms",
+            centrality_count,
+            centrality_ms
+        );
     } else {
         log::warn!(
-            "project root {:?} is not accessible — skipping stale-file cleanup to preserve index",
+            "project root {:?} is not accessible — skipping stale-file cleanup and centrality to preserve index",
             project_root
         );
     }
@@ -246,5 +257,6 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
         files: files_indexed,
         symbols: symbols_indexed,
         edges: edges_inserted,
+        centrality_computed: centrality_count,
     })
 }

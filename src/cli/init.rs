@@ -47,8 +47,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
     }
 
     println!(
-        "\nIndex: {} files, {} symbols, {} edges",
-        stats.files, stats.symbols, stats.edges
+        "\nIndex: {} files, {} symbols, {} edges, {} centrality",
+        stats.files, stats.symbols, stats.edges, stats.centrality_computed
     );
 
     // --- Auto-registration in parent workspace ---

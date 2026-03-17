@@ -332,9 +332,13 @@ CREATE TRIGGER symbols_fts_ad AFTER DELETE ON symbols BEGIN
 END;
 ";
 
+const MIGRATION_014: &str = "
+ALTER TABLE symbols ADD COLUMN centrality REAL NOT NULL DEFAULT 0.0;
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 13;
+pub const MIGRATION_COUNT: i64 = 14;
 
 /// Backfill `name_tokens` for symbols that still have the default empty value.
 /// Each UPDATE fires the `symbols_fts_au` trigger, populating the FTS index incrementally.
@@ -395,7 +399,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_011),
         M::up(MIGRATION_012),
         M::up(MIGRATION_013),
-        // Future migrations: append M::up(MIGRATION_014), etc. — never edit existing entries
+        M::up(MIGRATION_014),
+        // Future migrations: append M::up(MIGRATION_015), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;
@@ -574,6 +579,29 @@ mod tests {
         conn.execute("DELETE FROM symbols WHERE fqn = 't.rs::GC'", []).unwrap();
         let fts_after: i64 = conn.query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0)).unwrap();
         assert_eq!(fts_after, 0, "DELETE trigger must remove FTS entry");
+    }
+
+    #[test]
+    fn test_migration_014_centrality_column() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        // Verify centrality column exists with correct default
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, language, last_indexed_at) VALUES ('t.rs', 'h', 'rust', 1000)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn.query_row("SELECT id FROM files WHERE path = 't.rs'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (file_id, fqn, name, name_tokens, kind, start_line, end_line, source_hash)
+             VALUES (?1, 't.rs::Foo', 'Foo', 'foo', 'struct', 1, 5, 'h')",
+            params![file_id],
+        ).unwrap();
+
+        let centrality: f64 = conn.query_row(
+            "SELECT centrality FROM symbols WHERE fqn = 't.rs::Foo'", [], |r| r.get(0),
+        ).unwrap();
+        assert!((centrality - 0.0).abs() < f64::EPSILON, "centrality must default to 0.0");
     }
 
     #[test]
