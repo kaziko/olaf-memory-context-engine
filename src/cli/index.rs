@@ -7,7 +7,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let stats = olaf::index::run(&mut conn, &project_root)?;
     let elapsed = start.elapsed();
 
-    eprintln!("indexed {} files, {} symbols, {} edges", stats.files, stats.symbols, stats.edges);
+    eprintln!(
+        "indexed {} files, {} symbols, {} edges, {} centrality",
+        stats.files, stats.symbols, stats.edges, stats.centrality_computed
+    );
 
     if olaf::activity::is_monitor_active(&project_root) {
         olaf::activity::emit(&conn, olaf::activity::ActivityEvent {

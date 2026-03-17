@@ -184,7 +184,7 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
         );
     }
 
-    Ok(IndexStats { files: files_reindexed, symbols: symbols_changed, edges: edges_inserted })
+    Ok(IndexStats { files: files_reindexed, symbols: symbols_changed, edges: edges_inserted, centrality_computed: 0 })
 }
 
 /// Re-index a single file and return a structural diff outcome.

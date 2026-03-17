@@ -450,6 +450,75 @@ pub(crate) fn delete_unseen_files(
     Ok(tx.execute(&sql, params.as_slice())?)
 }
 
+const PAGERANK_DAMPING: f64 = 0.85;
+const PAGERANK_MAX_ITER: usize = 100;
+
+/// Compute PageRank centrality on the static dependency graph and store scores
+/// in the `centrality` column of the `symbols` table.
+///
+/// Returns the number of symbols whose centrality was updated.
+/// If there are no edges, resets all centrality to 0.0 and returns 0.
+pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> {
+    use petgraph::algo::page_rank;
+    use petgraph::graph::{DiGraph, NodeIndex};
+
+    // 1. Load all symbol IDs
+    let mut stmt = conn.prepare("SELECT id FROM symbols")?;
+    let symbol_ids: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    if symbol_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // 2. Load static-only edges
+    let mut stmt = conn.prepare(
+        "SELECT source_id, target_id FROM edges WHERE source_origin = 'static'",
+    )?;
+    let edges: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    // 3. No edges → reset all centrality to 0.0
+    if edges.is_empty() {
+        conn.execute("UPDATE symbols SET centrality = 0.0 WHERE centrality != 0.0", [])?;
+        return Ok(0);
+    }
+
+    // 4. Build petgraph DiGraph
+    let mut graph = DiGraph::<i64, ()>::new();
+    let mut node_map: HashMap<i64, NodeIndex> = HashMap::with_capacity(symbol_ids.len());
+    for &id in &symbol_ids {
+        let idx = graph.add_node(id);
+        node_map.insert(id, idx);
+    }
+    for (src, tgt) in &edges {
+        if let (Some(&s), Some(&t)) = (node_map.get(src), node_map.get(tgt)) {
+            graph.add_edge(s, t, ());
+        }
+    }
+
+    // 5. Compute PageRank
+    let scores = page_rank(&graph, PAGERANK_DAMPING, PAGERANK_MAX_ITER);
+
+    // 6. Batch UPDATE in a transaction (RAII Transaction auto-rolls-back on error)
+    {
+        let tx = conn.unchecked_transaction()?;
+        let mut update = tx.prepare("UPDATE symbols SET centrality = ?1 WHERE id = ?2")?;
+        for (&id, &idx) in &node_map {
+            let score = scores[idx.index()];
+            update.execute(params![score, id])?;
+        }
+        drop(update);
+        tx.commit()?;
+    }
+
+    Ok(symbol_ids.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,5 +1172,139 @@ mod tests {
         ).unwrap();
         assert_eq!(start, 1, "first-wins: should keep first symbol's start_line");
         assert_eq!(hash, "h1", "first-wins: should keep first symbol's source_hash");
+    }
+
+    // ─── PageRank centrality tests ───────────────────────────────────────────────
+
+    /// Helper: insert a symbol and return its DB id.
+    fn insert_symbol_returning_id(conn: &Connection, file_id: i64, fqn: &str, name: &str) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO symbols (file_id, fqn, name, kind, start_line, end_line, source_hash) \
+             VALUES (?1, ?2, ?3, 'function', 1, 10, 'h')",
+            params![file_id, fqn, name],
+        ).unwrap();
+        conn.query_row("SELECT id FROM symbols WHERE fqn = ?1", [fqn], |r| r.get(0)).unwrap()
+    }
+
+    /// Helper: insert a static edge between two symbol IDs.
+    fn insert_static_edge(conn: &Connection, src: i64, tgt: i64, kind: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, kind, source_origin) VALUES (?1, ?2, ?3, 'static')",
+            params![src, tgt, kind],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_pagerank_known_graph() {
+        // Graph: A→B, A→C, B→C, C→D
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let fid = upsert_file(&tx, "src/pr.rs", "h", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        let a = insert_symbol_returning_id(&conn, fid, "src/pr.rs::A", "A");
+        let b = insert_symbol_returning_id(&conn, fid, "src/pr.rs::B", "B");
+        let c = insert_symbol_returning_id(&conn, fid, "src/pr.rs::C", "C");
+        let d = insert_symbol_returning_id(&conn, fid, "src/pr.rs::D", "D");
+
+        insert_static_edge(&conn, a, b, "calls");
+        insert_static_edge(&conn, a, c, "calls");
+        insert_static_edge(&conn, b, c, "calls");
+        insert_static_edge(&conn, c, d, "calls");
+
+        let count = compute_and_store_centrality(&conn).unwrap();
+        assert_eq!(count, 4);
+
+        let get_centrality = |fqn: &str| -> f64 {
+            conn.query_row("SELECT centrality FROM symbols WHERE fqn = ?1", [fqn], |r| r.get(0)).unwrap()
+        };
+
+        let ca = get_centrality("src/pr.rs::A");
+        let cb = get_centrality("src/pr.rs::B");
+        let cc = get_centrality("src/pr.rs::C");
+        let cd = get_centrality("src/pr.rs::D");
+
+        // Frozen expected values from petgraph 0.7.1 page_rank(d=0.85, 100 iters)
+        // on graph A→B, A→C, B→C, C→D
+        let eps = 0.001;
+        assert!((ca - 0.1175).abs() < eps, "A expected ~0.1175, got {ca}");
+        assert!((cb - 0.1674).abs() < eps, "B expected ~0.1674, got {cb}");
+        assert!((cc - 0.3163).abs() < eps, "C expected ~0.3163, got {cc}");
+        assert!((cd - 0.3989).abs() < eps, "D expected ~0.3989, got {cd}");
+
+        // Structural invariants
+        assert!(cc > ca, "C (two incoming) must have higher centrality than A (zero incoming)");
+        assert!(ca > 0.0, "all nodes must have non-zero centrality in a connected graph");
+        assert!(cb > 0.0);
+        assert!(cc > 0.0);
+        assert!(cd > 0.0);
+    }
+
+    #[test]
+    fn test_pagerank_empty_graph_no_edges() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let fid = upsert_file(&tx, "src/empty.rs", "h", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        insert_symbol_returning_id(&conn, fid, "src/empty.rs::A", "A");
+        insert_symbol_returning_id(&conn, fid, "src/empty.rs::B", "B");
+
+        let count = compute_and_store_centrality(&conn).unwrap();
+        assert_eq!(count, 0, "no edges → return 0");
+
+        let ca: f64 = conn.query_row(
+            "SELECT centrality FROM symbols WHERE fqn = 'src/empty.rs::A'", [], |r| r.get(0),
+        ).unwrap();
+        assert!((ca - 0.0).abs() < f64::EPSILON, "no edges → centrality must be 0.0");
+    }
+
+    #[test]
+    fn test_pagerank_single_symbol_no_edges() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let fid = upsert_file(&tx, "src/single.rs", "h", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        insert_symbol_returning_id(&conn, fid, "src/single.rs::Alone", "Alone");
+
+        let count = compute_and_store_centrality(&conn).unwrap();
+        assert_eq!(count, 0);
+
+        let c: f64 = conn.query_row(
+            "SELECT centrality FROM symbols WHERE fqn = 'src/single.rs::Alone'", [], |r| r.get(0),
+        ).unwrap();
+        assert!((c - 0.0).abs() < f64::EPSILON, "single symbol with no edges → centrality 0.0");
+    }
+
+    #[test]
+    fn test_pagerank_stale_scores_reset_when_edges_removed() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let fid = upsert_file(&tx, "src/stale.rs", "h", "rust", 1000).unwrap();
+        tx.commit().unwrap();
+
+        let a = insert_symbol_returning_id(&conn, fid, "src/stale.rs::A", "A");
+        let b = insert_symbol_returning_id(&conn, fid, "src/stale.rs::B", "B");
+
+        // First: compute with edges → non-zero centrality
+        insert_static_edge(&conn, a, b, "calls");
+        let count = compute_and_store_centrality(&conn).unwrap();
+        assert_eq!(count, 2);
+
+        let ca: f64 = conn.query_row(
+            "SELECT centrality FROM symbols WHERE fqn = 'src/stale.rs::A'", [], |r| r.get(0),
+        ).unwrap();
+        assert!(ca > 0.0, "with edges, centrality must be non-zero");
+
+        // Now remove edges and recompute → centrality must reset to 0.0
+        conn.execute("DELETE FROM edges", []).unwrap();
+        let count2 = compute_and_store_centrality(&conn).unwrap();
+        assert_eq!(count2, 0, "no edges → return 0");
+
+        let ca2: f64 = conn.query_row(
+            "SELECT centrality FROM symbols WHERE fqn = 'src/stale.rs::A'", [], |r| r.get(0),
+        ).unwrap();
+        assert!((ca2 - 0.0).abs() < f64::EPSILON, "stale centrality must be reset to 0.0");
     }
 }
