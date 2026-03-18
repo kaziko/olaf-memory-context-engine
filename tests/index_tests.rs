@@ -678,3 +678,114 @@ fn test_go_ambiguous_call_edge_dropped() {
         calls_count
     );
 }
+
+/// Regression: full reindex must produce deterministic centrality regardless of
+/// prior LSP edges in the database. The cascade-delete on `replace_file_symbols`
+/// wipes all edges (including LSP-originated ones) before static edges are
+/// reinserted and PageRank is computed, so prior LSP session state cannot leak
+/// into centrality scores.
+///
+/// This test closes the concern raised in Story 14-2b by proving the bug cannot
+/// manifest on the full-index path (the only path that computes centrality).
+#[test]
+fn test_full_reindex_centrality_deterministic_despite_prior_lsp_edges() {
+    let dir = tempdir().unwrap();
+
+    // Two TypeScript files with a function→function call edge.
+    // From existing tests we know this produces at least one `calls` edge.
+    std::fs::write(dir.path().join("lib.ts"), "export function helper() {}").unwrap();
+    std::fs::write(
+        dir.path().join("caller.ts"),
+        "export function caller() { helper(); }",
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("index.db");
+    let mut conn = db::open(&db_path).unwrap();
+
+    // Run 1: baseline full index — produces static edges + centrality
+    index::run(&mut conn, dir.path()).expect("first full index failed");
+
+    let baseline_centrality: Vec<(String, f64)> = {
+        let mut stmt = conn
+            .prepare("SELECT fqn, centrality FROM symbols ORDER BY fqn")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        baseline_centrality.iter().any(|(_, c)| *c > 0.0),
+        "baseline must have non-zero centrality (proves static edges exist)"
+    );
+
+    // Inject fake LSP edges directly via SQL to simulate an LSP session between
+    // full reindexes. We add an edge with source_origin='lsp' for the same
+    // triple that static indexing would produce, plus a spurious LSP-only edge.
+    let (caller_id, helper_id): (i64, i64) = conn
+        .query_row(
+            "SELECT s1.id, s2.id FROM symbols s1, symbols s2
+             WHERE s1.name = 'caller' AND s2.name = 'helper'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    // Spurious LSP-only edge (helper→caller, reverse direction — wouldn't exist statically)
+    conn.execute(
+        "INSERT OR IGNORE INTO edges (source_id, target_id, kind, source_origin)
+         VALUES (?1, ?2, 'calls', 'lsp')",
+        rusqlite::params![helper_id, caller_id],
+    )
+    .unwrap();
+
+    let lsp_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE source_origin = 'lsp'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(lsp_count >= 1, "LSP edge must exist before second reindex");
+
+    // Run 2: full reindex over the same unchanged files
+    index::run(&mut conn, dir.path()).expect("second full index failed");
+
+    // All LSP edges must be gone (cascade-deleted when symbols were replaced)
+    let lsp_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE source_origin = 'lsp'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(lsp_after, 0, "LSP edges must not survive full reindex");
+
+    // Centrality must be identical to baseline
+    let after_centrality: Vec<(String, f64)> = {
+        let mut stmt = conn
+            .prepare("SELECT fqn, centrality FROM symbols ORDER BY fqn")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        baseline_centrality.len(),
+        after_centrality.len(),
+        "symbol count must be stable across reindex"
+    );
+    for (base, after) in baseline_centrality.iter().zip(after_centrality.iter()) {
+        assert_eq!(base.0, after.0, "symbol FQN order must be stable");
+        assert!(
+            (base.1 - after.1).abs() < f64::EPSILON,
+            "centrality for {} must be deterministic: baseline={}, after={}",
+            base.0,
+            base.1,
+            after.1
+        );
+    }
+}
