@@ -1507,9 +1507,10 @@ fn test_get_context_retrieval_notes_with_scores() {
     assert!(r["result"].is_object(), "must return result; got: {}", r);
     let text = r["result"]["content"][0]["text"].as_str().expect("text");
     assert!(text.contains("## Retrieval Notes"), "get_context must include retrieval notes section; got: {text}");
-    // Keyword pivot must show kw= and deg= scores
-    assert!(text.contains("kw="), "retrieval notes must include kw_score; got: {text}");
-    assert!(text.contains("deg="), "retrieval notes must include in_degree; got: {text}");
+    // Keyword pivot must show RRF fusion fields
+    assert!(text.contains("bm25_r="), "retrieval notes must include bm25_rank; got: {text}");
+    assert!(text.contains("cent_r="), "retrieval notes must include centrality_rank; got: {text}");
+    assert!(text.contains("rrf="), "retrieval notes must include rrf_score; got: {text}");
 }
 
 #[test]

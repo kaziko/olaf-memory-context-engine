@@ -342,7 +342,7 @@ impl std::fmt::Display for MatchClass {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SelectionReason {
-    Keyword { match_class: MatchClass, bm25_score: f64, kw_score: usize, in_degree: i64 },
+    Keyword { match_class: MatchClass, bm25_rank: usize, centrality_rank: usize, rrf_score: f64, bm25_score: f64 },
     FileHint { hint: String },
     CallerSupplied,
     Fallback,
@@ -379,6 +379,10 @@ const BM25_FQN_WEIGHT: f64 = 5.0;
 const BM25_SIG_WEIGHT: f64 = 2.0;
 const BM25_DOC_WEIGHT: f64 = 1.0;
 
+/// RRF fusion constant. Standard value from the original RRF paper (Cormack et al. 2009).
+/// Higher k reduces the influence of rank position differences.
+const RRF_K: f64 = 60.0;
+
 /// Classify a FTS5 hit into a MatchClass by comparing query terms against
 /// the symbol's name, name_tokens, and fqn (all already fetched from the join).
 fn classify_match(query_terms: &[String], name: &str, name_tokens: &str, fqn: &str) -> MatchClass {
@@ -406,34 +410,6 @@ fn classify_match(query_terms: &[String], name: &str, name_tokens: &str, fqn: &s
     MatchClass::Other
 }
 
-/// Compute in-degrees for a set of symbol IDs in batched chunks.
-fn batch_in_degrees(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, i64>, QueryError> {
-    const IN_DEG_CHUNK: usize = 500;
-    let mut in_degrees: HashMap<i64, i64> = HashMap::new();
-    let mut full_chunk_stmt: Option<rusqlite::Statement<'_>> = None;
-    let mut tail_chunk_stmt: Option<rusqlite::Statement<'_>> = None;
-    for chunk in ids.chunks(IN_DEG_CHUNK) {
-        let opt = if chunk.len() == IN_DEG_CHUNK { &mut full_chunk_stmt } else { &mut tail_chunk_stmt };
-        if opt.is_none() {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT target_id, COUNT(*) FROM edges WHERE target_id IN ({placeholders}) GROUP BY target_id"
-            );
-            *opt = Some(conn.prepare(&sql)?);
-        }
-        let stmt = opt.as_mut().expect("statement was just prepared above");
-        let rows: Vec<(i64, i64)> = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        for (id, count) in rows {
-            in_degrees.insert(id, count);
-        }
-    }
-    Ok(in_degrees)
-}
-
 pub(crate) fn rank_symbols_by_keywords(
     conn: &Connection,
     keywords: &[String],
@@ -448,7 +424,7 @@ pub(crate) fn rank_symbols_by_keywords(
         return Ok(Vec::new());
     }
 
-    // FTS5 MATCH with BM25 ranking — 20x over-fetch for in-degree tiebreaking
+    // FTS5 MATCH with BM25 ranking — 20x over-fetch for RRF fusion
     let over_fetch = (limit * 20).max(100) as i64;
     let mut fts_stmt = conn.prepare(
         "SELECT rowid, bm25(symbols_fts, ?1, ?2, ?3, ?4) AS score
@@ -473,65 +449,109 @@ pub(crate) fn rank_symbols_by_keywords(
         return Ok(Vec::new());
     }
 
-    // Join back to symbols for fqn, name, name_tokens
+    // Join back to symbols for fqn, name, name_tokens, centrality
     let rowids: Vec<i64> = fts_rows.iter().map(|(id, _)| *id).collect();
     let bm25_map: HashMap<i64, f64> = fts_rows.into_iter().collect();
 
     let placeholders = rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let join_sql = format!(
-        "SELECT id, fqn, name, name_tokens FROM symbols WHERE id IN ({placeholders})"
+        "SELECT id, fqn, name, name_tokens, centrality FROM symbols WHERE id IN ({placeholders})"
     );
     let mut join_stmt = conn.prepare(&join_sql)?;
-    let symbol_rows: Vec<(i64, String, String, String)> = join_stmt
+    let symbol_rows: Vec<(i64, String, String, String, f64)> = join_stmt
         .query_map(rusqlite::params_from_iter(rowids.iter()), |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<Result<_, _>>()?;
 
-    let symbol_map: HashMap<i64, (String, String, String)> = symbol_rows
+    let symbol_map: HashMap<i64, (String, String, String, f64)> = symbol_rows
         .into_iter()
-        .map(|(id, fqn, name, name_tokens)| (id, (fqn, name, name_tokens)))
+        .map(|(id, fqn, name, name_tokens, centrality)| (id, (fqn, name, name_tokens, centrality)))
         .collect();
 
-    // Compute in-degrees for the over-fetched pool
-    let in_degrees = batch_in_degrees(conn, &rowids)?;
-
-    // Sort: BM25 ASC (more negative = better match), in-degree DESC as tiebreaker, id ASC for determinism
-    let mut pool: Vec<(i64, f64, i64)> = rowids
+    // Build pool entries (BM25-sorted order from FTS5)
+    struct PoolEntry {
+        id: i64,
+        bm25_score: f64,
+        centrality: f64,
+        bm25_rank: usize,
+        centrality_rank: usize,
+        rrf_score: f64,
+    }
+    let mut pool: Vec<PoolEntry> = rowids
         .iter()
         .map(|&id| {
             let bm25 = bm25_map.get(&id).copied().unwrap_or(0.0);
-            let in_deg = in_degrees.get(&id).copied().unwrap_or(0);
-            (id, bm25, in_deg)
+            let centrality = symbol_map.get(&id).map(|s| s.3).unwrap_or(0.0);
+            PoolEntry { id, bm25_score: bm25, centrality, bm25_rank: 0, centrality_rank: 0, rrf_score: 0.0 }
         })
         .collect();
+
+    // Dense BM25 ranking: equal BM25 scores → same rank (pool is already BM25-sorted from FTS5)
+    if !pool.is_empty() {
+        let mut bm25_rank = 1usize;
+        let mut prev_bm25 = pool[0].bm25_score;
+        for entry in &mut pool {
+            if (entry.bm25_score - prev_bm25).abs() > f64::EPSILON {
+                bm25_rank += 1;
+                prev_bm25 = entry.bm25_score;
+            }
+            entry.bm25_rank = bm25_rank;
+        }
+    }
+
+    // Sort by centrality DESC, bm25_rank ASC (tiebreaker preserves BM25 order, not id order)
     pool.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1) // bm25 ASC (more negative = better)
+        b.centrality.partial_cmp(&a.centrality)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.2.cmp(&a.2)) // in_degree DESC (tiebreaker)
-            .then(a.0.cmp(&b.0)) // id ASC (determinism)
+            .then(a.bm25_rank.cmp(&b.bm25_rank))
     });
 
-    // Take top `limit` and build PivotScore results
+    // Dense centrality ranking: equal centrality → same rank
+    if !pool.is_empty() {
+        let mut cent_rank = 1usize;
+        let mut prev_cent = pool[0].centrality;
+        for entry in &mut pool {
+            if (entry.centrality - prev_cent).abs() > f64::EPSILON {
+                cent_rank += 1;
+                prev_cent = entry.centrality;
+            }
+            entry.centrality_rank = cent_rank;
+        }
+    }
+
+    // RRF fusion
+    for entry in &mut pool {
+        entry.rrf_score = 1.0 / (RRF_K + entry.bm25_rank as f64)
+            + 1.0 / (RRF_K + entry.centrality_rank as f64);
+    }
+
+    // Sort by RRF DESC, id ASC for determinism
+    pool.sort_by(|a, b| {
+        b.rrf_score.partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+
+    // Take top `limit` and build PivotScore results.
+    // match_class is assigned post-ranking for metadata only — it does not influence RRF ordering.
+    // This is by design: RRF relies on BM25 rank (which already favors exact matches via score)
+    // plus centrality rank, without a separate lexical-precedence tier. See AC7.
     let result: Vec<PivotScore> = pool
         .into_iter()
         .take(limit)
-        .filter_map(|(id, bm25, in_deg)| {
-            let (fqn, name, name_tokens) = symbol_map.get(&id)?;
+        .filter_map(|entry| {
+            let (fqn, name, name_tokens, _) = symbol_map.get(&entry.id)?;
             let match_class = classify_match(keywords, name, name_tokens, fqn);
-            let kw_score = match match_class {
-                MatchClass::Exact => 2,
-                MatchClass::Segment => 1,
-                _ => 0,
-            };
             Some(PivotScore {
-                id,
+                id: entry.id,
                 fqn: fqn.clone(),
                 reason: SelectionReason::Keyword {
                     match_class,
-                    bm25_score: bm25,
-                    kw_score,
-                    in_degree: in_deg,
+                    bm25_rank: entry.bm25_rank,
+                    centrality_rank: entry.centrality_rank,
+                    rrf_score: entry.rrf_score,
+                    bm25_score: entry.bm25_score,
                 },
             })
         })
@@ -808,7 +828,7 @@ fn format_retrieval_notes(rendered_pivots: &[&PivotScore], intent_label: &str, o
     for ps in rendered_pivots {
         let short_name = ps.fqn.rsplit("::").next().unwrap_or(&ps.fqn);
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { match_class, bm25_score, kw_score, in_degree } => format!("{match_class} bm25={bm25_score:.2} kw={kw_score} deg={in_degree}"),
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank} rrf={rrf_score:.4} bm25={bm25_score:.2}"),
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -840,7 +860,7 @@ fn format_retrieval_notes_multi(
             .unwrap_or("unknown");
         let strategy = if *is_local { "local-priority" } else { "remote-round-robin" };
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { match_class, bm25_score, kw_score, in_degree } => format!("{match_class} bm25={bm25_score:.2} kw={kw_score} deg={in_degree}"),
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank} rrf={rrf_score:.4} bm25={bm25_score:.2}"),
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -1147,8 +1167,8 @@ pub(crate) fn get_context(
 }
 
 /// Build a context brief directly from caller-provided `PivotScore` values, preserving their
-/// `SelectionReason` (e.g. `Keyword` with `kw_score`/`in_degree`). Used by `analyze_failure`
-/// Path B so that keyword scores are surfaced in retrieval notes rather than reclassified.
+/// `SelectionReason` (e.g. `Keyword` with `bm25_rank`/`centrality_rank`/`rrf_score`). Used by
+/// `analyze_failure` Path B so that keyword scores are surfaced in retrieval notes rather than reclassified.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_context_from_pivot_scores(
     conn: &Connection,
@@ -1928,7 +1948,8 @@ mod tests {
                  id INTEGER PRIMARY KEY, fqn TEXT NOT NULL, name TEXT NOT NULL,
                  name_tokens TEXT NOT NULL DEFAULT '',
                  file_id INTEGER NOT NULL, start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT,
+                 centrality REAL NOT NULL DEFAULT 0.0
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL);
              CREATE VIRTUAL TABLE symbols_fts USING fts5(
@@ -1961,7 +1982,8 @@ mod tests {
              CREATE TABLE symbols (
                  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
                  name TEXT NOT NULL, name_tokens TEXT NOT NULL DEFAULT '', kind TEXT, start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT,
+                 centrality REAL NOT NULL DEFAULT 0.0
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);
              CREATE VIRTUAL TABLE symbols_fts USING fts5(
@@ -2431,10 +2453,8 @@ mod tests {
 
     #[test]
     fn pivot_ranking_fts5_returns_both_exact_and_segment_matches() {
-        // With FTS5+in-degree composite scoring, in-degree provides a ranking bonus.
-        // Y (name="pipeline_stage", in_degree=5) gets a -2.5 composite bonus that can
-        // outrank X (name="pipeline", in_degree=0) even though X is an exact name match.
-        // This is correct: a well-connected symbol is more important for context retrieval.
+        // With FTS5 BM25 + RRF centrality fusion, both BM25 relevance and graph centrality
+        // influence ranking. Both exact and segment matches must appear in results.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "pkg::pipeline", "pipeline", "fn", 1, 10, None, None, None);
@@ -2453,9 +2473,7 @@ mod tests {
 
     #[test]
     fn pivot_ranking_exact_match_classified_correctly() {
-        // With FTS5+in-degree composite scoring, both BM25 and in-degree influence ranking.
         // P (name="processor") and Q (name="processor_v2") both match "processor".
-        // Q has 5 incoming edges (in-degree=5), getting a composite bonus.
         // Both must be returned; P must be classified as Exact match.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
@@ -2502,37 +2520,28 @@ mod tests {
     }
 
     #[test]
-    fn pivot_ranking_case_variant_keywords_do_not_inflate_kw_score() {
+    fn pivot_ranking_case_variant_keywords_dedup_is_correct() {
         // Intent "Build BUILD build" should deduplicate to unique_words={"build"}.
-        // Symbol A (name="builder") matches "build" → kw_score=1.
-        // Symbol C (name="debug_build", in_degree=2) also matches "build" → kw_score=1, in_degree=2.
-        // With correct dedup: both calls return [C, A] (C wins by in_degree tiebreak).
-        // With broken dedup: second call gives A kw_score=3 → A would appear first.
+        // Both symbols match "build" via FTS5. With zero centrality, BM25 determines order.
+        // Key assertion: dedup means "Build BUILD build" produces the same results as "build".
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "pkg::builder", "builder", "fn", 1, 10, None, None, None);
-        // Symbol C: "debug_build" contains "build" as a substring → also matches LIKE "%build%", in_degree=2.
         insert_sym(&conn, 3, 1, "pkg::debug_build", "debug_build", "fn", 11, 20, None, None, None);
-        insert_sym(&conn, 10, 1, "pkg::caller1", "caller1", "fn", 100, 110, None, None, None);
-        insert_sym(&conn, 11, 1, "pkg::caller2", "caller2", "fn", 111, 120, None, None, None);
-        conn.execute("INSERT INTO edges VALUES (1,10,3,'calls')", []).unwrap();
-        conn.execute("INSERT INTO edges VALUES (2,11,3,'calls')", []).unwrap();
 
         let result_single = find_pivot_symbols(&conn, "build", &[], 5).unwrap();
         let result_triple = find_pivot_symbols(&conn, "Build BUILD build", &[], 5).unwrap();
 
         let ids_single: Vec<i64> = result_single.iter().map(|ps| ps.id).collect();
         let ids_triple: Vec<i64> = result_triple.iter().map(|ps| ps.id).collect();
-        // Both must return C (id=3) first because in_degree=2 > in_degree=0 at equal kw_score
-        assert_eq!(ids_single[0], 3, "debug_build (in_degree=2) must rank first for 'build'");
-        assert_eq!(ids_triple[0], 3, "debug_build must still rank first for 'Build BUILD build' (dedup must prevent inflation)");
+        // Both calls must return identical ordering (dedup correctness)
         assert_eq!(ids_single, ids_triple, "both calls must return identical ordering");
     }
 
     #[test]
     fn pivot_ranking_deterministic_id_tiebreak() {
-        // 3 symbols all matching the same single keyword, all in_degree=0.
-        // Must be returned sorted by id ASC.
+        // 3 symbols all matching the same single keyword, all centrality=0.0.
+        // With equal RRF scores, must be returned sorted by id ASC.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         // Insert in reverse order to confirm ordering is by id, not insertion order
@@ -2684,22 +2693,24 @@ mod tests {
 
     #[test]
     fn rank_symbols_by_keywords_matches_find_pivot_logic() {
-        // Both symbols tokenize to have "auth" as a token (via snake_case split),
-        // so FTS5 MATCH "auth" finds both.
+        // Verify rank_symbols_by_keywords and find_pivot_symbols produce identical ordering.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1, 'src/a.rs', 'h')", []).unwrap();
         conn.execute("INSERT INTO files VALUES (2, 'src/b.rs', 'h')", []).unwrap();
         insert_sym(&conn, 1, 1, "src/a.rs::auth_login", "auth_login", "fn", 1, 10, None, None, None);
         insert_sym(&conn, 2, 2, "src/b.rs::auth_check", "auth_check", "fn", 1, 10, None, None, None);
-        // Give symbol 2 higher in-degree
-        conn.execute("INSERT INTO edges VALUES (1, 1, 2, 'calls')", []).unwrap();
+        conn.execute("UPDATE symbols SET centrality = 0.05 WHERE id = 2", []).unwrap();
 
         let keywords = vec!["auth".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
-        assert_eq!(result.len(), 2, "both symbols match 'auth'");
-        // Same kw_score (1 each), so in_degree breaks tie: symbol 2 has in_degree=1
-        assert_eq!(result[0].id, 2, "higher in-degree symbol first");
-        assert_eq!(result[1].id, 1);
+        let rank_result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let pivot_result = find_pivot_symbols(&conn, "auth", &[], 5).unwrap();
+
+        assert_eq!(rank_result.len(), 2, "both symbols match 'auth'");
+        assert_eq!(pivot_result.len(), 2, "find_pivot_symbols must also find both");
+        // Both functions must produce the same ordering
+        let rank_ids: Vec<i64> = rank_result.iter().map(|p| p.id).collect();
+        let pivot_ids: Vec<i64> = pivot_result.iter().map(|p| p.id).collect();
+        assert_eq!(rank_ids, pivot_ids, "rank_symbols_by_keywords and find_pivot_symbols must agree on ordering");
     }
 
     #[test]
@@ -2722,17 +2733,17 @@ mod tests {
 
     #[test]
     fn rank_symbols_by_keywords_lexicographic_sort_and_metadata() {
-        // Tests FTS5 BM25 + in-degree composite ranking.
+        // Tests FTS5 BM25 + RRF centrality fusion ranking.
         //
         // Keywords: ["alpha", "beta"]
         //   sym 5:  name="alpha" — name_tokens="alpha"
         //   sym 10: name="alpha_beta" — name_tokens="alpha beta alpha_beta"
-        //   sym 20: name="alpha_high" — name_tokens="alpha high alpha_high", in_degree=5
-        //   sym 30: name="alpha_low_a" — name_tokens="alpha low alpha_low_a", in_degree=2
-        //   sym 40: name="alpha_low_b" — name_tokens="alpha low alpha_low_b", in_degree=2
+        //   sym 20: name="alpha_high" — name_tokens="alpha high alpha_high"
+        //   sym 30: name="alpha_low_a" — name_tokens="alpha low alpha_low_a"
+        //   sym 40: name="alpha_low_b" — name_tokens="alpha low alpha_low_b"
         //
-        // BM25 heavily favors sym 10 (matches BOTH "alpha" AND "beta" tokens),
-        // then in-degree composite adjusts remaining order.
+        // All centrality=0.0 → centrality is a no-op, BM25 determines ordering.
+        // BM25 heavily favors sym 10 (matches BOTH "alpha" AND "beta" tokens).
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'src/a.rs','h')", []).unwrap();
 
@@ -2779,7 +2790,7 @@ mod tests {
     fn exact_name_bypasses_candidate_gather_limit() {
         // Verify that an exact name match ranks first even when many segment-matching
         // decoy symbols are present. With FTS5, all 61 symbols are candidates, but
-        // symbol 9999 (name="schedule", Exact match) must rank first via kw_score.
+        // symbol 9999 (name="schedule", Exact match) must rank first via BM25.
         //
         // Setup: 60 decoy symbols whose names start with "schedule_helper_" (Segment match),
         // all with lower IDs than the target. Symbol 9999 is the exact name match.
@@ -2807,17 +2818,16 @@ mod tests {
 
     #[test]
     fn bm25_ranking_with_match_class_metadata() {
-        // Verify FTS5 BM25-primary ranking:
-        // - BM25 is the primary sort signal
-        // - In-degree is a tiebreaker (only matters when BM25 scores are identical)
+        // Verify FTS5 BM25 + RRF ranking with zero centrality:
+        // - BM25 is the primary signal (centrality is uniform → no-op via RRF)
         //
         // sym1: name="scheduler" → exact token match, short doc → strong BM25
         // sym2: name="init_scheduler_pool" → "scheduler" is one of 4 tokens → weaker BM25
         // sym3: name="my_scheduler" → "scheduler" is one of 2 tokens → medium BM25
         //
         // BM25 determines order: sym1 ranks best (shortest doc with exact token),
-        // sym3 second (2-token doc), sym2 third (4-token doc). In-degree on sym2
-        // cannot override BM25 — that's by design (Story 14.2 PageRank will address this).
+        // sym3 second (2-token doc), sym2 third (4-token doc). With zero centrality,
+        // RRF reduces to pure BM25 ordering.
         let conn = build_test_db();
         conn.execute("INSERT INTO files VALUES (1,'pkg/scheduler/schedule.rs','h')", []).unwrap();
 
@@ -2842,6 +2852,112 @@ mod tests {
         assert!(matches!(exact.reason, SelectionReason::Keyword { match_class: MatchClass::Exact, .. }));
     }
 
+    // ─── Story 14.3: RRF fusion regression tests ──────
+
+    #[test]
+    fn rrf_fusion_centrality_breaks_bm25_tie() {
+        // AC2: when BM25 scores are identical, centrality determines final ordering.
+        // Use symbols with identical FTS5-indexed content so BM25 scores (and dense ranks) are equal.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        conn.execute("INSERT INTO files VALUES (2,'b.rs','h')", []).unwrap();
+        // Same name → same name_tokens → same BM25 for query "dispatch"
+        insert_sym(&conn, 1, 1, "a::dispatch", "dispatch", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 2, "b::dispatch", "dispatch", "fn", 1, 10, None, None, None);
+        // Set centrality: id=2 higher than id=1
+        conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE symbols SET centrality = 0.05 WHERE id = 2", []).unwrap();
+
+        let keywords = vec!["dispatch".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert_eq!(result.len(), 2);
+
+        if let (
+            SelectionReason::Keyword { bm25_rank: br0, centrality_rank: cr0, .. },
+            SelectionReason::Keyword { bm25_rank: br1, centrality_rank: cr1, .. },
+        ) = (&result[0].reason, &result[1].reason) {
+            // Dense BM25 ranking: identical BM25 → same bm25_rank
+            assert_eq!(br0, br1, "identical BM25 scores must produce same dense bm25_rank");
+            // Centrality breaks the tie: higher centrality ranks first
+            assert!(cr0 < cr1, "higher centrality (lower rank number) must sort first");
+        } else {
+            panic!("expected Keyword reasons");
+        }
+        // Behavioral outcome: id=2 (higher centrality) ranks first
+        assert_eq!(result[0].id, 2, "higher centrality symbol must rank first when BM25 is tied");
+    }
+
+    #[test]
+    fn rrf_fusion_uniform_centrality_preserves_bm25_order() {
+        // All symbols with centrality=0.0 (default). Ordering must match pure BM25.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        // sym1: exact match "controller" → best BM25
+        insert_sym(&conn, 1, 1, "pkg::controller", "controller", "fn", 1, 10, None, None, None);
+        // sym2: segment match "controller_manager" → weaker BM25
+        insert_sym(&conn, 2, 1, "pkg::controller_manager", "controller_manager", "fn", 11, 20, None, None, None);
+        // sym3: segment match "controller_helper" → weaker BM25
+        insert_sym(&conn, 3, 1, "pkg::controller_helper", "controller_helper", "fn", 21, 30, None, None, None);
+
+        let keywords = vec!["controller".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert!(result.len() >= 3);
+        // With uniform centrality (0.0), all get centrality_rank=1.
+        // RRF reduces to pure BM25 ordering.
+        for p in &result {
+            if let SelectionReason::Keyword { centrality_rank, .. } = &p.reason {
+                assert_eq!(*centrality_rank, 1, "all symbols with equal centrality must get same rank");
+            }
+        }
+        // Exact match must rank first (best BM25)
+        assert_eq!(result[0].id, 1, "exact match must rank first with uniform centrality");
+    }
+
+    #[test]
+    fn rrf_exact_match_beats_moderate_centrality_segment() {
+        // AC7: exact name match with low centrality must outrank segment match with moderate centrality.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        // Symbol A: exact match "controller", low centrality
+        insert_sym(&conn, 1, 1, "pkg::controller", "controller", "fn", 1, 10, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.01 WHERE id = 1", []).unwrap();
+        // Symbol B: segment match "controller_manager", moderate centrality
+        insert_sym(&conn, 2, 1, "pkg::controller_manager", "controller_manager", "fn", 11, 20, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.05 WHERE id = 2", []).unwrap();
+        // Symbol C: filler to avoid 2-symbol rank symmetry
+        insert_sym(&conn, 3, 1, "pkg::controller_helper", "controller_helper", "fn", 21, 30, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 3", []).unwrap();
+
+        let keywords = vec!["controller".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert!(result.len() >= 2);
+        // Exact match BM25 advantage should dominate moderate centrality difference
+        assert_eq!(result[0].id, 1, "exact match must outrank segment match with moderate centrality");
+    }
+
+    #[test]
+    fn rrf_multi_term_beats_single_term_high_centrality() {
+        // AC7: a symbol matching both query terms must outrank a symbol matching only one term
+        // even when the single-term match has much higher centrality.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
+        // Symbol A: matches both "alpha" and "beta", low centrality
+        insert_sym(&conn, 1, 1, "pkg::alpha_beta", "alpha_beta", "fn", 1, 10, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.01 WHERE id = 1", []).unwrap();
+        // Symbol B: matches only "alpha", high centrality
+        insert_sym(&conn, 2, 1, "pkg::alpha_only", "alpha_only", "fn", 11, 20, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.5 WHERE id = 2", []).unwrap();
+        // Symbol C: filler
+        insert_sym(&conn, 3, 1, "pkg::alpha_helper", "alpha_helper", "fn", 21, 30, None, None, None);
+        conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 3", []).unwrap();
+
+        let keywords = vec!["alpha".to_string(), "beta".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        assert!(result.len() >= 2);
+        // BM25 strongly favors multi-term matches over single-term
+        assert_eq!(result[0].id, 1, "multi-term match must outrank single-term with high centrality");
+    }
+
     // ─── Story 9.8: Score explainability tests ──────
 
     #[test]
@@ -2853,8 +2969,9 @@ mod tests {
         let result = find_pivot_symbols(&conn, "handler request", &[], 5).unwrap();
         assert!(!result.is_empty());
         assert!(matches!(result[0].reason, SelectionReason::Keyword { .. }), "keyword path must produce Keyword reason");
-        if let SelectionReason::Keyword { kw_score, .. } = &result[0].reason {
-            assert!(*kw_score >= 1, "kw_score must be at least 1");
+        if let SelectionReason::Keyword { bm25_rank, rrf_score, .. } = &result[0].reason {
+            assert!(*bm25_rank >= 1, "bm25_rank must be at least 1");
+            assert!(*rrf_score > 0.0, "rrf_score must be positive");
         }
     }
 
@@ -3158,8 +3275,8 @@ mod eval {
 
     fn format_reason(reason: &SelectionReason) -> String {
         match reason {
-            SelectionReason::Keyword { match_class, bm25_score, kw_score, in_degree } => {
-                format!("Keyword({} bm25={:.2} kw={}, deg={})", match_class, bm25_score, kw_score, in_degree)
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => {
+                format!("Keyword({} bm25_r={} cent_r={} rrf={:.4} bm25={:.2})", match_class, bm25_rank, centrality_rank, rrf_score, bm25_score)
             }
             SelectionReason::FileHint { hint } => format!("FileHint({})", hint),
             SelectionReason::CallerSupplied => "CallerSupplied".to_string(),
