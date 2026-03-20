@@ -1722,10 +1722,11 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
     }
     let resolved_path = &candidates[0];
 
-    // Fetch symbols for the single resolved file
+    // Fetch top-level symbols for the single resolved file
+    // story-15-2: remove parent_id filter and add parent-child grouping
     let mut stmt = conn.prepare(
         "SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id
-         WHERE f.path = ?1 ORDER BY s.start_line",
+         WHERE f.path = ?1 AND s.parent_id IS NULL ORDER BY s.start_line",
     )?;
     let symbol_ids: Vec<i64> = stmt
         .query_map(params![resolved_path], |r| r.get(0))?
@@ -2038,7 +2039,8 @@ mod tests {
                  name_tokens TEXT NOT NULL DEFAULT '',
                  file_id INTEGER NOT NULL, start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL, signature TEXT, docstring TEXT,
-                 centrality REAL NOT NULL DEFAULT 0.0
+                 centrality REAL NOT NULL DEFAULT 0.0,
+                 parent_id INTEGER DEFAULT NULL
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL);
              CREATE VIRTUAL TABLE symbols_fts USING fts5(
@@ -2072,7 +2074,8 @@ mod tests {
                  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
                  name TEXT NOT NULL, name_tokens TEXT NOT NULL DEFAULT '', kind TEXT, start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT,
-                 centrality REAL NOT NULL DEFAULT 0.0
+                 centrality REAL NOT NULL DEFAULT 0.0,
+                 parent_id INTEGER DEFAULT NULL
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);
              CREATE VIRTUAL TABLE symbols_fts USING fts5(
@@ -3418,6 +3421,60 @@ mod tests {
                 panic!("expected Keyword reason");
             }
         }
+    }
+
+    // --- Story 15.1 Task 0: Pre-change regression safety net ---
+
+    #[test]
+    fn get_file_skeleton_baseline_output() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
+             VALUES (1, 1, 'src/lib.rs::MyStruct', 'MyStruct', 'my struct', 'class', 1, 30, 'pub struct MyStruct', 'A test struct', 'h')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
+             VALUES (2, 1, 'src/lib.rs::MyStruct::process', 'process', 'process', 'function', 5, 20, 'pub fn process(&self)', 'Process data', 'h')",
+            [],
+        ).unwrap();
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+
+        // Both symbols must appear as top-level sections
+        assert!(output.contains("### MyStruct"), "struct must appear in skeleton");
+        assert!(output.contains("### process"), "method must appear in skeleton");
+        assert!(output.contains("pub struct MyStruct"), "struct signature must render");
+        assert!(output.contains("pub fn process(&self)"), "method signature must render");
+
+        // Verify section order: struct appears before method (ordered by start_line)
+        let struct_pos = output.find("### MyStruct").unwrap();
+        let method_pos = output.find("### process").unwrap();
+        assert!(struct_pos < method_pos, "symbols must be ordered by start_line");
+    }
+
+    #[test]
+    fn lookup_symbol_at_line_method_wins_over_class() {
+        // Regression guard: when a method is nested inside a class,
+        // lookup_symbol_at_line must return the method (narrowest span).
+        // Story 15.1 adds parent_id — this test ensures the contract is preserved.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/a.rs', 'h')", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, source_hash)
+             VALUES (1, 1, 'src/a.rs::Widget', 'Widget', 'widget', 'class', 1, 50, 'h')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, source_hash)
+             VALUES (2, 1, 'src/a.rs::Widget::render', 'render', 'render', 'function', 10, 25, 'h')",
+            [],
+        ).unwrap();
+
+        let fqn = crate::graph::store::lookup_symbol_at_line(&conn, "src/a.rs", 15).unwrap();
+        assert_eq!(fqn.as_deref(), Some("src/a.rs::Widget::render"),
+            "narrowest symbol (method) must be returned, not the class");
     }
 }
 

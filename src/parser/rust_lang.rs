@@ -1,7 +1,7 @@
 // Named rust_lang.rs to avoid collision with the `rust` keyword
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_symbol};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_child_symbol, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -101,18 +101,60 @@ fn extract_nodes(
                 ));
             }
         }
-        "struct_item" | "enum_item" => {
-            // No native Struct/Enum kind — use Class
+        "struct_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source)?;
                 symbols.push(make_symbol(
                     relative_path,
                     None,
                     name,
-                    SymbolKind::Class,
+                    SymbolKind::Struct,
                     node,
                     source,
                 ));
+                // Extract field declarations as children
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut walker = body.walk();
+                    for child in body.children(&mut walker) {
+                        if child.kind() == "field_declaration"
+                            && let Some(field_name_node) = child.child_by_field_name("name")
+                        {
+                            let field_name = field_name_node.utf8_text(source)?;
+                            symbols.push(make_child_symbol(
+                                relative_path, name, field_name,
+                                SymbolKind::Field, child, source,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "enum_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source)?;
+                symbols.push(make_symbol(
+                    relative_path,
+                    None,
+                    name,
+                    SymbolKind::Enum,
+                    node,
+                    source,
+                ));
+                // Extract enum variants as children
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut walker = body.walk();
+                    for child in body.children(&mut walker) {
+                        if child.kind() == "enum_variant"
+                            && let Some(variant_name_node) = child.child_by_field_name("name")
+                        {
+                            let variant_name = variant_name_node.utf8_text(source)?;
+                            symbols.push(make_child_symbol(
+                                relative_path, name, variant_name,
+                                SymbolKind::EnumVariant, child, source,
+                            ));
+                        }
+                    }
+                }
             }
         }
         "trait_item" => {
@@ -122,10 +164,37 @@ fn extract_nodes(
                     relative_path,
                     None,
                     name,
-                    SymbolKind::Interface,
+                    SymbolKind::Trait,
                     node,
                     source,
                 ));
+                // Extract trait items as children (method signatures, associated types)
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut walker = body.walk();
+                    for child in body.children(&mut walker) {
+                        match child.kind() {
+                            "function_signature_item" => {
+                                if let Some(method_name_node) = child.child_by_field_name("name") {
+                                    let method_name = method_name_node.utf8_text(source)?;
+                                    symbols.push(make_child_symbol(
+                                        relative_path, name, method_name,
+                                        SymbolKind::TraitMethod, child, source,
+                                    ));
+                                }
+                            }
+                            "associated_type" => {
+                                if let Some(type_name_node) = child.child_by_field_name("name") {
+                                    let type_name = type_name_node.utf8_text(source)?;
+                                    symbols.push(make_child_symbol(
+                                        relative_path, name, type_name,
+                                        SymbolKind::AssociatedType, child, source,
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         "impl_item" => {
@@ -298,5 +367,84 @@ impl From  <  String  > for Foo { fn from(s: String) -> Self { Foo } }
         let fqn_spaced: Vec<&str> = syms_spaced.iter().filter(|s| s.name == "from").map(|s| s.fqn.as_str()).collect();
         assert_eq!(fqn_compact, fqn_spaced, "whitespace differences must not change FQN");
         assert_eq!(fqn_compact[0], "test.rs::Foo::<From<String>>::from");
+    }
+
+    #[test]
+    fn enum_variants_extracted_as_children() {
+        let src = b"
+pub enum Error {
+    Sqlite(rusqlite::Error),
+    Io(std::io::Error),
+    Custom(String),
+}
+";
+        let (symbols, _) = parse("test.rs", src).unwrap();
+        let parent = symbols.iter().find(|s| s.name == "Error").unwrap();
+        assert_eq!(parent.kind, SymbolKind::Enum);
+        assert!(parent.parent_fqn.is_none());
+
+        let variants: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::EnumVariant).collect();
+        assert_eq!(variants.len(), 3);
+        assert!(variants.iter().any(|v| v.name == "Sqlite" && v.parent_fqn.as_deref() == Some("test.rs::Error")));
+        assert!(variants.iter().any(|v| v.name == "Custom"));
+        // Variant signature must contain full text (bodyless declaration)
+        let sqlite = variants.iter().find(|v| v.name == "Sqlite").unwrap();
+        assert!(sqlite.signature.as_ref().unwrap().contains("rusqlite::Error"),
+            "variant signature must contain type; got: {:?}", sqlite.signature);
+    }
+
+    #[test]
+    fn struct_fields_extracted_as_children() {
+        let src = b"
+pub struct Config {
+    pub name: String,
+    pub port: u16,
+}
+";
+        let (symbols, _) = parse("test.rs", src).unwrap();
+        let parent = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(parent.kind, SymbolKind::Struct);
+
+        let fields: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::Field).collect();
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().any(|f| f.name == "name" && f.fqn == "test.rs::Config::name"));
+        assert!(fields.iter().any(|f| f.name == "port" && f.fqn == "test.rs::Config::port"));
+    }
+
+    #[test]
+    fn trait_methods_and_associated_types_extracted() {
+        let src = b"
+pub trait Handler {
+    type Output;
+    fn handle(&self, input: &str) -> Self::Output;
+}
+";
+        let (symbols, _) = parse("test.rs", src).unwrap();
+        let parent = symbols.iter().find(|s| s.name == "Handler").unwrap();
+        assert_eq!(parent.kind, SymbolKind::Trait);
+
+        let trait_methods: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::TraitMethod).collect();
+        assert_eq!(trait_methods.len(), 1);
+        assert_eq!(trait_methods[0].name, "handle");
+        assert_eq!(trait_methods[0].parent_fqn.as_deref(), Some("test.rs::Handler"));
+
+        let assoc_types: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::AssociatedType).collect();
+        assert_eq!(assoc_types.len(), 1);
+        assert_eq!(assoc_types[0].name, "Output");
+    }
+
+    #[test]
+    fn impl_methods_remain_top_level() {
+        // impl methods must NOT get parent_fqn — they stay top-level
+        let src = b"
+struct Foo;
+impl Foo {
+    fn method(&self) {}
+}
+";
+        let (symbols, _) = parse("test.rs", src).unwrap();
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert!(method.parent_fqn.is_none(), "impl methods must not have parent_fqn");
+        assert_eq!(method.kind, SymbolKind::Method);
     }
 }

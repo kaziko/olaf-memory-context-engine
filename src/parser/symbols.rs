@@ -9,6 +9,9 @@ pub struct Symbol {
     pub docstring: Option<String>,
     /// blake3 hash of this symbol's source bytes — used to detect staleness when the file changes
     pub source_hash: String,
+    /// FQN of the parent symbol for child declarations (fields, variants, etc.).
+    /// Resolved to parent_id by the store layer. None for top-level symbols.
+    pub parent_fqn: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +36,15 @@ pub enum SymbolKind {
     Interface,
     TypeAlias,
     Variable,
-    Namespace, // PHP-specific
+    Namespace,    // PHP-specific
+    Struct,       // Rust-specific (replaces Class for Rust)
+    Enum,         // Rust-specific (replaces Class for Rust)
+    Trait,        // Rust-specific (replaces Interface for Rust)
+    EnumVariant,  // child of Enum
+    Field,        // child of Struct/Class
+    TraitMethod,  // child of Trait/Interface (signature only)
+    AssociatedType, // child of Trait
+    Constant,
 }
 
 impl SymbolKind {
@@ -46,6 +57,14 @@ impl SymbolKind {
             Self::TypeAlias => "type_alias",
             Self::Variable => "variable",
             Self::Namespace => "namespace",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::EnumVariant => "enum_variant",
+            Self::Field => "field",
+            Self::TraitMethod => "trait_method",
+            Self::AssociatedType => "associated_type",
+            Self::Constant => "constant",
         }
     }
 }
@@ -155,6 +174,44 @@ pub(crate) fn make_symbol(
         source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
             .to_hex()
             .to_string(),
+        parent_fqn: None,
+    }
+}
+
+/// Constructor for child symbols (fields, variants, trait items).
+///
+/// Uses parent_name as the FQN parent component and records parent_fqn for
+/// store-layer resolution to parent_id. For bodyless declarations (fields,
+/// variants, associated types), uses full node text as signature when
+/// extract_signature returns None.
+pub(crate) fn make_child_symbol(
+    relative_path: &str,
+    parent_name: &str,
+    name: &str,
+    kind: SymbolKind,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Symbol {
+    let parent_fqn = make_fqn(relative_path, None, parent_name);
+    let signature = extract_signature(source, node).or_else(|| {
+        // Bodyless declarations: full node text IS the signature
+        std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    Symbol {
+        fqn: make_fqn(relative_path, Some(parent_name), name),
+        name: name.to_string(),
+        kind,
+        start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        signature,
+        docstring: None,
+        source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
+            .to_hex()
+            .to_string(),
+        parent_fqn: Some(parent_fqn),
     }
 }
 

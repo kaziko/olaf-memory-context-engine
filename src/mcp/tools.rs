@@ -1798,7 +1798,8 @@ mod tests {
              CREATE TABLE symbols (
                  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
                  name TEXT NOT NULL, kind TEXT, start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT,
+                 parent_id INTEGER DEFAULT NULL
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);",
         ).unwrap();

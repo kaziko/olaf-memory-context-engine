@@ -168,7 +168,8 @@ fn build_trace_test_db() -> rusqlite::Connection {
     conn.execute_batch("
         CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL, hash TEXT, lang TEXT, last_indexed_at INTEGER);
         CREATE TABLE symbols (id INTEGER PRIMARY KEY, file_id INTEGER, fqn TEXT, name TEXT, kind TEXT,
-                              start_line INTEGER, end_line INTEGER, signature TEXT, source_hash TEXT, docstring TEXT);
+                              start_line INTEGER, end_line INTEGER, signature TEXT, source_hash TEXT, docstring TEXT,
+                              parent_id INTEGER DEFAULT NULL);
         CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);
         INSERT INTO files VALUES (1, 'src/a.rs', 'h', 'rust', 0);
     ").unwrap();
@@ -183,8 +184,8 @@ mod tests {
     fn test_direct_call() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1, 1, 2, 'calls');
         ").unwrap();
 
@@ -199,9 +200,9 @@ mod tests {
     fn test_two_hop() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1, 1, 2, 'calls');
             INSERT INTO edges VALUES (2, 2, 3, 'calls');
         ").unwrap();
@@ -218,10 +219,10 @@ mod tests {
     fn test_no_path() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (4, 1, 'D', 'D', 'fn', 7, 8, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (4, 1, 'D', 'D', 'fn', 7, 8, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1, 1, 2, 'calls');
             INSERT INTO edges VALUES (2, 3, 4, 'calls');
         ").unwrap();
@@ -234,9 +235,9 @@ mod tests {
     fn test_cycle_terminates() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1, 1, 2, 'calls');
             INSERT INTO edges VALUES (2, 2, 1, 'calls');
         ").unwrap();
@@ -250,10 +251,10 @@ mod tests {
     fn test_multiple_shortest_paths() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (4, 1, 'D', 'D', 'fn', 7, 8, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B', 'B', 'fn', 3, 4, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (3, 1, 'C', 'C', 'fn', 5, 6, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (4, 1, 'D', 'D', 'fn', 7, 8, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1, 1, 2, 'calls');
             INSERT INTO edges VALUES (2, 2, 4, 'calls');
             INSERT INTO edges VALUES (3, 1, 3, 'calls');
@@ -273,7 +274,7 @@ mod tests {
     fn test_source_equals_target() {
         let conn = build_trace_test_db();
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A', 'A', 'fn', 1, 2, NULL, NULL, NULL, NULL);
         ").unwrap();
 
         let result = trace_flow(&conn, 1, 1, 5).unwrap();
@@ -325,14 +326,14 @@ mod tests {
         let conn = build_trace_test_db();
         // A(1), B1..B6(2..7), D(8)
         conn.execute_batch("
-            INSERT INTO symbols VALUES (1, 1, 'A',  'A',  'fn', 1,  2,  NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (2, 1, 'B1', 'B1', 'fn', 3,  4,  NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (3, 1, 'B2', 'B2', 'fn', 5,  6,  NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (4, 1, 'B3', 'B3', 'fn', 7,  8,  NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (5, 1, 'B4', 'B4', 'fn', 9,  10, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (6, 1, 'B5', 'B5', 'fn', 11, 12, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (7, 1, 'B6', 'B6', 'fn', 13, 14, NULL, NULL, NULL);
-            INSERT INTO symbols VALUES (8, 1, 'D',  'D',  'fn', 15, 16, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (1, 1, 'A',  'A',  'fn', 1,  2,  NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (2, 1, 'B1', 'B1', 'fn', 3,  4,  NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (3, 1, 'B2', 'B2', 'fn', 5,  6,  NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (4, 1, 'B3', 'B3', 'fn', 7,  8,  NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (5, 1, 'B4', 'B4', 'fn', 9,  10, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (6, 1, 'B5', 'B5', 'fn', 11, 12, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (7, 1, 'B6', 'B6', 'fn', 13, 14, NULL, NULL, NULL, NULL);
+            INSERT INTO symbols VALUES (8, 1, 'D',  'D',  'fn', 15, 16, NULL, NULL, NULL, NULL);
             INSERT INTO edges VALUES (1,  1, 2, 'calls');
             INSERT INTO edges VALUES (2,  1, 3, 'calls');
             INSERT INTO edges VALUES (3,  1, 4, 'calls');

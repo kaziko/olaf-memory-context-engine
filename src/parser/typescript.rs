@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_fqn};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_child_symbol, make_fqn};
 
 pub(crate) enum TsDialect {
     TypeScript,
@@ -77,6 +77,7 @@ fn extract_nodes(
                     signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
+                    parent_fqn: None,
                 });
                 // Recurse into body with this function as the enclosing symbol
                 for child in node.children(&mut node.walk()) {
@@ -109,6 +110,7 @@ fn extract_nodes(
                     signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
+                    parent_fqn: None,
                 });
 
                 // class_heritage wraps extends_clause / implements_clause (TS) or
@@ -205,6 +207,7 @@ fn extract_nodes(
                     signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
+                    parent_fqn: None,
                 });
                 // Recurse into method body with this method as the enclosing symbol
                 for child in node.children(&mut node.walk()) {
@@ -237,7 +240,76 @@ fn extract_nodes(
                     signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
+                    parent_fqn: None,
                 });
+                // Extract interface member signatures as children
+                if let Some(body) = node.child_by_field_name("body") {
+                    for child in body.children(&mut body.walk()) {
+                        match child.kind() {
+                            "property_signature" | "method_signature" => {
+                                if let Some(member_name) = child.child_by_field_name("name") {
+                                    let mname = member_name.utf8_text(source)?;
+                                    let kind = if child.kind() == "property_signature" {
+                                        SymbolKind::Field
+                                    } else {
+                                        SymbolKind::TraitMethod
+                                    };
+                                    symbols.push(make_child_symbol(
+                                        relative_path, name, mname, kind, child, source,
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        "public_field_definition" => {
+            // Class field declaration — extract as Field child (NOT a method)
+            if let Some(parent) = parent_class
+                && let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source)?;
+                    symbols.push(make_child_symbol(
+                        relative_path, parent, name, SymbolKind::Field, node, source,
+                    ));
+                }
+        }
+
+        "enum_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source)?;
+                let fqn = make_fqn(relative_path, parent_class, name);
+                let source_hash = blake3::hash(&source[node.start_byte()..node.end_byte()])
+                    .to_hex()
+                    .to_string();
+                symbols.push(Symbol {
+                    fqn,
+                    name: name.to_string(),
+                    kind: SymbolKind::Class,
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    signature: extract_signature(source, node),
+                    docstring: None,
+                    source_hash,
+                    parent_fqn: None,
+                });
+                // Extract enum members as children
+                if let Some(body) = node.child_by_field_name("body") {
+                    for child in body.children(&mut body.walk()) {
+                        if (child.kind() == "enum_assignment" || child.kind() == "property_identifier")
+                            && let Some(member_name) = child.child_by_field_name("name")
+                                .or_else(|| if child.kind() == "property_identifier" { Some(child) } else { None })
+                            {
+                                let mname = member_name.utf8_text(source)?;
+                                symbols.push(make_child_symbol(
+                                    relative_path, name, mname,
+                                    SymbolKind::EnumVariant, child, source,
+                                ));
+                            }
+                    }
+                }
             }
         }
 
@@ -257,6 +329,7 @@ fn extract_nodes(
                     signature: extract_signature(source, node),
                     docstring: None,
                     source_hash,
+                    parent_fqn: None,
                 });
             }
         }
@@ -285,6 +358,7 @@ fn extract_nodes(
                         signature: extract_signature(source, value_node),
                         docstring: None,
                         source_hash,
+                        parent_fqn: None,
                     });
                     // Recurse into arrow/function body with this symbol as the enclosing context
                     extract_nodes(
@@ -431,5 +505,25 @@ mod tests {
         let (symbols, edges) = parse("empty.jsx", b"", TsDialect::Jsx).unwrap();
         assert!(symbols.is_empty());
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn interface_members_extracted_as_children() {
+        let src = b"
+interface Config {
+    name: string;
+    getValue(key: string): number;
+}
+";
+        let (symbols, _) = parse("test.ts", src, TsDialect::TypeScript).unwrap();
+        let iface = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(iface.kind, SymbolKind::Interface);
+
+        let fields: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Field).collect();
+        let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::TraitMethod).collect();
+        assert_eq!(fields.len(), 1, "interface property signature");
+        assert_eq!(fields[0].name, "name");
+        assert_eq!(methods.len(), 1, "interface method signature");
+        assert_eq!(methods[0].name, "getValue");
     }
 }

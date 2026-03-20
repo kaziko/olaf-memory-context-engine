@@ -391,7 +391,9 @@ fn test_parse_rust_exact_symbol_set() {
             "tests/fixtures/rust/sample.rs::FileReader",
             "tests/fixtures/rust/sample.rs::FileReader::exists",
             "tests/fixtures/rust/sample.rs::FileReader::new",
+            "tests/fixtures/rust/sample.rs::FileReader::path",
             "tests/fixtures/rust/sample.rs::Readable",
+            "tests/fixtures/rust/sample.rs::Readable::read",
         ],
         "Rust exact symbol set mismatch"
     );
@@ -663,6 +665,8 @@ fn test_parse_go_exact_symbol_set() {
         fqns,
         vec![
             "tests/fixtures/go/sample.go::Config",
+            "tests/fixtures/go/sample.go::Config::Host",
+            "tests/fixtures/go/sample.go::Config::Port",
             "tests/fixtures/go/sample.go::Config::String",
             "tests/fixtures/go/sample.go::Config::Validate",
             "tests/fixtures/go/sample.go::DefaultTimeout",
@@ -671,6 +675,7 @@ fn test_parse_go_exact_symbol_set() {
             "tests/fixtures/go/sample.go::NewConfig",
             "tests/fixtures/go/sample.go::StringAlias",
             "tests/fixtures/go/sample.go::Stringer",
+            "tests/fixtures/go/sample.go::Stringer::String",
             "tests/fixtures/go/sample.go::Version",
         ],
         "exact Go symbol set mismatch"

@@ -123,6 +123,51 @@ pub(crate) fn replace_file_symbols(
             ],
         )?;
     }
+
+    // Second pass: resolve parent_fqn → parent_id for child symbols
+    resolve_parent_ids(tx, file_id, symbols)?;
+
+    Ok(())
+}
+
+/// Resolve parent_fqn to parent_id for child symbols within a file.
+/// Symbols with parent_fqn set get their parent_id updated by looking up
+/// the parent FQN among symbols in the same file.
+fn resolve_parent_ids(
+    tx: &Transaction,
+    file_id: i64,
+    symbols: &[Symbol],
+) -> Result<(), StoreError> {
+    let children: Vec<&Symbol> = symbols.iter().filter(|s| s.parent_fqn.is_some()).collect();
+    if children.is_empty() {
+        return Ok(());
+    }
+
+    let mut update_stmt =
+        tx.prepare("UPDATE symbols SET parent_id = ?1 WHERE file_id = ?2 AND fqn = ?3")?;
+    let mut lookup_stmt =
+        tx.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND fqn = ?2")?;
+
+    for child in children {
+        let parent_fqn = child.parent_fqn.as_ref().unwrap();
+        let parent_id: Option<i64> = match lookup_stmt
+            .query_row(params![file_id, parent_fqn], |r| r.get(0))
+        {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(StoreError::Sqlite(e)),
+        };
+        if let Some(pid) = parent_id {
+            update_stmt.execute(params![pid, file_id, child.fqn])?;
+        } else {
+            log::debug!(
+                "parent_fqn '{}' not found for child '{}' in file_id {}",
+                parent_fqn,
+                child.fqn,
+                file_id,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -215,6 +260,9 @@ pub(crate) fn update_file_symbols(
         tx.execute("DELETE FROM symbols WHERE id = ?1", [old_id])?;
         diff.removed.push(fqn.clone());
     }
+
+    // Second pass: resolve parent_fqn → parent_id for child symbols
+    resolve_parent_ids(tx, file_id, new_symbols)?;
 
     Ok(diff)
 }
@@ -407,10 +455,12 @@ pub fn lookup_symbol_at_line(
     rel_path: &str,
     line: u32,
 ) -> Result<Option<String>, StoreError> {
+    // story-15-2: remove parent_id filter to optionally return children
     let mut stmt = conn.prepare(
         "SELECT s.fqn FROM symbols s \
          JOIN files f ON s.file_id = f.id \
          WHERE f.path = ?1 AND s.start_line <= ?2 AND s.end_line >= ?2 \
+         AND s.parent_id IS NULL \
          ORDER BY (s.end_line - s.start_line) ASC \
          LIMIT 1",
     )?;
@@ -631,6 +681,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "deadbeef".to_string(),
+            parent_fqn: None,
         };
 
         // First replace
@@ -673,6 +724,7 @@ mod tests {
             signature: Some("fn method(&self)".to_string()),
             docstring: None,
             source_hash: "aaa".to_string(),
+            parent_fqn: None,
         };
         let sym_b = crate::parser::symbols::Symbol {
             fqn: "src/lib.rs::Foo::method".to_string(), // same FQN, different impl block
@@ -683,6 +735,7 @@ mod tests {
             signature: Some("fn method(&self) -> bool".to_string()),
             docstring: None,
             source_hash: "bbb".to_string(),
+            parent_fqn: None,
         };
 
         let tx = conn.transaction().unwrap();
@@ -726,6 +779,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "hash".to_string(),
+            parent_fqn: None,
         };
 
         let tx = conn.transaction().unwrap();
@@ -769,6 +823,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "hash".to_string(),
+            parent_fqn: None,
         };
         let tx = conn.transaction().unwrap();
         replace_file_symbols(&tx, file_id, &[sym]).unwrap();
@@ -806,6 +861,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: hash.to_string(),
+            parent_fqn: None,
         };
 
         let tx = conn.transaction().unwrap();
@@ -853,6 +909,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "h1".to_string(),
+            parent_fqn: None,
         };
 
         // File A (caller), File B (target with helper())
@@ -890,6 +947,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "h2".to_string(),
+            parent_fqn: None,
         };
         let tx = conn.transaction().unwrap();
         let diff = update_file_symbols(&tx, file_b, &[updated_sym]).unwrap();
@@ -939,6 +997,7 @@ mod tests {
                 signature: None,
                 docstring: None,
                 source_hash: "h".to_string(),
+                parent_fqn: None,
             })
             .collect();
 
@@ -995,6 +1054,7 @@ mod tests {
             signature: None,
             docstring: None,
             source_hash: "hash".to_string(),
+            parent_fqn: None,
         };
 
         let tx = conn.transaction().unwrap();
@@ -1141,6 +1201,7 @@ mod tests {
                 signature: None,
                 docstring: None,
                 source_hash: "h1".into(),
+                parent_fqn: None,
             },
             Symbol {
                 fqn: "src/dup.rs::Foo::fmt".into(),
@@ -1151,6 +1212,7 @@ mod tests {
                 signature: None,
                 docstring: None,
                 source_hash: "h2".into(),
+                parent_fqn: None,
             },
         ];
 
