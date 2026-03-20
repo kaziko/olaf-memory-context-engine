@@ -382,6 +382,10 @@ const BM25_DOC_WEIGHT: f64 = 1.0;
 /// RRF fusion constant. Standard value from the original RRF paper (Cormack et al. 2009).
 /// Higher k reduces the influence of rank position differences.
 const RRF_K: f64 = 60.0;
+/// Minimum fraction of the FTS5 pool that must have stored embeddings before the
+/// embedding signal is included in RRF fusion. Below this threshold, the sparse
+/// coverage would bias ranking toward the few symbols that happen to be embedded.
+const EMBEDDING_COVERAGE_MIN: f64 = 0.5;
 
 /// Classify a FTS5 hit into a MatchClass by comparing query terms against
 /// the symbol's name, name_tokens, and fqn (all already fetched from the join).
@@ -540,8 +544,8 @@ pub(crate) fn rank_symbols_by_keywords(
                 Err(_) => break 'embedding,
             };
 
-            // Coverage check: skip embedding signal if fewer than 50% of pool has embeddings.
-            if stored.len() * 2 < pool.len() {
+            // Coverage check: skip embedding signal when too few pool members have embeddings.
+            if (stored.len() as f64) < pool.len() as f64 * EMBEDDING_COVERAGE_MIN {
                 break 'embedding;
             }
 
@@ -3376,6 +3380,42 @@ mod tests {
             if let SelectionReason::Keyword { embedding_rank, .. } = &ps.reason {
                 let rank = embedding_rank.expect("sym with embedding must have Some rank");
                 assert!(rank < 4, "ranked symbol embedding_rank must be less than pool_size+1");
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_below_coverage_threshold_skips_embedding_signal() {
+        // Pool of 4 symbols; only 1 has a stored embedding (25% < EMBEDDING_COVERAGE_MIN).
+        // Embedding signal must be skipped entirely — all embedding_rank fields must be None.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        insert_sym(&conn, 1, 1, "pkg::alpha", "alpha", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 1, "pkg::beta", "beta", "fn", 11, 20, None, None, None);
+        insert_sym(&conn, 3, 1, "pkg::gamma", "gamma", "fn", 21, 30, None, None, None);
+        insert_sym(&conn, 4, 1, "pkg::delta", "delta", "fn", 31, 40, None, None, None);
+
+        let embedder = crate::memory::embedder::FakeEmbedder::new(4);
+        let emb1 = embedder.embed_query("alpha signal").unwrap();
+        // Only 1 of 4 symbols has an embedding (25% coverage)
+        insert_symbol_embedding(&conn, 1, &emb1);
+
+        let keywords = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(), "delta".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, Some(&embedder), Some("alpha beta gamma delta")).unwrap();
+
+        assert_eq!(result.len(), 4, "all four symbols should be returned");
+
+        // With coverage below threshold, embedding signal is skipped — pure two-signal RRF.
+        for ps in &result {
+            if let SelectionReason::Keyword { embedding_rank, rrf_score, bm25_rank, centrality_rank, .. } = &ps.reason {
+                assert!(embedding_rank.is_none(),
+                    "embedding_rank must be None when coverage < threshold; got {:?} for {}",
+                    embedding_rank, ps.fqn);
+                let expected = 1.0 / (RRF_K + *bm25_rank as f64) + 1.0 / (RRF_K + *centrality_rank as f64);
+                assert!((rrf_score - expected).abs() < 1e-10,
+                    "two-signal RRF formula must hold when embedding signal is skipped");
+            } else {
+                panic!("expected Keyword reason");
             }
         }
     }
