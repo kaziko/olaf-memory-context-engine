@@ -323,7 +323,17 @@ mod tests {
     #[test]
     fn enum_variant_payload_change_is_structural() {
         let old = vec![make_snap("f.rs::Error::Db", "enum_variant", Some("Db(DbError)"), "h1")];
-        let new = vec![make_sym("f.rs::Error::Db", Some("Db(String)"), "h2")];
+        let new = vec![Symbol {
+            fqn: "f.rs::Error::Db".into(),
+            name: "Db".into(),
+            kind: SymbolKind::EnumVariant,
+            start_line: 1,
+            end_line: 1,
+            signature: Some("Db(String)".into()),
+            docstring: None,
+            source_hash: "h2".into(),
+            parent_fqn: Some("f.rs::Error".into()),
+        }];
         let diff = compute("f.rs", &old, &new);
         assert_eq!(diff.signature_changed.len(), 1, "variant payload change must be signature_changed");
         assert!(diff.body_only.is_empty(), "must NOT be body_only");
@@ -333,7 +343,17 @@ mod tests {
     #[test]
     fn struct_field_type_change_is_structural() {
         let old = vec![make_snap("f.rs::Config::name", "field", Some("name: String"), "h1")];
-        let new = vec![make_sym("f.rs::Config::name", Some("name: &str"), "h2")];
+        let new = vec![Symbol {
+            fqn: "f.rs::Config::name".into(),
+            name: "name".into(),
+            kind: SymbolKind::Field,
+            start_line: 2,
+            end_line: 2,
+            signature: Some("name: &str".into()),
+            docstring: None,
+            source_hash: "h2".into(),
+            parent_fqn: Some("f.rs::Config".into()),
+        }];
         let diff = compute("f.rs", &old, &new);
         assert_eq!(diff.signature_changed.len(), 1, "field type change must be signature_changed");
         assert!(diff.body_only.is_empty(), "must NOT be body_only");
