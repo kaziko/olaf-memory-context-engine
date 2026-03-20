@@ -176,6 +176,7 @@ mod tests {
             signature: sig.map(|s| s.to_string()),
             docstring: None,
             source_hash: hash.to_string(),
+            parent_fqn: None,
         }
     }
 
@@ -299,6 +300,7 @@ mod tests {
             signature: Some("fn()".into()),
             docstring: None,
             source_hash: "h2".into(),
+            parent_fqn: None,
         }];
         let diff = compute("f.rs", &old, &new_syms);
         assert!(diff.renamed.is_empty());
@@ -315,5 +317,25 @@ mod tests {
         assert!(diff.renamed.is_empty());
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.added.len(), 1);
+    }
+
+    // Story 15.1: enum variant payload change is structural
+    #[test]
+    fn enum_variant_payload_change_is_structural() {
+        let old = vec![make_snap("f.rs::Error::Db", "enum_variant", Some("Db(DbError)"), "h1")];
+        let new = vec![make_sym("f.rs::Error::Db", Some("Db(String)"), "h2")];
+        let diff = compute("f.rs", &old, &new);
+        assert_eq!(diff.signature_changed.len(), 1, "variant payload change must be signature_changed");
+        assert!(diff.body_only.is_empty(), "must NOT be body_only");
+    }
+
+    // Story 15.1: struct field type change is structural
+    #[test]
+    fn struct_field_type_change_is_structural() {
+        let old = vec![make_snap("f.rs::Config::name", "field", Some("name: String"), "h1")];
+        let new = vec![make_sym("f.rs::Config::name", Some("name: &str"), "h2")];
+        let diff = compute("f.rs", &old, &new);
+        assert_eq!(diff.signature_changed.len(), 1, "field type change must be signature_changed");
+        assert!(diff.body_only.is_empty(), "must NOT be body_only");
     }
 }

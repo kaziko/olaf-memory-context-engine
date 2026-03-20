@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_fqn, make_symbol};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, extract_signature, make_child_symbol, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -58,6 +58,7 @@ fn extract_nodes(
                     source_hash: blake3::hash(&source[node.start_byte()..node.end_byte()])
                         .to_hex()
                         .to_string(),
+                    parent_fqn: None,
                 });
             }
 
@@ -155,6 +156,24 @@ fn extract_nodes(
                             edges,
                         )?;
                     }
+                }
+            }
+        }
+        "property_declaration" => {
+            // Class property — extract as Field child
+            if let Some(parent) = parent_class {
+                // property_declaration can have multiple property_element children
+                let mut walker = node.walk();
+                for child in node.children(&mut walker) {
+                    if child.kind() == "property_element"
+                        && let Some(var) = child.child(0)
+                            && var.kind() == "variable_name" {
+                                let prop_name = var.utf8_text(source)?.trim_start_matches('$');
+                                symbols.push(make_child_symbol(
+                                    relative_path, parent, prop_name,
+                                    SymbolKind::Field, child, source,
+                                ));
+                            }
                 }
             }
         }

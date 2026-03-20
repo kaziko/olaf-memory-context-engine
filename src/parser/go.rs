@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_fqn, make_symbol};
+use super::symbols::{Edge, EdgeKind, ParserError, Symbol, SymbolKind, make_child_symbol, make_fqn, make_symbol};
 
 pub(crate) fn parse(
     relative_path: &str,
@@ -320,6 +320,47 @@ fn extract_type_spec(
     };
 
     symbols.push(make_symbol(relative_path, None, name, kind, node, source));
+
+    // Extract children from struct fields and interface method specs
+    if let Some(type_node) = node.child_by_field_name("type") {
+        match type_node.kind() {
+            "struct_type" => {
+                // struct_type has field_declaration_list as an unnamed child (no field name)
+                let field_list = (0..type_node.child_count())
+                    .filter_map(|i| type_node.child(i))
+                    .find(|c| c.kind() == "field_declaration_list");
+                if let Some(field_list) = field_list {
+                    let mut walker = field_list.walk();
+                    for child in field_list.children(&mut walker) {
+                        if child.kind() == "field_declaration"
+                            && let Some(field_name_node) = child.child_by_field_name("name") {
+                                let field_name = field_name_node.utf8_text(source)?;
+                                symbols.push(make_child_symbol(
+                                    relative_path, name, field_name,
+                                    SymbolKind::Field, child, source,
+                                ));
+                            }
+                    }
+                }
+            }
+            "interface_type" => {
+                // Extract method elements from interface body
+                let mut walker = type_node.walk();
+                for child in type_node.children(&mut walker) {
+                    if child.kind() == "method_elem"
+                        && let Some(method_name) = child.child_by_field_name("name") {
+                            let mname = method_name.utf8_text(source)?;
+                            symbols.push(make_child_symbol(
+                                relative_path, name, mname,
+                                SymbolKind::TraitMethod, child, source,
+                            ));
+                        }
+                }
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -648,6 +689,18 @@ func Env(key string) string {
             has_edge(&edges, "main.go::Listen", "Event", EdgeKind::UsesType),
             "channel param type should produce uses_type edge; edges: {edges:?}"
         );
+    }
+
+    #[test]
+    fn test_interface_method_elem_extraction() {
+        let src = b"package main\ntype Stringer interface {\n\tString() string\n}\n";
+        let (symbols, _) = parse("main.go", src).unwrap();
+        let fqns: Vec<&str> = symbols.iter().map(|s| s.fqn.as_str()).collect();
+        assert!(fqns.contains(&"main.go::Stringer"), "interface must be extracted");
+        assert!(fqns.contains(&"main.go::Stringer::String"), "interface method elem must be extracted");
+        let method = symbols.iter().find(|s| s.name == "String").unwrap();
+        assert_eq!(method.kind, SymbolKind::TraitMethod);
+        assert_eq!(method.parent_fqn.as_deref(), Some("main.go::Stringer"));
     }
 
     #[test]

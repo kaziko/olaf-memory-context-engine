@@ -38,7 +38,8 @@ mod tests {
              CREATE TABLE symbols (
                  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, fqn TEXT NOT NULL,
                  name TEXT NOT NULL, kind TEXT, start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT
+                 end_line INTEGER NOT NULL, signature TEXT, docstring TEXT, source_hash TEXT,
+                 parent_id INTEGER DEFAULT NULL
              );
              CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, kind TEXT);",
         ).unwrap();
@@ -50,7 +51,7 @@ mod tests {
     fn skeletonize_symbol_with_no_edges() {
         let conn = setup_skeleton_db();
         conn.execute(
-            "INSERT INTO symbols VALUES (1, 1, 'lib::Foo', 'Foo', 'struct', 1, 10, 'pub struct Foo', 'A foo struct', NULL)",
+            "INSERT INTO symbols VALUES (1, 1, 'lib::Foo', 'Foo', 'struct', 1, 10, 'pub struct Foo', 'A foo struct', NULL, NULL)",
             [],
         ).unwrap();
         let result = skeletonize(&conn, 1).unwrap();
@@ -64,7 +65,7 @@ mod tests {
     fn skeletonize_symbol_with_only_docstring_no_signature() {
         let conn = setup_skeleton_db();
         conn.execute(
-            "INSERT INTO symbols VALUES (1, 1, 'lib::Bar', 'Bar', 'function', 5, 15, NULL, 'Does something important', NULL)",
+            "INSERT INTO symbols VALUES (1, 1, 'lib::Bar', 'Bar', 'function', 5, 15, NULL, 'Does something important', NULL, NULL)",
             [],
         ).unwrap();
         let result = skeletonize(&conn, 1).unwrap();
