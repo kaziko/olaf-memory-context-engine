@@ -300,6 +300,116 @@ pub fn get_observations_by_ids(
     rows.collect::<Result<Vec<_>, _>>().map_err(super::store::StoreError::Sqlite)
 }
 
+// ── Symbol embedding helpers ──
+
+/// Build the canonical text for a symbol to embed.
+/// Concatenates `"{fqn} {name} {signature} {docstring}"`, trimmed.
+/// Returns `None` if all of name, signature, and docstring are empty
+/// (fqn-only symbols have no meaningful semantic content).
+pub fn symbol_canonical_text(
+    fqn: &str,
+    name: &str,
+    signature: &str,
+    docstring: &str,
+) -> Option<String> {
+    if name.is_empty() && signature.is_empty() && docstring.is_empty() {
+        return None;
+    }
+    let text = format!("{} {} {} {}", fqn, name, signature, docstring);
+    Some(text.trim().to_string())
+}
+
+/// Get symbol IDs that don't yet have an embedding for the given model version.
+#[allow(dead_code)] // Used by CLI embed command (cfg-gated)
+pub fn get_unembedded_symbol_ids(
+    conn: &rusqlite::Connection,
+    model_id: &str,
+    model_rev: &str,
+) -> Result<Vec<i64>, super::store::StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id FROM symbols s
+         LEFT JOIN symbol_embeddings e
+           ON s.id = e.symbol_id AND e.model_id = ?1 AND e.model_rev = ?2
+         WHERE e.symbol_id IS NULL
+         ORDER BY s.id",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![model_id, model_rev], |row| row.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
+/// Store an embedding for a symbol (upsert).
+#[allow(dead_code)] // Used by CLI embed command (cfg-gated)
+pub fn store_symbol_embedding(
+    conn: &rusqlite::Connection,
+    symbol_id: i64,
+    model_id: &str,
+    model_rev: &str,
+    dims: i32,
+    embedding: &[f32],
+) -> Result<(), super::store::StoreError> {
+    let blob = embedding_to_blob(embedding);
+    conn.execute(
+        "INSERT OR REPLACE INTO symbol_embeddings (symbol_id, model_id, model_rev, dims, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
+        rusqlite::params![symbol_id, model_id, model_rev, dims, blob],
+    )?;
+    Ok(())
+}
+
+/// Bulk-load embeddings for a set of symbol IDs, filtered by model_id + model_rev.
+/// Batches into chunks of 999 to respect SQLite's variable limit.
+pub fn load_symbol_embeddings_for_ids(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+    model_id: &str,
+    model_rev: &str,
+) -> Result<HashMap<i64, Vec<f32>>, super::store::StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut result = HashMap::new();
+    // Chunk at 997 to stay within SQLite's 999 bind-variable limit.
+    // Each chunk also binds model_id (?1) and model_rev (?2), so max = 997 + 2 = 999.
+    for chunk in ids.chunks(997) {
+        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 3)).collect();
+        let sql = format!(
+            "SELECT symbol_id, embedding FROM symbol_embeddings
+             WHERE model_id = ?1 AND model_rev = ?2 AND symbol_id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(model_id.to_string()));
+        params.push(Box::new(model_rev.to_string()));
+        for id in chunk {
+            params.push(Box::new(*id));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let sym_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((sym_id, blob))
+        })?;
+        for row in rows {
+            let (sym_id, blob) = row?;
+            result.insert(sym_id, blob_to_embedding(&blob));
+        }
+    }
+    Ok(result)
+}
+
+/// Delete all symbol embeddings (used by `olaf embed --rebuild`).
+#[allow(dead_code)] // Used by CLI embed command (cfg-gated)
+pub fn delete_all_symbol_embeddings(
+    conn: &rusqlite::Connection,
+) -> Result<usize, super::store::StoreError> {
+    let count = conn.execute("DELETE FROM symbol_embeddings", [])?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

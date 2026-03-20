@@ -349,3 +349,140 @@ fn embed_full_pipeline_deterministic() {
     let after_rebuild = get_unembedded_observation_ids(&conn, model_id, model_rev).unwrap();
     assert_eq!(after_rebuild.len(), 2, "rebuild should re-expose all");
 }
+
+/// Exercises the full symbol embed pipeline (query unembedded → canonical text → store → load)
+/// using deterministic test vectors — no ONNX runtime or network needed.
+#[test]
+fn symbol_embed_full_pipeline_deterministic() {
+    use olaf::memory::embedder::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}").unwrap();
+
+    #[allow(deprecated)]
+    Command::cargo_bin("olaf").unwrap()
+        .current_dir(dir.path()).arg("init").output().unwrap();
+    #[allow(deprecated)]
+    Command::cargo_bin("olaf").unwrap()
+        .current_dir(dir.path()).arg("index").output().unwrap();
+
+    let db_path = dir.path().join(".olaf/index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let model_id = "test-model";
+    let model_rev = "v1";
+    let dims: i32 = 4;
+
+    // Verify symbols were indexed
+    let sym_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap();
+    assert!(sym_count >= 1, "indexing should produce at least one symbol");
+
+    // Step 1: All symbols are initially unembedded
+    let unembedded = get_unembedded_symbol_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(unembedded.len() as i64, sym_count);
+
+    // Step 2: Store a deterministic embedding for each symbol
+    let dummy_embedding = vec![0.5f32, 0.5, 0.5, 0.5];
+    for &sym_id in &unembedded {
+        store_symbol_embedding(&conn, sym_id, model_id, model_rev, dims, &dummy_embedding).unwrap();
+    }
+
+    // Step 3: All symbols now have embeddings — query returns empty
+    let still_unembedded = get_unembedded_symbol_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(still_unembedded.len(), 0, "all symbols should be embedded now");
+
+    // Step 4: Load and verify round-trip
+    let loaded = load_symbol_embeddings_for_ids(&conn, &unembedded, model_id, model_rev).unwrap();
+    assert_eq!(loaded.len(), unembedded.len());
+    for &sym_id in &unembedded {
+        assert_eq!(loaded[&sym_id], dummy_embedding, "loaded embedding must match stored");
+    }
+
+    // Step 5: Wrong model_rev returns empty
+    let wrong_rev = load_symbol_embeddings_for_ids(&conn, &unembedded, model_id, "v99").unwrap();
+    assert!(wrong_rev.is_empty(), "wrong model_rev should return empty");
+
+    // Step 6: delete_all_symbol_embeddings clears everything and re-exposes symbols
+    let deleted = delete_all_symbol_embeddings(&conn).unwrap();
+    assert_eq!(deleted as i64, sym_count);
+
+    let after_clear = get_unembedded_symbol_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(after_clear.len() as i64, sym_count, "clear should re-expose all symbols");
+
+    // Step 7: Idempotency — storing the same embedding twice doesn't duplicate rows
+    store_symbol_embedding(&conn, unembedded[0], model_id, model_rev, dims, &dummy_embedding).unwrap();
+    store_symbol_embedding(&conn, unembedded[0], model_id, model_rev, dims, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+    let row_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbol_embeddings WHERE symbol_id = ?1",
+        rusqlite::params![unembedded[0]],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(row_count, 1, "INSERT OR REPLACE must not duplicate rows");
+
+    // Step 8: Verify the FTS5 index is populated (prerequisite for retrieval).
+    // rank_symbols_by_keywords and FakeEmbedder are pub(crate) and not accessible here.
+    // The three-signal retrieval path is covered by rrf_three_signal_with_embeddings
+    // in graph/query.rs which can use FakeEmbedder directly.
+    let fts_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0),
+    ).unwrap();
+    assert!(fts_count > 0, "FTS5 index must be populated for retrieval to work");
+    assert_eq!(fts_count, sym_count, "every symbol must have an FTS5 entry");
+}
+
+/// Regression test: symbol phase must run even when all observations are already embedded.
+///
+/// `olaf embed` had a bug where `if obs_total == 0 { return Ok(()); }` silently skipped
+/// the entire symbol phase. This test verifies the data contract: after pre-embedding all
+/// observations (obs_total = 0), symbols remain unembedded and are still processable.
+///
+/// Note: this exercises library functions rather than the CLI binary because `olaf embed`
+/// requires an ONNX runtime to load the model, making it unsuitable for CI. The CLI
+/// control flow itself is covered by code review; this test protects the underlying data
+/// layer that the CLI depends on.
+#[test]
+fn symbol_phase_data_contract_when_obs_already_embedded() {
+    use olaf::memory::embedder::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    // observations (from setup_project_with_observations) + a source file for symbols
+    setup_project_with_observations(dir.path());
+    fs::write(dir.path().join("lib.rs"), "pub fn process() {}\npub fn handle() {}").unwrap();
+
+    #[allow(deprecated)]
+    Command::cargo_bin("olaf").unwrap()
+        .current_dir(dir.path()).arg("index").output().unwrap();
+
+    let db_path = dir.path().join(".olaf/index.db");
+    let conn = olaf::db::open(&db_path).unwrap();
+
+    let model_id = "test-model";
+    let model_rev = "v1";
+    let dims = 4i32;
+    let dummy = vec![0.5f32, 0.5, 0.5, 0.5];
+
+    // Pre-embed ALL observations — this is the state that triggered the early-return bug.
+    let obs_ids = get_unembedded_observation_ids(&conn, model_id, model_rev).unwrap();
+    assert!(!obs_ids.is_empty(), "setup should produce embeddable observations");
+    for id in &obs_ids {
+        store_embedding(&conn, *id, model_id, model_rev, dims, &dummy).unwrap();
+    }
+    let remaining_obs = get_unembedded_observation_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(remaining_obs.len(), 0, "all observations must be pre-embedded");
+
+    // With obs_total = 0, the symbol phase must still see unembedded symbols.
+    let unembedded_syms = get_unembedded_symbol_ids(&conn, model_id, model_rev).unwrap();
+    assert!(!unembedded_syms.is_empty(), "symbols must be unembedded after obs phase completes");
+
+    // Run the symbol phase (the library calls that `olaf embed` would make).
+    for &sym_id in &unembedded_syms {
+        store_symbol_embedding(&conn, sym_id, model_id, model_rev, dims, &dummy).unwrap();
+    }
+
+    let after = get_unembedded_symbol_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(after.len(), 0, "symbol phase must embed all symbols");
+
+    // Sanity: observation embeddings are still intact.
+    let obs_after = get_unembedded_observation_ids(&conn, model_id, model_rev).unwrap();
+    assert_eq!(obs_after.len(), 0, "obs embeddings must not be disturbed by symbol phase");
+}

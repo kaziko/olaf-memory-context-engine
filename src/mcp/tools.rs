@@ -712,10 +712,10 @@ fn handle_analyze_failure(
     let mut output = String::new();
 
     let retrieval_notes;
+    let intent = format!("fix error: {}", extraction.error_summary);
 
     if !allowed_pivot_fqns.is_empty() {
         // Path A: Pivots resolved from trace (CallerSupplied — FQNs from stack-trace resolution)
-        let intent = format!("fix error: {}", extraction.error_summary);
         let (brief, notes) = crate::graph::query::get_context_with_pivots(
             conn, project_root, &intent, &allowed_pivot_fqns, token_budget, branch.as_deref(), &content_policy
         ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
@@ -742,17 +742,19 @@ fn handle_analyze_failure(
             .take(10)
             .collect();
 
+        // Create embedder once; reused for both keyword ranking and context building.
+        let embedder = crate::graph::query::create_embedder(project_root);
         let mut keyword_pivots = Vec::new();
         if !keywords.is_empty() {
-            keyword_pivots = crate::graph::query::rank_symbols_by_keywords(conn, &keywords, 5)
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!("keyword search failed: {e}")))?;
+            keyword_pivots = crate::graph::query::rank_symbols_by_keywords(
+                conn, &keywords, 5, embedder.as_deref(), Some(intent.as_str()),
+            ).map_err(|e| ToolError::Internal(anyhow::anyhow!("keyword search failed: {e}")))?;
         }
 
         if !keyword_pivots.is_empty() {
             // Path B: keywords matched symbols — pass PivotScores directly to preserve kw/deg scores
-            let intent = format!("fix error: {}", extraction.error_summary);
             let (brief, notes) = crate::graph::query::get_context_from_pivot_scores(
-                conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref(), &content_policy
+                conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref(), &content_policy, embedder.as_deref()
             ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
             retrieval_notes = notes;
 
