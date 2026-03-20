@@ -336,9 +336,21 @@ const MIGRATION_014: &str = "
 ALTER TABLE symbols ADD COLUMN centrality REAL NOT NULL DEFAULT 0.0;
 ";
 
+const MIGRATION_015: &str = "
+CREATE TABLE symbol_embeddings (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    model_rev TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_sym_embeddings_model ON symbol_embeddings(model_id, model_rev);
+";
+
 /// Number of schema migrations. Used by `workspace doctor` to compare remote DB versions.
 /// Update this when adding new migrations.
-pub const MIGRATION_COUNT: i64 = 14;
+pub const MIGRATION_COUNT: i64 = 15;
 
 /// Backfill `name_tokens` for symbols that still have the default empty value.
 /// Each UPDATE fires the `symbols_fts_au` trigger, populating the FTS index incrementally.
@@ -400,7 +412,8 @@ fn apply_migrations(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
         M::up(MIGRATION_012),
         M::up(MIGRATION_013),
         M::up(MIGRATION_014),
-        // Future migrations: append M::up(MIGRATION_015), etc. — never edit existing entries
+        M::up(MIGRATION_015),
+        // Future migrations: append M::up(MIGRATION_016), etc. — never edit existing entries
         // Also update MIGRATION_COUNT above.
     ]);
     migrations.to_latest(conn)?;

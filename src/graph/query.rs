@@ -342,7 +342,7 @@ impl std::fmt::Display for MatchClass {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SelectionReason {
-    Keyword { match_class: MatchClass, bm25_rank: usize, centrality_rank: usize, rrf_score: f64, bm25_score: f64 },
+    Keyword { match_class: MatchClass, bm25_rank: usize, centrality_rank: usize, rrf_score: f64, bm25_score: f64, embedding_rank: Option<usize> },
     FileHint { hint: String },
     CallerSupplied,
     Fallback,
@@ -382,6 +382,10 @@ const BM25_DOC_WEIGHT: f64 = 1.0;
 /// RRF fusion constant. Standard value from the original RRF paper (Cormack et al. 2009).
 /// Higher k reduces the influence of rank position differences.
 const RRF_K: f64 = 60.0;
+/// Minimum fraction of the FTS5 pool that must have stored embeddings before the
+/// embedding signal is included in RRF fusion. Below this threshold, the sparse
+/// coverage would bias ranking toward the few symbols that happen to be embedded.
+const EMBEDDING_COVERAGE_MIN: f64 = 0.5;
 
 /// Classify a FTS5 hit into a MatchClass by comparing query terms against
 /// the symbol's name, name_tokens, and fqn (all already fetched from the join).
@@ -414,6 +418,8 @@ pub(crate) fn rank_symbols_by_keywords(
     conn: &Connection,
     keywords: &[String],
     limit: usize,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
+    intent_query: Option<&str>,
 ) -> Result<Vec<PivotScore>, QueryError> {
     if limit == 0 || keywords.is_empty() {
         return Ok(Vec::new());
@@ -476,6 +482,7 @@ pub(crate) fn rank_symbols_by_keywords(
         centrality: f64,
         bm25_rank: usize,
         centrality_rank: usize,
+        embedding_rank: Option<usize>,
         rrf_score: f64,
     }
     let mut pool: Vec<PoolEntry> = rowids
@@ -483,7 +490,7 @@ pub(crate) fn rank_symbols_by_keywords(
         .map(|&id| {
             let bm25 = bm25_map.get(&id).copied().unwrap_or(0.0);
             let centrality = symbol_map.get(&id).map(|s| s.3).unwrap_or(0.0);
-            PoolEntry { id, bm25_score: bm25, centrality, bm25_rank: 0, centrality_rank: 0, rrf_score: 0.0 }
+            PoolEntry { id, bm25_score: bm25, centrality, bm25_rank: 0, centrality_rank: 0, embedding_rank: None, rrf_score: 0.0 }
         })
         .collect();
 
@@ -520,10 +527,70 @@ pub(crate) fn rank_symbols_by_keywords(
         }
     }
 
-    // RRF fusion
+    // Embedding signal: compute cosine similarity for FTS5 pool if embedder is available.
+    // Uses the same shared-pool design as centrality: scores only the FTS5 match pool,
+    // not the full symbol table. Gracefully degrades to two-signal RRF if unavailable.
+    if let (Some(emb), Some(query)) = (embedder, intent_query) {
+        'embedding: {
+            let query_vec = match emb.embed_query(query) {
+                Ok(v) => v,
+                Err(_) => break 'embedding,
+            };
+            let pool_ids: Vec<i64> = pool.iter().map(|e| e.id).collect();
+            let stored = match crate::memory::embedder::load_symbol_embeddings_for_ids(
+                conn, &pool_ids, emb.model_id(), emb.model_rev(),
+            ) {
+                Ok(m) => m,
+                Err(_) => break 'embedding,
+            };
+
+            // Coverage check: skip embedding signal when too few pool members have embeddings.
+            if (stored.len() as f64) < pool.len() as f64 * EMBEDDING_COVERAGE_MIN {
+                break 'embedding;
+            }
+
+            // Compute similarity scores; entries without embeddings get pool_size + 1 (worst rank).
+            let pool_size = pool.len();
+            struct SimilarityEntry { pool_idx: usize, similarity: f32 }
+            let mut sim_entries: Vec<SimilarityEntry> = pool.iter().enumerate().map(|(i, e)| {
+                let similarity = stored.get(&e.id)
+                    .map(|emb_vec| crate::memory::embedder::cosine_similarity(&query_vec, emb_vec))
+                    .unwrap_or(f32::NEG_INFINITY);
+                SimilarityEntry { pool_idx: i, similarity }
+            }).collect();
+
+            // Sort by similarity DESC, bm25_rank ASC (tiebreaker preserves BM25 order).
+            sim_entries.sort_by(|a, b| {
+                b.similarity.partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(pool[a.pool_idx].bm25_rank.cmp(&pool[b.pool_idx].bm25_rank))
+            });
+
+            // Dense embedding ranking: equal similarity → same rank.
+            // Entries with no stored embedding (NEG_INFINITY) all get pool_size + 1.
+            let mut emb_rank = 1usize;
+            let mut prev_sim = sim_entries[0].similarity;
+            for se in &sim_entries {
+                if se.similarity == f32::NEG_INFINITY {
+                    pool[se.pool_idx].embedding_rank = Some(pool_size + 1);
+                    continue;
+                }
+                if (se.similarity - prev_sim).abs() > f32::EPSILON {
+                    emb_rank += 1;
+                    prev_sim = se.similarity;
+                }
+                pool[se.pool_idx].embedding_rank = Some(emb_rank);
+            }
+        }
+    }
+
+    // RRF fusion: three-signal if embedding ranks are available, two-signal otherwise.
     for entry in &mut pool {
         entry.rrf_score = 1.0 / (RRF_K + entry.bm25_rank as f64)
             + 1.0 / (RRF_K + entry.centrality_rank as f64);
+        if let Some(emb_rank) = entry.embedding_rank {
+            entry.rrf_score += 1.0 / (RRF_K + emb_rank as f64);
+        }
     }
 
     // Sort by RRF DESC, id ASC for determinism
@@ -552,6 +619,7 @@ pub(crate) fn rank_symbols_by_keywords(
                     centrality_rank: entry.centrality_rank,
                     rrf_score: entry.rrf_score,
                     bm25_score: entry.bm25_score,
+                    embedding_rank: entry.embedding_rank,
                 },
             })
         })
@@ -559,7 +627,13 @@ pub(crate) fn rank_symbols_by_keywords(
     Ok(result)
 }
 
-fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], pool_size: usize) -> Result<Vec<PivotScore>, QueryError> {
+fn find_pivot_symbols(
+    conn: &Connection,
+    intent: &str,
+    file_hints: &[String],
+    pool_size: usize,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
+) -> Result<Vec<PivotScore>, QueryError> {
     // --- File hints branch ---
     if !file_hints.is_empty() {
         let mut seen: HashSet<i64> = HashSet::new();
@@ -589,7 +663,7 @@ fn find_pivot_symbols(conn: &Connection, intent: &str, file_hints: &[String], po
     // --- Keyword branch: delegate to shared ranking function ---
     // Use min_len=2 for FTS5 to preserve short code tokens like "get", "pod"
     let keywords = normalize_query_terms_with_min(intent, 2);
-    let ranked = rank_symbols_by_keywords(conn, &keywords, pool_size)?;
+    let ranked = rank_symbols_by_keywords(conn, &keywords, pool_size, embedder, Some(intent))?;
 
     if !ranked.is_empty() {
         return Ok(ranked);
@@ -710,7 +784,7 @@ fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end
 
 /// Create an embedder for the given project root. Returns None without `embeddings` feature
 /// or on any initialization failure (including missing ONNX runtime).
-fn create_embedder(project_root: &Path) -> Option<Box<dyn crate::memory::embedder::EmbedText>> {
+pub(crate) fn create_embedder(project_root: &Path) -> Option<Box<dyn crate::memory::embedder::EmbedText>> {
     #[cfg(feature = "embeddings")]
     {
         let cache_dir = project_root.join(".olaf").join("models");
@@ -828,7 +902,10 @@ fn format_retrieval_notes(rendered_pivots: &[&PivotScore], intent_label: &str, o
     for ps in rendered_pivots {
         let short_name = ps.fqn.rsplit("::").next().unwrap_or(&ps.fqn);
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank} rrf={rrf_score:.4} bm25={bm25_score:.2}"),
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score, embedding_rank } => {
+                let emb = embedding_rank.map(|r| format!(" emb_r={r}")).unwrap_or_default();
+                format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank}{emb} rrf={rrf_score:.4} bm25={bm25_score:.2}")
+            }
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -860,7 +937,10 @@ fn format_retrieval_notes_multi(
             .unwrap_or("unknown");
         let strategy = if *is_local { "local-priority" } else { "remote-round-robin" };
         let score_str = match &ps.reason {
-            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank} rrf={rrf_score:.4} bm25={bm25_score:.2}"),
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score, embedding_rank } => {
+                let emb = embedding_rank.map(|r| format!(" emb_r={r}")).unwrap_or_default();
+                format!("{match_class} bm25_r={bm25_rank} cent_r={centrality_rank}{emb} rrf={rrf_score:.4} bm25={bm25_score:.2}")
+            }
             SelectionReason::FileHint { hint } => format!("file-hint \"{hint}\""),
             SelectionReason::CallerSupplied => "caller-supplied".to_string(),
             SelectionReason::Fallback => "fallback".to_string(),
@@ -930,6 +1010,7 @@ fn build_context_brief(
     intent_query: Option<&str>,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
 ) -> Result<(String, String), QueryError> {
     let mut output = intent_header.to_string();
 
@@ -1026,15 +1107,12 @@ fn build_context_brief(
     let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
     let anchored_memory_budget = memory_budget - project_sub_budget;
 
-    // Create embedder once for both anchored and project-scoped scoring
-    let embedder = create_embedder(project_root);
-    let embedder_ref = embedder.as_ref().map(|e| e.as_ref());
     let mut mem_section = String::new();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
-            embedder_ref,
+            embedder,
         )
         .unwrap_or_default();
 
@@ -1075,7 +1153,7 @@ fn build_context_brief(
         // When embeddings available, use semantic similarity for sort; else fall back to token count
         let semantic_sort = compute_project_semantic_scores(
             conn, &scored_project.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
-            intent_query, embedder_ref,
+            intent_query, embedder,
         );
         if let Some(ref sem) = semantic_sort {
             scored_project.sort_by(|a, b| {
@@ -1161,9 +1239,11 @@ pub(crate) fn get_context(
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    let mut pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size)?;
+    let embedder = create_embedder(project_root);
+    let embedder_ref = embedder.as_deref();
+    let mut pivot_scores = find_pivot_symbols(conn, intent, file_hints, policy.pivot_pool_size, embedder_ref)?;
     pivot_scores.retain(|ps| !content_policy.is_denied_by_fqn(&ps.fqn));
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy)
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy, embedder_ref)
 }
 
 /// Build a context brief directly from caller-provided `PivotScore` values, preserving their
@@ -1178,6 +1258,7 @@ pub(crate) fn get_context_from_pivot_scores(
     token_budget: usize,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
 ) -> Result<(String, String), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
@@ -1185,7 +1266,11 @@ pub(crate) fn get_context_from_pivot_scores(
     let filtered: Vec<PivotScore> = pivot_scores.into_iter()
         .filter(|ps| !content_policy.is_denied_by_fqn(&ps.fqn))
         .collect();
-    build_context_brief(conn, project_root, &intent_header, &filtered, &policy, token_budget, Some(intent), branch, content_policy)
+    // Use caller-provided embedder to avoid a second model init on the same request.
+    // Fall back to creating one if the caller had no embedder (e.g. non-keyword paths).
+    let owned = if embedder.is_none() { create_embedder(project_root) } else { None };
+    let emb_ref = embedder.or(owned.as_deref());
+    build_context_brief(conn, project_root, &intent_header, &filtered, &policy, token_budget, Some(intent), branch, content_policy, emb_ref)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1224,7 +1309,9 @@ pub(crate) fn get_context_with_pivots(
         return Ok((output, String::new()));
     }
 
-    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy)
+    let embedder = create_embedder(project_root);
+    let embedder_ref = embedder.as_deref();
+    build_context_brief(conn, project_root, &intent_header, &pivot_scores, &policy, token_budget, Some(intent), branch, content_policy, embedder_ref)
 }
 
 // --- Workspace-aware federated queries ---
@@ -1237,12 +1324,13 @@ pub(crate) fn find_pivot_symbols_multi(
     intent: &str,
     file_hints: &[String],
     pool_size: usize,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
 ) -> Result<Vec<TaggedPivotScore>, QueryError> {
     let members = workspace.all_read_conns();
     let mut per_member: Vec<(usize, Vec<PivotScore>)> = Vec::new();
 
     for m in &members {
-        let pivots = find_pivot_symbols(m.conn, intent, file_hints, pool_size)?;
+        let pivots = find_pivot_symbols(m.conn, intent, file_hints, pool_size, embedder)?;
         if !pivots.is_empty() {
             per_member.push((m.index, pivots));
         }
@@ -1324,6 +1412,7 @@ pub(crate) fn build_context_brief_multi(
     intent_query: Option<&str>,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
+    embedder: Option<&dyn crate::memory::embedder::EmbedText>,
 ) -> Result<(String, String), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
@@ -1444,15 +1533,12 @@ pub(crate) fn build_context_brief_multi(
     let project_sub_budget = std::cmp::min(memory_budget * 20 / 100, 200);
     let anchored_memory_budget = memory_budget - project_sub_budget;
 
-    // Create embedder once for both anchored and project-scoped scoring
-    let embedder = create_embedder(workspace.local_root());
-    let embedder_ref = embedder.as_ref().map(|e| e.as_ref());
     let mut mem_section = String::new();
 
     if !fqns.is_empty() || !file_paths.is_empty() {
         let scored = crate::memory::store::get_scored_observations_for_context(
             local_conn, &fqns, &file_paths, 50, intent_query, branch, content_policy,
-            embedder_ref,
+            embedder,
         )
         .unwrap_or_default();
 
@@ -1491,7 +1577,7 @@ pub(crate) fn build_context_brief_multi(
         // When embeddings available, use semantic similarity for sort; else fall back to token count
         let semantic_sort = compute_project_semantic_scores(
             local_conn, &scored_project.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
-            intent_query, embedder_ref,
+            intent_query, embedder,
         );
         if let Some(ref sem) = semantic_sort {
             scored_project.sort_by(|a, b| {
@@ -1577,9 +1663,11 @@ pub(crate) fn get_context_workspace(
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
-    let mut tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size)?;
+    let embedder = create_embedder(workspace.local_root());
+    let embedder_ref = embedder.as_deref();
+    let mut tagged_pivots = find_pivot_symbols_multi(workspace, intent, file_hints, policy.pivot_pool_size, embedder_ref)?;
     tagged_pivots.retain(|tp| !content_policy.is_denied_by_fqn(&tp.pivot.fqn));
-    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent), branch, content_policy)
+    build_context_brief_multi(workspace, &intent_header, &tagged_pivots, &policy, token_budget, Some(intent), branch, content_policy, embedder_ref)
 }
 
 /// Private helper: query candidate file paths from the files table.
@@ -1780,6 +1868,7 @@ pub(crate) fn get_impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embedder::EmbedText;
     use rusqlite::Connection;
 
     // ─── Story 13.3: tokenize_identifier / normalize_query_terms tests ──────
@@ -2003,7 +2092,15 @@ mod tests {
              CREATE TRIGGER symbols_fts_ad AFTER DELETE ON symbols BEGIN
                  INSERT INTO symbols_fts(symbols_fts, rowid, name_tokens, fqn, signature, docstring)
                  VALUES('delete', old.id, old.name_tokens, old.fqn, old.signature, old.docstring);
-             END;",
+             END;
+             CREATE TABLE symbol_embeddings (
+                 symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+                 model_id TEXT NOT NULL,
+                 model_rev TEXT NOT NULL,
+                 dims INTEGER NOT NULL,
+                 embedding BLOB NOT NULL,
+                 created_at INTEGER NOT NULL
+             );",
         ).unwrap();
         conn
     }
@@ -2464,7 +2561,7 @@ mod tests {
             conn.execute(&format!("INSERT INTO edges VALUES ({i},{i},2,'calls')"), []).unwrap();
         }
 
-        let result = find_pivot_symbols(&conn, "pipeline", &[], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "pipeline", &[], 5, None).unwrap();
         assert!(!result.is_empty(), "must return results");
         // Both symbols must be in the results
         assert!(result.iter().any(|p| p.id == 1), "pipeline must appear");
@@ -2484,7 +2581,7 @@ mod tests {
             conn.execute(&format!("INSERT INTO edges VALUES ({i},{i},2,'calls')"), []).unwrap();
         }
 
-        let result = find_pivot_symbols(&conn, "processor data", &[], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "processor data", &[], 5, None).unwrap();
         assert_eq!(result.len(), 2, "both processor symbols must be returned");
         // "processor" exact match should be classified as Exact
         let p = result.iter().find(|p| p.id == 1).unwrap();
@@ -2499,7 +2596,7 @@ mod tests {
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "auth::authenticate_handler", "handler", "fn", 1, 10, None, None, None);
 
-        let result = find_pivot_symbols(&conn, "authenticate users", &[], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "authenticate users", &[], 5, None).unwrap();
         let ids: Vec<i64> = result.iter().map(|ps| ps.id).collect();
         assert!(ids.contains(&1), "symbol must be found via FQN LIKE match on 'authenticate'");
     }
@@ -2513,7 +2610,7 @@ mod tests {
         insert_sym(&conn, 1, 1, "pkg::hint_sym", "hint_sym", "fn", 1, 10, None, None, None);
         insert_sym(&conn, 2, 2, "pkg::other_sym", "other_sym", "fn", 1, 10, None, None, None);
 
-        let result = find_pivot_symbols(&conn, "other build context", &["specific_file.rs".to_string()], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "other build context", &["specific_file.rs".to_string()], 5, None).unwrap();
         let ids: Vec<i64> = result.iter().map(|ps| ps.id).collect();
         assert!(ids.contains(&1), "symbol from hinted file must be present");
         assert!(!ids.contains(&2), "symbol from non-hinted file must be absent when file hints are given");
@@ -2529,8 +2626,8 @@ mod tests {
         insert_sym(&conn, 1, 1, "pkg::builder", "builder", "fn", 1, 10, None, None, None);
         insert_sym(&conn, 3, 1, "pkg::debug_build", "debug_build", "fn", 11, 20, None, None, None);
 
-        let result_single = find_pivot_symbols(&conn, "build", &[], 5).unwrap();
-        let result_triple = find_pivot_symbols(&conn, "Build BUILD build", &[], 5).unwrap();
+        let result_single = find_pivot_symbols(&conn, "build", &[], 5, None).unwrap();
+        let result_triple = find_pivot_symbols(&conn, "Build BUILD build", &[], 5, None).unwrap();
 
         let ids_single: Vec<i64> = result_single.iter().map(|ps| ps.id).collect();
         let ids_triple: Vec<i64> = result_triple.iter().map(|ps| ps.id).collect();
@@ -2549,7 +2646,7 @@ mod tests {
         insert_sym(&conn, 10, 1, "pkg::context_a", "context_a", "fn", 11, 20, None, None, None);
         insert_sym(&conn, 20, 1, "pkg::context_b", "context_b", "fn", 21, 30, None, None, None);
 
-        let result = find_pivot_symbols(&conn, "context data", &[], 10).unwrap();
+        let result = find_pivot_symbols(&conn, "context data", &[], 10, None).unwrap();
         let ctx_ids: Vec<i64> = result.iter().map(|ps| ps.id).filter(|&id| id == 10 || id == 20 || id == 30).collect();
         assert_eq!(ctx_ids, vec![10, 20, 30], "symbols with equal score must be ordered by id ASC");
     }
@@ -2702,8 +2799,8 @@ mod tests {
         conn.execute("UPDATE symbols SET centrality = 0.05 WHERE id = 2", []).unwrap();
 
         let keywords = vec!["auth".to_string()];
-        let rank_result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
-        let pivot_result = find_pivot_symbols(&conn, "auth", &[], 5).unwrap();
+        let rank_result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
+        let pivot_result = find_pivot_symbols(&conn, "auth", &[], 5, None).unwrap();
 
         assert_eq!(rank_result.len(), 2, "both symbols match 'auth'");
         assert_eq!(pivot_result.len(), 2, "find_pivot_symbols must also find both");
@@ -2717,7 +2814,7 @@ mod tests {
     fn rank_symbols_by_keywords_no_match_returns_empty() {
         let conn = build_test_db();
         let keywords = vec!["nonexistent_keyword_xyz".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert!(result.is_empty(), "no match must return empty vec (no first-in-DB fallback)");
     }
 
@@ -2727,7 +2824,7 @@ mod tests {
         conn.execute("INSERT INTO files VALUES (1,'src/a.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "src/a.rs::authentication", "authentication", "fn", 1, 10, None, None, None);
         let keywords = vec!["authentication".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 0).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 0, None, None).unwrap();
         assert!(result.is_empty(), "limit=0 must return empty vec without panicking or invalid SQL");
     }
 
@@ -2771,7 +2868,7 @@ mod tests {
         }
 
         let keywords = vec!["alpha".to_string(), "beta".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 10).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 10, None, None).unwrap();
         assert_eq!(result.len(), 5, "all 5 symbols must be returned");
 
         // All must have Keyword reason
@@ -2805,7 +2902,7 @@ mod tests {
         }
 
         let keywords = vec!["schedule".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
 
         // Symbol 9999 must appear and rank first (Exact match outranks Segment regardless of ID)
         assert!(result.iter().any(|p| p.id == 9999),
@@ -2840,7 +2937,7 @@ mod tests {
         }
 
         let keywords = vec!["scheduler".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert!(result.len() >= 3, "all three scheduler-matching symbols must be returned");
 
         // All three must appear with Keyword reason
@@ -2869,7 +2966,7 @@ mod tests {
         conn.execute("UPDATE symbols SET centrality = 0.05 WHERE id = 2", []).unwrap();
 
         let keywords = vec!["dispatch".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert_eq!(result.len(), 2);
 
         if let (
@@ -2900,7 +2997,7 @@ mod tests {
         insert_sym(&conn, 3, 1, "pkg::controller_helper", "controller_helper", "fn", 21, 30, None, None, None);
 
         let keywords = vec!["controller".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert!(result.len() >= 3);
         // With uniform centrality (0.0), all get centrality_rank=1.
         // RRF reduces to pure BM25 ordering.
@@ -2929,7 +3026,7 @@ mod tests {
         conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 3", []).unwrap();
 
         let keywords = vec!["controller".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert!(result.len() >= 2);
         // Exact match BM25 advantage should dominate moderate centrality difference
         assert_eq!(result[0].id, 1, "exact match must outrank segment match with moderate centrality");
@@ -2952,7 +3049,7 @@ mod tests {
         conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 3", []).unwrap();
 
         let keywords = vec!["alpha".to_string(), "beta".to_string()];
-        let result = rank_symbols_by_keywords(&conn, &keywords, 5).unwrap();
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
         assert!(result.len() >= 2);
         // BM25 strongly favors multi-term matches over single-term
         assert_eq!(result[0].id, 1, "multi-term match must outrank single-term with high centrality");
@@ -2966,7 +3063,7 @@ mod tests {
         conn.execute("INSERT INTO files VALUES (1,'f.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "pkg::handler", "handler", "fn", 1, 10, None, None, None);
 
-        let result = find_pivot_symbols(&conn, "handler request", &[], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "handler request", &[], 5, None).unwrap();
         assert!(!result.is_empty());
         assert!(matches!(result[0].reason, SelectionReason::Keyword { .. }), "keyword path must produce Keyword reason");
         if let SelectionReason::Keyword { bm25_rank, rrf_score, .. } = &result[0].reason {
@@ -2981,7 +3078,7 @@ mod tests {
         conn.execute("INSERT INTO files VALUES (1,'src/auth.rs','h')", []).unwrap();
         insert_sym(&conn, 1, 1, "auth::login", "login", "fn", 1, 10, None, None, None);
 
-        let result = find_pivot_symbols(&conn, "anything", &["auth.rs".to_string()], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "anything", &["auth.rs".to_string()], 5, None).unwrap();
         assert!(!result.is_empty());
         assert!(matches!(result[0].reason, SelectionReason::FileHint { .. }), "file-hint path must produce FileHint reason");
         if let SelectionReason::FileHint { hint } = &result[0].reason {
@@ -2996,7 +3093,7 @@ mod tests {
         insert_sym(&conn, 1, 1, "pkg::something", "something", "fn", 1, 10, None, None, None);
 
         // Use a keyword that won't match any symbol
-        let result = find_pivot_symbols(&conn, "zzzz_nomatch_zzzz", &[], 5).unwrap();
+        let result = find_pivot_symbols(&conn, "zzzz_nomatch_zzzz", &[], 5, None).unwrap();
         assert!(!result.is_empty(), "fallback must return at least one symbol");
         assert!(matches!(result[0].reason, SelectionReason::Fallback), "fallback path must produce Fallback reason");
     }
@@ -3148,6 +3245,180 @@ mod tests {
         assert!(!result.contains(".env"),
             "sensitive file path must not appear in output; got: {result}");
     }
+
+    // ─── Task 5.3-5.5: Embedding signal tests ────────────────────────────────
+
+    /// Helper: store an embedding blob into symbol_embeddings for tests.
+    fn insert_symbol_embedding(conn: &Connection, symbol_id: i64, embedding: &[f32]) {
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO symbol_embeddings (symbol_id, model_id, model_rev, dims, embedding, created_at)
+             VALUES (?1, 'fake-model', 'v1', ?2, ?3, 0)",
+            rusqlite::params![symbol_id, embedding.len() as i64, blob],
+        ).unwrap();
+    }
+
+    #[test]
+    fn rrf_three_signal_with_embeddings() {
+        // Three symbols with equal BM25 (all have "alpha" once in name, so same TF/IDF).
+        // sym2 has the highest centrality → wins two-signal RRF.
+        // sym1 gets the query vector stored as its embedding (cosine = 1.0, guaranteed rank 1).
+        // sym2 gets the negated query vector (cosine = -1.0, guaranteed worst rank).
+        // sym3 gets an orthogonal vector (cosine ≈ 0, middle rank).
+        // Expected: two-signal → sym2 first; three-signal → sym1 first.
+        // This proves the embedding signal actually changed the final ordering.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        // Single-word names so FTS5 tokenizes them as one token each.
+        // Keywords are the names themselves, so each keyword matches exactly one symbol.
+        // Equal document length → equal IDF → equal BM25 for all three.
+        insert_sym(&conn, 1, 1, "pkg::alpha", "alpha", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 1, "pkg::beta",  "beta",  "fn", 11, 20, None, None, None);
+        insert_sym(&conn, 3, 1, "pkg::gamma", "gamma", "fn", 21, 30, None, None, None);
+
+        // sym2 has the highest centrality → wins two-signal RRF
+        conn.execute("UPDATE symbols SET centrality = 0.001 WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE symbols SET centrality = 0.05  WHERE id = 2", []).unwrap();
+        conn.execute("UPDATE symbols SET centrality = 0.02  WHERE id = 3", []).unwrap();
+
+        let embedder = crate::memory::embedder::FakeEmbedder::new(4);
+        let query = "alpha task";
+        let query_vec = embedder.embed_query(query).unwrap();
+
+        // sym1: stores query vector → cosine 1.0 → embedding_rank 1 (best)
+        insert_symbol_embedding(&conn, 1, &query_vec);
+        // sym3: orthogonal vector → cosine ≈ 0.0 → embedding_rank 2 (middle)
+        // Rotating in the first two dims preserves unit length and guarantees low cosine.
+        let sym3_vec = vec![-query_vec[1], query_vec[0], query_vec[2], query_vec[3]];
+        insert_symbol_embedding(&conn, 3, &sym3_vec);
+        // sym2: negated query vector → cosine -1.0 → embedding_rank 3 (worst)
+        let sym2_neg: Vec<f32> = query_vec.iter().map(|x| -x).collect();
+        insert_symbol_embedding(&conn, 2, &sym2_neg);
+
+        // Each keyword matches exactly one symbol (OR query → all 3 in pool)
+        let keywords = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        // Two-signal: sym2 wins due to highest centrality
+        let two_sig = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
+        assert_eq!(two_sig.len(), 3);
+        assert_eq!(two_sig[0].fqn, "pkg::beta", "2-signal: sym2 first due to centrality");
+
+        // Three-signal: sym1 wins because embedding rank advantage overcomes centrality disadvantage.
+        // With k=60 and 3 symbols: sym1 gains 1/(60+1) vs sym2's 1/(60+3) in embedding (delta ~0.00052),
+        // which exceeds sym2's centrality gain of 1/(60+1) vs sym1's 1/(60+3) (delta ~0.00052).
+        // They tie on RRF score, resolved by id (sym1 id=1 < sym2 id=2) → sym1 wins.
+        let three_sig = rank_symbols_by_keywords(&conn, &keywords, 5, Some(&embedder), Some(query)).unwrap();
+        assert_eq!(three_sig.len(), 3);
+        assert_eq!(three_sig[0].fqn, "pkg::alpha", "3-signal: sym1 first due to embedding rank");
+        assert_ne!(two_sig[0].fqn, three_sig[0].fqn, "embedding signal must change the top result");
+
+        // All results must carry Some embedding_rank when embedder is provided
+        for ps in &three_sig {
+            if let SelectionReason::Keyword { embedding_rank, .. } = &ps.reason {
+                assert!(embedding_rank.is_some(), "embedding_rank must be Some when embedder provided");
+            } else {
+                panic!("expected Keyword reason, got {:?}", ps.reason);
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_graceful_without_embeddings() {
+        // With None embedder, all embedding_rank fields must be None and
+        // the two-signal RRF formula must hold exactly.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        insert_sym(&conn, 1, 1, "pkg::handler", "handler", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 1, "pkg::handle_request", "handle_request", "fn", 11, 20, None, None, None);
+
+        let keywords = vec!["handler".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, None, None).unwrap();
+
+        assert!(!result.is_empty(), "should return results");
+        for ps in &result {
+            if let SelectionReason::Keyword { embedding_rank, rrf_score, bm25_rank, centrality_rank, .. } = &ps.reason {
+                assert!(embedding_rank.is_none(), "embedding_rank must be None when embedder is None");
+                let expected = 1.0 / (60.0 + *bm25_rank as f64) + 1.0 / (60.0 + *centrality_rank as f64);
+                assert!((rrf_score - expected).abs() < 1e-10, "two-signal RRF formula must hold");
+            } else {
+                panic!("expected Keyword reason");
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_partial_embeddings_pool() {
+        // Pool of 3 symbols; only 2 have stored embeddings (>50% coverage threshold met).
+        // Symbol without embedding gets worst embedding rank = pool_size + 1.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        insert_sym(&conn, 1, 1, "pkg::alpha", "alpha", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 1, "pkg::beta", "beta", "fn", 11, 20, None, None, None);
+        insert_sym(&conn, 3, 1, "pkg::gamma", "gamma", "fn", 21, 30, None, None, None);
+
+        let embedder = crate::memory::embedder::FakeEmbedder::new(4);
+        let emb1 = embedder.embed_query("alpha signal").unwrap();
+        let emb2 = embedder.embed_query("beta signal").unwrap();
+        // Only sym1 and sym2 get embeddings; sym3 has no embedding stored
+        insert_symbol_embedding(&conn, 1, &emb1);
+        insert_symbol_embedding(&conn, 2, &emb2);
+
+        let keywords = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, Some(&embedder), Some("alpha beta gamma")).unwrap();
+
+        assert_eq!(result.len(), 3, "all three symbols should be returned");
+
+        // sym3 (no embedding) must have embedding_rank = Some(pool_size + 1) = Some(4)
+        let sym3 = result.iter().find(|p| p.fqn == "pkg::gamma").unwrap();
+        if let SelectionReason::Keyword { embedding_rank, .. } = &sym3.reason {
+            assert_eq!(*embedding_rank, Some(4), "no-embedding symbol gets pool_size + 1 rank");
+        }
+
+        // sym1 and sym2 must have Some(rank) in range [1, pool_size]
+        for fqn in ["pkg::alpha", "pkg::beta"] {
+            let ps = result.iter().find(|p| p.fqn == fqn).unwrap();
+            if let SelectionReason::Keyword { embedding_rank, .. } = &ps.reason {
+                let rank = embedding_rank.expect("sym with embedding must have Some rank");
+                assert!(rank < 4, "ranked symbol embedding_rank must be less than pool_size+1");
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_below_coverage_threshold_skips_embedding_signal() {
+        // Pool of 4 symbols; only 1 has a stored embedding (25% < EMBEDDING_COVERAGE_MIN).
+        // Embedding signal must be skipped entirely — all embedding_rank fields must be None.
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files VALUES (1,'a.rs','h')", []).unwrap();
+        insert_sym(&conn, 1, 1, "pkg::alpha", "alpha", "fn", 1, 10, None, None, None);
+        insert_sym(&conn, 2, 1, "pkg::beta", "beta", "fn", 11, 20, None, None, None);
+        insert_sym(&conn, 3, 1, "pkg::gamma", "gamma", "fn", 21, 30, None, None, None);
+        insert_sym(&conn, 4, 1, "pkg::delta", "delta", "fn", 31, 40, None, None, None);
+
+        let embedder = crate::memory::embedder::FakeEmbedder::new(4);
+        let emb1 = embedder.embed_query("alpha signal").unwrap();
+        // Only 1 of 4 symbols has an embedding (25% coverage)
+        insert_symbol_embedding(&conn, 1, &emb1);
+
+        let keywords = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(), "delta".to_string()];
+        let result = rank_symbols_by_keywords(&conn, &keywords, 5, Some(&embedder), Some("alpha beta gamma delta")).unwrap();
+
+        assert_eq!(result.len(), 4, "all four symbols should be returned");
+
+        // With coverage below threshold, embedding signal is skipped — pure two-signal RRF.
+        for ps in &result {
+            if let SelectionReason::Keyword { embedding_rank, rrf_score, bm25_rank, centrality_rank, .. } = &ps.reason {
+                assert!(embedding_rank.is_none(),
+                    "embedding_rank must be None when coverage < threshold; got {:?} for {}",
+                    embedding_rank, ps.fqn);
+                let expected = 1.0 / (RRF_K + *bm25_rank as f64) + 1.0 / (RRF_K + *centrality_rank as f64);
+                assert!((rrf_score - expected).abs() < 1e-10,
+                    "two-signal RRF formula must hold when embedding signal is skipped");
+            } else {
+                panic!("expected Keyword reason");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3275,8 +3546,9 @@ mod eval {
 
     fn format_reason(reason: &SelectionReason) -> String {
         match reason {
-            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score } => {
-                format!("Keyword({} bm25_r={} cent_r={} rrf={:.4} bm25={:.2})", match_class, bm25_rank, centrality_rank, rrf_score, bm25_score)
+            SelectionReason::Keyword { match_class, bm25_rank, centrality_rank, rrf_score, bm25_score, embedding_rank } => {
+                let emb = embedding_rank.map(|r| format!(" emb_r={r}")).unwrap_or_default();
+                format!("Keyword({} bm25_r={} cent_r={}{} rrf={:.4} bm25={:.2})", match_class, bm25_rank, centrality_rank, emb, rrf_score, bm25_score)
             }
             SelectionReason::FileHint { hint } => format!("FileHint({})", hint),
             SelectionReason::CallerSupplied => "CallerSupplied".to_string(),
@@ -3378,6 +3650,7 @@ mod eval {
                 &tc.intent,
                 &tc.file_hints,
                 policy.pivot_pool_size,
+                None,
             )
             .expect("find_pivot_symbols failed");
 
@@ -3709,4 +3982,5 @@ mod eval {
         assert!(result.contains("[project]") && result.contains("CI/CD pipeline"),
             "punctuation-heavy intents should match; got: {result}");
     }
+
 }
