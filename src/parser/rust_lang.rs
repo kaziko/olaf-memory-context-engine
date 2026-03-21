@@ -191,6 +191,15 @@ fn extract_nodes(
                                     ));
                                 }
                             }
+                            "const_item" => {
+                                if let Some(const_name_node) = child.child_by_field_name("name") {
+                                    let const_name = const_name_node.utf8_text(source)?;
+                                    symbols.push(make_child_symbol(
+                                        relative_path, name, const_name,
+                                        SymbolKind::Constant, child, source,
+                                    ));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -431,6 +440,21 @@ pub trait Handler {
         let assoc_types: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::AssociatedType).collect();
         assert_eq!(assoc_types.len(), 1);
         assert_eq!(assoc_types[0].name, "Output");
+    }
+
+    #[test]
+    fn trait_consts_extracted_as_children() {
+        let src = b"
+pub trait Limits {
+    const MIN: usize = 0;
+}
+";
+        let (symbols, _) = parse("test.rs", src).unwrap();
+
+        let constants: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::Constant).collect();
+        assert_eq!(constants.len(), 1);
+        assert_eq!(constants[0].name, "MIN");
+        assert_eq!(constants[0].parent_fqn.as_deref(), Some("test.rs::Limits"));
     }
 
     #[test]
