@@ -198,6 +198,19 @@ pub fn open(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
         std::fs::create_dir_all(parent)?;
     }
 
+    match open_and_migrate(db_path) {
+        Ok(conn) => Ok(conn),
+        Err(e) if is_corruption_error(&e) => {
+            // FTS5 or schema corruption surfaced during migration/backfill —
+            // same recovery as open_with_recovery: rename and rebuild from scratch
+            rename_corrupt_db(db_path)?;
+            open_and_migrate(db_path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn open_and_migrate(db_path: &Path) -> Result<rusqlite::Connection, DbError> {
     let mut conn = open_with_recovery(db_path)?;
 
     // WAL mode — improves crash resilience and allows concurrent reads during writes
@@ -264,25 +277,54 @@ fn handle_corruption_or_propagate(
     e: rusqlite::Error,
     db_path: &Path,
 ) -> Result<rusqlite::Connection, DbError> {
-    use rusqlite::ErrorCode;
-    match e.sqlite_error_code() {
-        Some(ErrorCode::NotADatabase) | Some(ErrorCode::DatabaseCorrupt) => {
-            // Rename corrupt file — preserve evidence, don't delete
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let backup = db_path.with_extension(format!("db.corrupt.{}", ts));
-            std::fs::rename(db_path, &backup)?;
-            eprintln!(
-                "warn: corrupt DB renamed to {:?} — rebuilding index",
-                backup
-            );
-            Ok(rusqlite::Connection::open(db_path)?)
-        }
+    if is_corruption_error_sqlite(&e) {
+        rename_corrupt_db(db_path)?;
+        Ok(rusqlite::Connection::open(db_path)?)
+    } else {
         // All other errors (permissions, path issues): propagate — do NOT silently recover
-        _ => Err(DbError::Sqlite(e)),
+        Err(DbError::Sqlite(e))
     }
+}
+
+/// Rename corrupt DB to `.corrupt.{timestamp}` and clean up WAL/SHM sidecar files.
+fn rename_corrupt_db(db_path: &Path) -> Result<(), std::io::Error> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup = db_path.with_extension(format!("db.corrupt.{}", ts));
+    std::fs::rename(db_path, &backup)?;
+    // Clean up WAL/SHM sidecar files — stale sidecars from a corrupt DB cause issues
+    for ext in &["db-wal", "db-shm"] {
+        let sidecar = db_path.with_extension(ext);
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+    eprintln!(
+        "warn: corrupt DB renamed to {:?} — rebuilding index",
+        backup
+    );
+    Ok(())
+}
+
+fn is_corruption_error(e: &DbError) -> bool {
+    match e {
+        DbError::Sqlite(e) => is_corruption_error_sqlite(e),
+        DbError::Migration(e) => {
+            // rusqlite_migration wraps rusqlite errors
+            format!("{e:?}").contains("malformed") || format!("{e:?}").contains("corrupt")
+        }
+        _ => false,
+    }
+}
+
+fn is_corruption_error_sqlite(e: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::NotADatabase) | Some(ErrorCode::DatabaseCorrupt)
+    )
 }
 
 const MIGRATION_010: &str = "

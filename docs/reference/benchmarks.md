@@ -98,9 +98,9 @@ Measured on **kubernetes/kubernetes** at commit `040ca596` using `get_brief` (wr
 
 ### Environment
 
-- CPU: Apple M4 Max (arm64)
-- RAM: 128 GB
-- OS: macOS Darwin 25.2.0
+- CPU: Apple M2 Max (arm64)
+- RAM: 32 GB
+- OS: macOS Tahoe 26.3.1
 - Build: `--release` profile
 - Olaf commit: `8b924f1`
 
