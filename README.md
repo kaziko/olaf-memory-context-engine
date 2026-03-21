@@ -10,7 +10,7 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 ### Features
 
-- **Multi-language indexing** — TypeScript, JavaScript, Python, Rust, PHP, Go
+- **Multi-language indexing** — TypeScript, JavaScript, Python, Rust, PHP, Go (with sub-declaration extraction: struct fields, enum variants, trait items, interface members, class fields)
 - **Intent-aware context** — classifies your task (bug-fix, refactor, implementation) and adjusts retrieval depth and direction
 - **Score-explainable retrieval** — every context brief includes a `## Retrieval Notes` section showing why each pivot symbol was selected (keyword scores, file hints, fallback) and a recency label on each memory observation
 - **Token-budgeted briefs** — context fits within your budget, not a dump of every file
@@ -36,23 +36,17 @@ Olaf also acts as **session memory** — it automatically records decisions, err
 
 ### How much does it save?
 
-**On a large codebase** — benchmarked on **kubernetes/kubernetes** (16,789 files, 302k symbols):
+Benchmarked on **kubernetes/kubernetes** (16,789 files, 398k symbols, 185k edges) — one of the largest Go codebases:
 
-| | Regular tools (Grep + Read) | Olaf | Savings |
+| Query type | Regular tools (Grep + Read) | Olaf (budget=4000) | Savings |
 |-|-|-|-|
-| Mean across 10 queries | ~11k tokens / 3-5 calls | ~1.2k tokens / 1 call | **78%** |
-| Best case (file hint) | ~37k tokens | ~67 tokens | **99.8%** |
+| Exact symbol lookup | ~13k tokens / 3-5 calls | ~2.9k tokens / 1 call | **78%** |
+| Module-level search | ~8k tokens / 3-5 calls | ~2.3k tokens / 1 call | **73%** |
+| Cross-module trace | ~22k tokens / 5-7 calls | ~2.8k tokens / 1 call | **87%** |
+| File-hint (37k file) | ~37k tokens / 1 call | ~589 tokens / 1 call | **98%** |
+| **Mean across 10 queries** | **~11k tokens** | **~2.2k tokens** | **67%** |
 
-**On a small codebase** — benchmarked on Olaf's own source (15 modules, ~5,500 lines):
-
-| | Regular tools (Grep + Read) | Olaf | Savings |
-|-|-|-|-|
-| Ranking algorithm | ~6,000 tokens / 5-7 calls | ~1,950 tokens / 1 call | **68%** |
-| Cross-module trace | ~5,550 tokens / 7 calls | ~1,800 tokens / 1 call | **68%** |
-
-One tool call instead of many. The gap widens on larger codebases where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
-
-**Note**: The external benchmark was run before Go edge extraction was added. Recall numbers reflect keyword-only retrieval — graph-assisted retrieval with 181k edges is expected to perform better. A re-run is planned.
+One tool call instead of many. Indexing the full kubernetes repo takes ~60 seconds. The gap widens on larger files where regular tools need even more rounds of searching. See the [full benchmark methodology](https://kaziko.github.io/olaf-memory-context-engine/reference/benchmarks/) for details.
 
 ## Install
 
@@ -101,7 +95,7 @@ This creates the `.olaf/` database, registers the MCP server in `.mcp.json`, ins
 - `get_brief` — start here. Context brief for any task with optional impact analysis
 - `get_context` — token-budgeted context retrieval (fine-grained control)
 - `get_impact` — find symbols that call, extend, or depend on a given symbol
-- `get_file_skeleton` — structure of a file (signatures, edges, no bodies)
+- `get_file_skeleton` — IDE-like outline of a file: signatures, edges, enum variants, struct fields, trait items nested under parents, impl methods grouped under their type
 - `analyze_failure` — parse a stack trace or error and get a context brief focused on the failure path
 
 **Session memory:**
