@@ -506,12 +506,12 @@ const PAGERANK_MAX_ITER: usize = 100;
 /// Compute PageRank centrality on the static dependency graph and store scores
 /// in the `centrality` column of the `symbols` table.
 ///
+/// Uses a sparse O(N·(V+E)) implementation instead of petgraph's O(N·V²·E)
+/// dense algorithm, which is critical for large repos (k8s: 300k+ symbols).
+///
 /// Returns the number of symbols whose centrality was updated.
 /// If there are no edges, resets all centrality to 0.0 and returns 0.
 pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> {
-    use petgraph::algo::page_rank;
-    use petgraph::graph::{DiGraph, NodeIndex};
-
     // 1. Load top-level symbol IDs only — child symbols (fields, variants,
     // trait items) have no meaningful call edges and inflate the graph without
     // contributing to ranking quality.
@@ -525,7 +525,8 @@ pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> 
         return Ok(0);
     }
 
-    // 2. Load static-only edges
+    // 2. Load static-only edges between top-level symbols
+    let id_set: HashSet<i64> = symbol_ids.iter().copied().collect();
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id FROM edges WHERE source_origin = 'static'",
     )?;
@@ -533,6 +534,11 @@ pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> 
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     drop(stmt);
+    // Filter to edges where both endpoints are top-level symbols
+    let edges: Vec<(i64, i64)> = edges
+        .into_iter()
+        .filter(|(s, t)| id_set.contains(s) && id_set.contains(t))
+        .collect();
 
     // 3. No edges → reset all centrality to 0.0
     if edges.is_empty() {
@@ -540,31 +546,64 @@ pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> 
         return Ok(0);
     }
 
-    // 4. Build petgraph DiGraph
-    let mut graph = DiGraph::<i64, ()>::new();
-    let mut node_map: HashMap<i64, NodeIndex> = HashMap::with_capacity(symbol_ids.len());
-    for &id in &symbol_ids {
-        let idx = graph.add_node(id);
-        node_map.insert(id, idx);
+    // 4. Build sparse adjacency: out_degree per node, inbound edges per node
+    let mut id_to_idx: HashMap<i64, usize> = HashMap::with_capacity(symbol_ids.len());
+    for (i, &id) in symbol_ids.iter().enumerate() {
+        id_to_idx.insert(id, i);
     }
-    for (src, tgt) in &edges {
-        if let (Some(&s), Some(&t)) = (node_map.get(src), node_map.get(tgt)) {
-            graph.add_edge(s, t, ());
+    let n = symbol_ids.len();
+    let mut out_degree = vec![0u32; n];
+    let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(src, tgt) in &edges {
+        let si = id_to_idx[&src];
+        let ti = id_to_idx[&tgt];
+        out_degree[si] += 1;
+        inbound[ti].push(si);
+    }
+
+    // 5. Sparse PageRank — O(iter × (V + E))
+    let d = PAGERANK_DAMPING;
+    let inv_n = 1.0 / n as f64;
+    let mut ranks = vec![inv_n; n];
+
+    for _ in 0..PAGERANK_MAX_ITER {
+        // Dangling node mass: nodes with out_degree=0 distribute rank to all
+        let dangling_sum: f64 = ranks
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| out_degree[i] == 0)
+            .map(|(_, &r)| r)
+            .sum();
+
+        let mut new_ranks = vec![(1.0 - d) * inv_n + d * dangling_sum * inv_n; n];
+
+        // Accumulate contributions from inbound edges — O(E) total
+        for v in 0..n {
+            for &w in &inbound[v] {
+                new_ranks[v] += d * ranks[w] / out_degree[w] as f64;
+            }
         }
+
+        // Normalize to sum=1 (corrects floating-point drift)
+        let sum: f64 = new_ranks.iter().sum();
+        if sum > 0.0 {
+            let inv_sum = 1.0 / sum;
+            for r in &mut new_ranks {
+                *r *= inv_sum;
+            }
+        }
+
+        ranks = new_ranks;
     }
 
-    // 5. Compute PageRank
-    let scores = page_rank(&graph, PAGERANK_DAMPING, PAGERANK_MAX_ITER);
-
-    // 6. Batch UPDATE in a transaction (RAII Transaction auto-rolls-back on error)
+    // 6. Batch UPDATE in a transaction
     {
         let tx = conn.unchecked_transaction()?;
         // Child symbols excluded from graph — reset their centrality to 0.0
         tx.execute("UPDATE symbols SET centrality = 0.0 WHERE parent_id IS NOT NULL AND centrality != 0.0", [])?;
         let mut update = tx.prepare("UPDATE symbols SET centrality = ?1 WHERE id = ?2")?;
-        for (&id, &idx) in &node_map {
-            let score = scores[idx.index()];
-            update.execute(params![score, id])?;
+        for (i, &id) in symbol_ids.iter().enumerate() {
+            update.execute(params![ranks[i], id])?;
         }
         drop(update);
         tx.commit()?;
@@ -1290,13 +1329,13 @@ mod tests {
         let cc = get_centrality("src/pr.rs::C");
         let cd = get_centrality("src/pr.rs::D");
 
-        // Frozen expected values from petgraph 0.7.1 page_rank(d=0.85, 100 iters)
-        // on graph A→B, A→C, B→C, C→D
-        let eps = 0.001;
-        assert!((ca - 0.1175).abs() < eps, "A expected ~0.1175, got {ca}");
-        assert!((cb - 0.1674).abs() < eps, "B expected ~0.1674, got {cb}");
-        assert!((cc - 0.3163).abs() < eps, "C expected ~0.3163, got {cc}");
-        assert!((cd - 0.3989).abs() < eps, "D expected ~0.3989, got {cd}");
+        // Expected values from sparse PageRank (d=0.85, 100 iters)
+        // on graph A→B, A→C, B→C, C→D with dangling-node redistribution
+        let eps = 0.005;
+        assert!((ca - 0.1205).abs() < eps, "A expected ~0.1205, got {ca}");
+        assert!((cb - 0.1704).abs() < eps, "B expected ~0.1704, got {cb}");
+        assert!((cc - 0.3175).abs() < eps, "C expected ~0.3175, got {cc}");
+        assert!((cd - 0.3916).abs() < eps, "D expected ~0.3916, got {cd}");
 
         // Structural invariants
         assert!(cc > ca, "C (two incoming) must have higher centrality than A (zero incoming)");

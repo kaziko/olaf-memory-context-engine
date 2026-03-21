@@ -39,7 +39,6 @@ ctrlc = "2"
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
-petgraph = "0.7"
 fastembed = { version = "4", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
 
 [features]
