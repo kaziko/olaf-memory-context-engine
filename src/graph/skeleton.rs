@@ -74,17 +74,16 @@ pub(crate) fn format_parent_with_children(
     for method in methods.iter().take(method_budget) {
         let is_redacted = method.signature.as_deref() == Some("[redacted by policy]");
         output.push_str(&format!("#### {}\n", nested_entry_title(method)));
-        if !is_redacted {
-            if let Some(edges) = deps_map.get(&method.id)
-                && !edges.is_empty()
-            {
-                let dep_line = edges
-                    .iter()
-                    .map(|(name, kind)| format!("{name} ({kind})"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                output.push_str(&format!("Dependencies: {dep_line}\n"));
-            }
+        if !is_redacted
+            && let Some(edges) = deps_map.get(&method.id)
+            && !edges.is_empty()
+        {
+            let dep_line = edges
+                .iter()
+                .map(|(name, kind)| format!("{name} ({kind})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!("Dependencies: {dep_line}\n"));
         }
         rendered += 1;
     }
