@@ -512,8 +512,10 @@ pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> 
     use petgraph::algo::page_rank;
     use petgraph::graph::{DiGraph, NodeIndex};
 
-    // 1. Load all symbol IDs
-    let mut stmt = conn.prepare("SELECT id FROM symbols")?;
+    // 1. Load top-level symbol IDs only — child symbols (fields, variants,
+    // trait items) have no meaningful call edges and inflate the graph without
+    // contributing to ranking quality.
+    let mut stmt = conn.prepare("SELECT id FROM symbols WHERE parent_id IS NULL")?;
     let symbol_ids: Vec<i64> = stmt
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
@@ -557,6 +559,8 @@ pub fn compute_and_store_centrality(conn: &Connection) -> anyhow::Result<usize> 
     // 6. Batch UPDATE in a transaction (RAII Transaction auto-rolls-back on error)
     {
         let tx = conn.unchecked_transaction()?;
+        // Child symbols excluded from graph — reset their centrality to 0.0
+        tx.execute("UPDATE symbols SET centrality = 0.0 WHERE parent_id IS NOT NULL AND centrality != 0.0", [])?;
         let mut update = tx.prepare("UPDATE symbols SET centrality = ?1 WHERE id = ?2")?;
         for (&id, &idx) in &node_map {
             let score = scores[idx.index()];
