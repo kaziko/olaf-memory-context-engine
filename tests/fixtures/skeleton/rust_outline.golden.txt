@@ -1,0 +1,38 @@
+# File Skeleton: src/rust_outline.rs
+
+### ToolError (`src/rust_outline.rs::ToolError`)
+File: `src/rust_outline.rs` lines 1-4
+Signature: `pub enum ToolError`
+#### Db(DbError)
+#### Parse(String)
+
+### Widget (`src/rust_outline.rs::Widget`)
+File: `src/rust_outline.rs` lines 6-9
+Signature: `pub struct Widget`
+#### pub name: String
+#### pub total: usize
+#### pub fn new(name: String) -> Self
+#### pub fn render(&self) -> String
+#### pub fn count(&self) -> usize
+#### fn render(&self) -> Self::Output
+#### fn reset(&mut self)
+#### fn from(value: T) -> Self
+
+### Render (`src/rust_outline.rs::Render`)
+File: `src/rust_outline.rs` lines 11-16
+Signature: `pub trait Render`
+#### type Output;
+#### const MIN: usize = 0;
+#### fn render(&self) -> Self::Output;
+#### fn reset(&mut self);
+
+### TupleWidget (`src/rust_outline.rs::TupleWidget`)
+File: `src/rust_outline.rs` lines 18-18
+
+### Marker (`src/rust_outline.rs::Marker`)
+File: `src/rust_outline.rs` lines 20-20
+
+### helper (`src/rust_outline.rs::helper`)
+File: `src/rust_outline.rs` lines 55-55
+Signature: `pub fn helper()`
+

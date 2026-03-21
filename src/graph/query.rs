@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::graph::skeleton::skeletonize;
+use crate::graph::skeleton::{
+    SkeletonSymbol, format_parent_with_children, format_standalone, skeletonize,
+};
 use crate::policy::ContentPolicy;
 use crate::sensitive::is_sensitive;
 use crate::workspace::Workspace;
@@ -433,8 +435,10 @@ pub(crate) fn rank_symbols_by_keywords(
     // FTS5 MATCH with BM25 ranking — 20x over-fetch for RRF fusion
     let over_fetch = (limit * 20).max(100) as i64;
     let mut fts_stmt = conn.prepare(
-        "SELECT rowid, bm25(symbols_fts, ?1, ?2, ?3, ?4) AS score
-         FROM symbols_fts WHERE symbols_fts MATCH ?5
+        "SELECT symbols_fts.rowid, bm25(symbols_fts, ?1, ?2, ?3, ?4) AS score
+         FROM symbols_fts
+         JOIN symbols s ON s.id = symbols_fts.rowid
+         WHERE symbols_fts MATCH ?5 AND s.parent_id IS NULL
          ORDER BY score LIMIT ?6",
     )?;
     let fts_rows: Vec<(i64, f64)> = fts_stmt
@@ -640,7 +644,8 @@ fn find_pivot_symbols(
         let mut result: Vec<PivotScore> = Vec::new();
         let mut hint_stmt = conn.prepare(
             "SELECT s.id, s.fqn FROM symbols s JOIN files f ON f.id=s.file_id
-             WHERE f.path LIKE ?1 ORDER BY (s.end_line-s.start_line) DESC LIMIT 10"
+             WHERE f.path LIKE ?1 AND s.parent_id IS NULL
+             ORDER BY (s.end_line-s.start_line) DESC LIMIT 10"
         )?;
         for hint in file_hints {
             let pattern = format!("%{hint}%");
@@ -770,6 +775,69 @@ fn load_symbol_row(conn: &Connection, symbol_id: i64) -> Result<Option<SymbolRow
         }),
     ).optional()?;
     Ok(row)
+}
+
+fn is_type_like_kind(kind: &str) -> bool {
+    matches!(kind, "struct" | "enum" | "trait" | "class" | "interface")
+}
+
+fn extract_method_group_key(symbol: &SkeletonSymbol) -> Option<String> {
+    // "function" included because tree-sitter emits Rust impl block items as
+    // kind="function", not "method". The type_names guard below prevents
+    // accidental grouping of true top-level functions.
+    if !matches!(symbol.kind.as_str(), "method" | "function") {
+        return None;
+    }
+
+    let rest = symbol
+        .fqn
+        .strip_prefix(&format!("{}::", symbol.file_path))?;
+    let mut parts = rest.split("::");
+    let type_name = parts.next()?;
+    parts.next()?;
+
+    if type_name.is_empty() {
+        return None;
+    }
+
+    Some(type_name.to_string())
+}
+
+fn load_skeleton_dependencies(
+    conn: &Connection,
+    source_ids: &[i64],
+) -> Result<HashMap<i64, Vec<(String, String)>>, QueryError> {
+    let mut deps_map: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    if source_ids.is_empty() {
+        return Ok(deps_map);
+    }
+
+    let placeholders = source_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT e.source_id, s2.name, e.kind
+         FROM edges e
+         JOIN symbols s2 ON s2.id=e.target_id
+         WHERE e.source_id IN ({placeholders})
+         ORDER BY e.source_id, e.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(source_ids.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (source_id, name, kind) = row?;
+        let deps = deps_map.entry(source_id).or_default();
+        if deps.len() < 10 {
+            deps.push((name, kind));
+        }
+    }
+
+    Ok(deps_map)
 }
 
 fn read_symbol_source(project_root: &Path, file_path: &str, start_line: i64, end_line: i64) -> Result<String, std::io::Error> {
@@ -1722,38 +1790,121 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
     }
     let resolved_path = &candidates[0];
 
-    // Fetch top-level symbols for the single resolved file
-    // story-15-2: remove parent_id filter and add parent-child grouping
     let mut stmt = conn.prepare(
-        "SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id
-         WHERE f.path = ?1 AND s.parent_id IS NULL ORDER BY s.start_line",
+        "SELECT s.id, s.name, s.fqn, f.path, s.start_line, s.end_line, s.kind,
+                s.signature, s.docstring, s.parent_id
+         FROM symbols s
+         JOIN files f ON f.id=s.file_id
+         WHERE f.path = ?1
+         ORDER BY s.start_line",
     )?;
-    let symbol_ids: Vec<i64> = stmt
-        .query_map(params![resolved_path], |r| r.get(0))?
+    let symbols: Vec<SkeletonSymbol> = stmt
+        .query_map(params![resolved_path], |r| {
+            Ok(SkeletonSymbol {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                fqn: r.get(2)?,
+                file_path: r.get(3)?,
+                start_line: r.get(4)?,
+                end_line: r.get(5)?,
+                kind: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                signature: r.get(7)?,
+                docstring: r.get(8)?,
+                parent_id: r.get(9)?,
+            })
+        })?
         .collect::<Result<_, _>>()?;
 
-    if symbol_ids.is_empty() {
+    if symbols.is_empty() {
         return Ok(format!(
             "No symbols found in file: {resolved_path}. The file may not contain indexable symbols.\n"
         ));
     }
 
-    let mut output = format!("# File Skeleton: {resolved_path}\n\n");
-    for id in symbol_ids {
-        // Check per-symbol redaction by loading the FQN
-        if let Some(row) = load_symbol_row(conn, id)? {
-            if content_policy.is_denied(resolved_path, Some(&row.fqn)) {
-                continue;
-            }
-            if content_policy.is_redacted(resolved_path, Some(&row.fqn)) {
-                output.push_str(&format!(
-                    "{}\n  [redacted by policy]\n\n",
-                    row.signature.as_deref().unwrap_or(&row.fqn)
-                ));
-                continue;
-            }
+    let parents: Vec<&SkeletonSymbol> = symbols.iter().filter(|symbol| symbol.parent_id.is_none()).collect();
+    let type_names: HashSet<&str> = parents
+        .iter()
+        .filter(|symbol| is_type_like_kind(&symbol.kind))
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+
+    let mut children_map: HashMap<i64, Vec<&SkeletonSymbol>> = HashMap::new();
+    let mut method_group: HashMap<String, Vec<&SkeletonSymbol>> = HashMap::new();
+    for symbol in &symbols {
+        if let Some(parent_id) = symbol.parent_id {
+            children_map.entry(parent_id).or_default().push(symbol);
+            continue;
         }
-        output.push_str(&crate::graph::skeleton::skeletonize(conn, id)?);
+        if let Some(group_key) = extract_method_group_key(symbol)
+            && type_names.contains(group_key.as_str())
+        {
+            method_group.entry(group_key).or_default().push(symbol);
+        }
+    }
+
+    let consumed_ids: HashSet<i64> = method_group
+        .values()
+        .flat_map(|methods| methods.iter().map(|symbol| symbol.id))
+        .collect();
+
+    let mut dep_source_ids: Vec<i64> = parents.iter().map(|symbol| symbol.id).collect();
+    dep_source_ids.extend(consumed_ids.iter().copied());
+    dep_source_ids.sort_unstable();
+    dep_source_ids.dedup();
+    let deps_map = load_skeleton_dependencies(conn, &dep_source_ids)?;
+
+    let mut output = format!("# File Skeleton: {resolved_path}\n\n");
+    for parent in parents {
+        if consumed_ids.contains(&parent.id) {
+            continue;
+        }
+        if content_policy.is_denied(resolved_path, Some(&parent.fqn)) {
+            continue;
+        }
+        if content_policy.is_redacted(resolved_path, Some(&parent.fqn)) {
+            output.push_str(&format!("### {} [redacted by policy]\n\n", parent.name));
+            continue;
+        }
+
+        if is_type_like_kind(&parent.kind) {
+            let children = children_map
+                .get(&parent.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|child| {
+                    if content_policy.is_denied(resolved_path, Some(&child.fqn)) {
+                        return None;
+                    }
+                    if content_policy.is_redacted(resolved_path, Some(&child.fqn)) {
+                        let mut redacted = (*child).clone();
+                        redacted.signature = Some("[redacted by policy]".to_string());
+                        redacted.docstring = None;
+                        return Some(redacted);
+                    }
+                    Some((*child).clone())
+                })
+                .collect::<Vec<_>>();
+            let methods = method_group
+                .get(&parent.name)
+                .into_iter()
+                .flatten()
+                .filter_map(|method| {
+                    if content_policy.is_denied(resolved_path, Some(&method.fqn)) {
+                        return None;
+                    }
+                    if content_policy.is_redacted(resolved_path, Some(&method.fqn)) {
+                        let mut redacted = (*method).clone();
+                        redacted.signature = Some("[redacted by policy]".to_string());
+                        redacted.docstring = None;
+                        return Some(redacted);
+                    }
+                    Some((*method).clone())
+                })
+                .collect::<Vec<_>>();
+            output.push_str(&format_parent_with_children(parent, &children, &methods, &deps_map));
+        } else {
+            output.push_str(&format_standalone(parent, &deps_map));
+        }
     }
     Ok(output)
 }
@@ -1869,8 +2020,10 @@ pub(crate) fn get_impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{db, index};
     use crate::memory::embedder::EmbedText;
     use rusqlite::Connection;
+    use tempfile::tempdir;
 
     // ─── Story 13.3: tokenize_identifier / normalize_query_terms tests ──────
 
@@ -2173,6 +2326,30 @@ mod tests {
             "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![id, file_id, fqn, name, name_tokens, kind, start, end, sig, doc, hash],
+        ).unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_sym_with_parent(
+        conn: &Connection,
+        id: i64,
+        file_id: i64,
+        fqn: &str,
+        name: &str,
+        kind: &str,
+        start: i64,
+        end: i64,
+        sig: Option<&str>,
+        doc: Option<&str>,
+        hash: Option<&str>,
+        parent_id: Option<i64>,
+    ) {
+        let name_tokens = expand_name_tokens(name);
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line,
+                                  signature, docstring, source_hash, parent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id, file_id, fqn, name, name_tokens, kind, start, end, sig, doc, hash, parent_id],
         ).unwrap();
     }
 
@@ -3423,35 +3600,181 @@ mod tests {
         }
     }
 
-    // --- Story 15.1 Task 0: Pre-change regression safety net ---
+    fn skeleton_fixture_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skeleton")
+    }
+
+    fn index_project_fixture(root: &std::path::Path) -> (tempfile::TempDir, Connection) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = db::open(&db_path).unwrap();
+        index::run(&mut conn, root).unwrap();
+        (dir, conn)
+    }
+
+    // --- Story 15.2: declaration-aware skeleton rendering ---
 
     #[test]
     fn get_file_skeleton_baseline_output() {
         let conn = build_test_db();
         conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
-        conn.execute(
-            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
-             VALUES (1, 1, 'src/lib.rs::MyStruct', 'MyStruct', 'my struct', 'class', 1, 30, 'pub struct MyStruct', 'A test struct', 'h')",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO symbols (id, file_id, fqn, name, name_tokens, kind, start_line, end_line, signature, docstring, source_hash)
-             VALUES (2, 1, 'src/lib.rs::MyStruct::process', 'process', 'process', 'function', 5, 20, 'pub fn process(&self)', 'Process data', 'h')",
-            [],
-        ).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::MyStruct", "MyStruct", "class", 1, 30, Some("pub struct MyStruct"), Some("A test struct"), Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::MyStruct::count", "count", "field", 2, 2, Some("count: usize"), None, Some("h"), Some(1));
+        insert_sym(&conn, 3, 1, "src/lib.rs::MyStruct::process", "process", "method", 5, 20, Some("pub fn process(&self)"), Some("Process data"), Some("h"));
 
         let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
 
-        // Both symbols must appear as top-level sections
         assert!(output.contains("### MyStruct"), "struct must appear in skeleton");
-        assert!(output.contains("### process"), "method must appear in skeleton");
         assert!(output.contains("pub struct MyStruct"), "struct signature must render");
-        assert!(output.contains("pub fn process(&self)"), "method signature must render");
+        assert!(output.contains("#### count: usize"), "field must render nested");
+        assert!(output.contains("#### pub fn process(&self)"), "method signature must render nested");
+        assert!(!output.contains("### process"), "grouped method must not also render top-level");
+    }
 
-        // Verify section order: struct appears before method (ordered by start_line)
-        let struct_pos = output.find("### MyStruct").unwrap();
-        let method_pos = output.find("### process").unwrap();
-        assert!(struct_pos < method_pos, "symbols must be ordered by start_line");
+    #[test]
+    fn rank_symbols_by_keywords_excludes_child_symbols() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Config", "Config", "struct", 1, 10, Some("pub struct Config"), None, Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::token", "token", "field", 2, 2, Some("token: String"), None, Some("h"), Some(1));
+
+        let result = rank_symbols_by_keywords(&conn, &["token".to_string()], 5, None, None).unwrap();
+
+        assert!(result.is_empty(), "child symbols must not be returned as pivot candidates");
+    }
+
+    #[test]
+    fn find_pivot_symbols_file_hint_excludes_child_symbols() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Config", "Config", "struct", 1, 10, Some("pub struct Config"), None, Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::token", "token", "field", 1, 100, Some("token: String"), None, Some("h"), Some(1));
+
+        let result = find_pivot_symbols(&conn, "anything", &["lib.rs".to_string()], 5, None).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].fqn, "src/lib.rs::Config");
+    }
+
+    #[test]
+    fn get_file_skeleton_groups_impl_methods_under_type_without_double_rendering() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Widget", "Widget", "struct", 1, 30, Some("pub struct Widget"), None, Some("h"));
+        insert_sym(&conn, 2, 1, "src/lib.rs::Widget::new", "new", "method", 5, 10, Some("pub fn new() -> Self"), None, Some("h"));
+        insert_sym(&conn, 3, 1, "src/lib.rs::Widget::<Display>::fmt", "fmt", "method", 12, 20, Some("fn fmt(&self, f: &mut Formatter)"), None, Some("h"));
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+
+        assert!(output.contains("### Widget (`src/lib.rs::Widget`)"));
+        assert!(output.contains("#### pub fn new() -> Self"));
+        assert!(output.contains("#### fn fmt(&self, f: &mut Formatter)"));
+        assert!(!output.contains("### new"));
+        assert!(!output.contains("### fmt"));
+    }
+
+    #[test]
+    fn get_file_skeleton_renders_standalone_functions_at_top_level() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::helper", "helper", "function", 1, 5, Some("pub fn helper()"), None, Some("h"));
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+
+        assert!(output.contains("### helper (`src/lib.rs::helper`)"));
+        assert!(output.contains("Signature: `pub fn helper()`"));
+    }
+
+    #[test]
+    fn get_file_skeleton_applies_child_redaction() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Account", "Account", "struct", 1, 20, Some("pub struct Account"), None, Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Account::secret", "secret", "field", 2, 2, Some("secret: String"), None, Some("h"), Some(1));
+        insert_sym_with_parent(&conn, 3, 1, "src/lib.rs::Account::visible", "visible", "field", 3, 3, Some("visible: bool"), None, Some("h"), Some(1));
+
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".olaf")).unwrap();
+        std::fs::write(
+            dir.path().join(".olaf/policy.toml"),
+            "[[redact]]\nfqn_prefix = \"src/lib.rs::Account::secret\"\n",
+        ).unwrap();
+        let policy = ContentPolicy::load(dir.path());
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy).unwrap();
+
+        assert!(output.contains("#### secret [redacted by policy]"));
+        assert!(output.contains("#### visible: bool"));
+        assert!(!output.contains("#### secret: String"));
+    }
+
+    #[test]
+    fn get_file_skeleton_grouped_method_renders_deps() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Widget", "Widget", "struct", 1, 30, Some("pub struct Widget"), None, Some("h"));
+        insert_sym(&conn, 2, 1, "src/lib.rs::Widget::new", "new", "method", 5, 10, Some("pub fn new() -> Self"), None, Some("h"));
+        // Edge: Widget::new calls Config
+        insert_sym(&conn, 3, 1, "src/lib.rs::Config", "Config", "struct", 35, 40, Some("pub struct Config"), None, Some("h"));
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (2, 3, 'calls')", []).unwrap();
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+
+        assert!(output.contains("#### pub fn new() -> Self"), "method must appear grouped");
+        assert!(output.contains("Dependencies: Config (calls)"), "grouped method deps must render; got:\n{output}");
+    }
+
+    #[test]
+    fn get_file_skeleton_redacted_method_hides_deps() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Service", "Service", "struct", 1, 30, Some("pub struct Service"), None, Some("h"));
+        insert_sym(&conn, 2, 1, "src/lib.rs::Service::secret_op", "secret_op", "method", 5, 10, Some("fn secret_op()"), None, Some("h"));
+        // Edge: secret_op calls InternalApi — must NOT leak when redacted
+        insert_sym(&conn, 3, 1, "src/lib.rs::InternalApi", "InternalApi", "struct", 35, 40, Some("struct InternalApi"), None, Some("h"));
+        conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (2, 3, 'calls')", []).unwrap();
+
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".olaf")).unwrap();
+        std::fs::write(
+            dir.path().join(".olaf/policy.toml"),
+            "[[redact]]\nfqn_prefix = \"src/lib.rs::Service::secret_op\"\n",
+        ).unwrap();
+        let policy = ContentPolicy::load(dir.path());
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy).unwrap();
+
+        assert!(output.contains("#### secret_op [redacted by policy]"), "redacted method title must show; got:\n{output}");
+        assert!(!output.contains("InternalApi (calls)"), "redacted method must NOT leak dep names; got:\n{output}");
+        assert!(!output.contains("Dependencies: InternalApi"), "no Dependencies line for redacted method; got:\n{output}");
+    }
+
+    #[test]
+    fn get_file_skeleton_golden_rust_outline() {
+        let fixture_root = skeleton_fixture_root();
+        let (_db_dir, conn) = index_project_fixture(&fixture_root);
+        let output = get_file_skeleton(&conn, "src/rust_outline.rs", &ContentPolicy::default()).unwrap();
+        let expected = std::fs::read_to_string(fixture_root.join("rust_outline.golden.txt")).unwrap();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn get_file_skeleton_cross_language_nested_rendering() {
+        let fixture_root = skeleton_fixture_root();
+        let (_db_dir, conn) = index_project_fixture(&fixture_root);
+        let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default()).unwrap();
+
+        assert!(output.contains("### Greeter (`src/ts_outline.ts::Greeter`)"));
+        assert!(output.contains("#### message: string"));
+        assert!(output.contains("#### greet(name: string): string"));
+        assert!(output.contains("### Displayable (`src/ts_outline.ts::Displayable`)"));
+        assert!(output.contains("#### text: string"));
+        assert!(output.contains("#### render(): string"));
+        assert!(
+            !output.contains("\n### greet (`src/ts_outline.ts::Greeter::greet`)"),
+            "class methods must not double-render at top level; got:\n{output}"
+        );
     }
 
     #[test]
