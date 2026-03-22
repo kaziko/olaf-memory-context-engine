@@ -1,0 +1,43 @@
+# File Skeleton: src/ts_outline_rich.ts
+
+### Displayable (`src/ts_outline_rich.ts::Displayable`)
+File: `src/ts_outline_rich.ts` lines 2-6
+Signature: `interface Displayable`
+#### text: string
+#### render(): string
+#### update(value: string): void
+
+### Greeter (`src/ts_outline_rich.ts::Greeter`)
+File: `src/ts_outline_rich.ts` lines 9-34
+Signature: `class Greeter extends BaseGreeter implements Displayable`
+#### message: string
+#### count: number
+#### constructor(message: string)
+#### greet(name: string): string
+#### render(): string
+#### update(value: string): void
+#### get text(): string
+
+### Status (`src/ts_outline_rich.ts::Status`)
+File: `src/ts_outline_rich.ts` lines 37-41
+Signature: `enum Status`
+#### Active = "active"
+#### Inactive = "inactive"
+#### Pending = "pending"
+
+### Direction (`src/ts_outline_rich.ts::Direction`)
+File: `src/ts_outline_rich.ts` lines 44-49
+Signature: `const enum Direction`
+#### Up = 0
+#### Down = 1
+#### Left = 2
+#### Right = 3
+
+### Result (`src/ts_outline_rich.ts::Result`)
+File: `src/ts_outline_rich.ts` lines 52-52
+Signature: `type Result<T> = Success<T> | Failure;`
+
+### createGreeter (`src/ts_outline_rich.ts::createGreeter`)
+File: `src/ts_outline_rich.ts` lines 55-57
+Signature: `function createGreeter(msg: string): Greeter`
+

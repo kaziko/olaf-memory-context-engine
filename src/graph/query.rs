@@ -3760,6 +3760,24 @@ mod tests {
     }
 
     #[test]
+    fn get_file_skeleton_golden_ts_outline_rich() {
+        let fixture_root = skeleton_fixture_root();
+        let (_db_dir, conn) = index_project_fixture(&fixture_root);
+        let output = get_file_skeleton(&conn, "src/ts_outline_rich.ts", &ContentPolicy::default()).unwrap();
+        let expected = std::fs::read_to_string(fixture_root.join("ts_outline_rich.golden.txt")).unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn get_file_skeleton_golden_js_outline() {
+        let fixture_root = skeleton_fixture_root();
+        let (_db_dir, conn) = index_project_fixture(&fixture_root);
+        let output = get_file_skeleton(&conn, "src/js_outline.js", &ContentPolicy::default()).unwrap();
+        let expected = std::fs::read_to_string(fixture_root.join("js_outline.golden.txt")).unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
     fn get_file_skeleton_cross_language_nested_rendering() {
         let fixture_root = skeleton_fixture_root();
         let (_db_dir, conn) = index_project_fixture(&fixture_root);
@@ -3775,6 +3793,80 @@ mod tests {
             !output.contains("\n### greet (`src/ts_outline.ts::Greeter::greet`)"),
             "class methods must not double-render at top level; got:\n{output}"
         );
+    }
+
+    /// Index a minimal TS file containing a `Status` enum and a function typed with it.
+    /// Returns the tempdir (keep alive) and a fully-indexed connection.
+    fn setup_enum_status_db() -> (tempfile::TempDir, Connection) {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("status.ts"), b"\
+enum Status {\n\
+    Active = \"active\",\n\
+}\n\
+function getStatus(s: Status): string {\n\
+    return s;\n\
+}\n\
+").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = db::open(&db_path).unwrap();
+        index::run(&mut conn, dir.path()).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn enum_uses_type_edge_resolves() {
+        // Verify that after the SymbolKind::Class → SymbolKind::Enum fix, a uses_type edge from a
+        // function annotated with an enum parameter type resolves to the enum symbol (not dangling).
+        // This locks down the valid_kinds filter fix in full.rs and incremental.rs.
+        let (_dir, conn) = setup_enum_status_db();
+
+        let enum_kind: String = conn.query_row(
+            "SELECT kind FROM symbols WHERE name = 'Status'",
+            [],
+            |row| row.get(0),
+        ).expect("Status enum must be indexed");
+        assert_eq!(enum_kind, "enum", "enum_declaration must store kind 'enum' after fix");
+
+        let edge_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM edges e
+             JOIN symbols src ON src.id = e.source_id
+             JOIN symbols tgt ON tgt.id = e.target_id
+             WHERE src.name = 'getStatus' AND tgt.name = 'Status' AND e.kind = 'uses_type'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(edge_count, 1, "uses_type edge from getStatus to Status enum must resolve after valid_kinds fix");
+    }
+
+    #[test]
+    fn enum_uses_type_edge_resolves_incremental() {
+        // enum_uses_type_edge_resolves covers full::run; this test covers
+        // incremental::reindex_single_file which has its own resolve_and_insert_file_edges call.
+        let (dir, mut conn) = setup_enum_status_db();
+        let ts_path = dir.path().join("src").join("status.ts");
+
+        // Wipe edges to simulate stale state before incremental re-index
+        conn.execute("DELETE FROM edges", []).unwrap();
+
+        // Bump the file hash — incremental skips files whose hash hasn't changed
+        let mut content = std::fs::read(&ts_path).unwrap();
+        content.push(b'\n');
+        std::fs::write(&ts_path, &content).unwrap();
+
+        index::reindex_single_file(&mut conn, dir.path(), "src/status.ts").unwrap();
+
+        let edge_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM edges e
+             JOIN symbols src ON src.id = e.source_id
+             JOIN symbols tgt ON tgt.id = e.target_id
+             WHERE src.name = 'getStatus' AND tgt.name = 'Status' AND e.kind = 'uses_type'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(edge_count, 1,
+            "uses_type edge must re-resolve via incremental reindex_single_file after valid_kinds fix");
     }
 
     #[test]
