@@ -1,0 +1,24 @@
+# File Skeleton: src/php_outline.php
+
+### Outline (`src/php_outline.php::Outline`)
+File: `src/php_outline.php` lines 3-3
+
+### Outline\Renderable (`src/php_outline.php::Outline\Renderable`)
+File: `src/php_outline.php` lines 5-8
+Signature: `interface Renderable`
+#### public function render(): string;
+#### public function getLabel(): string;
+
+### Outline\Widget (`src/php_outline.php::Outline\Widget`)
+File: `src/php_outline.php` lines 10-26
+Signature: `class Widget implements Renderable`
+#### public string $name;
+#### public int $width = 0;
+#### public function __construct(string $name, int $width)
+#### public function render(): string
+#### public function getLabel(): string
+
+### Outline\create_widget (`src/php_outline.php::Outline\create_widget`)
+File: `src/php_outline.php` lines 28-30
+Signature: `function create_widget(string $name): Widget`
+

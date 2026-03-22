@@ -1,0 +1,22 @@
+# File Skeleton: src/go_outline.go
+
+### Server (`src/go_outline.go::Server`)
+File: `src/go_outline.go` lines 6-10
+Signature: `Server struct`
+#### Host    string `json:"host"`
+#### Port    int
+#### Timeout time.Duration
+#### func (s *Server) Start() error
+#### func (s *Server) Stop()
+
+### Handler (`src/go_outline.go::Handler`)
+File: `src/go_outline.go` lines 13-16
+Signature: `Handler interface`
+#### Handle(path string) (string, error)
+#### Close() error
+
+### NewServer (`src/go_outline.go::NewServer`)
+File: `src/go_outline.go` lines 19-21
+Signature: `func NewServer(host string, port int) *Server`
+Dependencies: Server (uses_type)
+

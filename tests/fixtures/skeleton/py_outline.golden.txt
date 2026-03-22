@@ -1,0 +1,20 @@
+# File Skeleton: src/py_outline.py
+
+### FileProcessor (`src/py_outline.py::FileProcessor`)
+File: `src/py_outline.py` lines 4-13
+Signature: `class FileProcessor:`
+#### default_encoding: str = "utf-8"
+#### self.path = path
+#### def __init__(self, path: str):
+#### def process(self):
+
+### Config (`src/py_outline.py::Config`)
+File: `src/py_outline.py` lines 17-19
+Signature: `class Config:`
+#### host: str
+#### port: int = 8080
+
+### read_file (`src/py_outline.py::read_file`)
+File: `src/py_outline.py` lines 22-23
+Signature: `def read_file(path: str) -> str:`
+
