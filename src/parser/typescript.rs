@@ -266,15 +266,21 @@ fn extract_nodes(
             }
         }
 
-        "public_field_definition" => {
-            // Class field declaration — extract as Field child (NOT a method)
-            if let Some(parent) = parent_class
-                && let Some(name_node) = node.child_by_field_name("name") {
+        "public_field_definition" | "field_definition" => {
+            // tree-sitter-typescript uses public_field_definition with a named "name" grammar field.
+            // tree-sitter-javascript uses field_definition with a named "property" grammar field.
+            // Do NOT fall back to named_child(0): when a decorator is present, named_child(0)
+            // returns the decorator node, not the property name.
+            if let Some(parent) = parent_class {
+                let name_node_opt = node.child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("property"));
+                if let Some(name_node) = name_node_opt {
                     let name = name_node.utf8_text(source)?;
                     symbols.push(make_child_symbol(
                         relative_path, parent, name, SymbolKind::Field, node, source,
                     ));
                 }
+            }
         }
 
         "enum_declaration" => {
@@ -287,7 +293,7 @@ fn extract_nodes(
                 symbols.push(Symbol {
                     fqn,
                     name: name.to_string(),
-                    kind: SymbolKind::Class,
+                    kind: SymbolKind::Enum,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
                     signature: extract_signature(source, node),
@@ -326,7 +332,16 @@ fn extract_nodes(
                     kind: SymbolKind::TypeAlias,
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    signature: extract_signature(source, node),
+                    signature: extract_signature(source, node).or_else(|| {
+                        // type_alias_declaration has no body delimiter ({, body child, or :\n),
+                        // so extract_signature returns None. Fall back to first line of node text,
+                        // which captures the full declaration e.g. `type Result<T> = Success<T> | Error`.
+                        std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
+                            .ok()
+                            .and_then(|s| s.lines().next())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    }),
                     docstring: None,
                     source_hash,
                     parent_fqn: None,
@@ -525,5 +540,69 @@ interface Config {
         assert_eq!(fields[0].name, "name");
         assert_eq!(methods.len(), 1, "interface method signature");
         assert_eq!(methods[0].name, "getValue");
+    }
+
+    #[test]
+    fn enum_members_use_correct_symbol_kind() {
+        let src = b"
+enum Status {
+    Active = \"active\",
+    Inactive = \"inactive\",
+}
+";
+        let (symbols, _) = parse("test.ts", src, TsDialect::TypeScript).unwrap();
+        let enum_sym = symbols.iter().find(|s| s.name == "Status").unwrap();
+        assert_eq!(enum_sym.kind, SymbolKind::Enum, "enum_declaration must use SymbolKind::Enum, not Class");
+
+        let variants: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::EnumVariant).collect();
+        assert_eq!(variants.len(), 2);
+        assert!(variants.iter().any(|s| s.name == "Active"));
+        assert!(variants.iter().any(|s| s.name == "Inactive"));
+    }
+
+    #[test]
+    fn type_alias_signature_captured() {
+        let src = b"type Result<T> = Success<T> | Error;\n";
+        let (symbols, _) = parse("test.ts", src, TsDialect::TypeScript).unwrap();
+        let alias = symbols.iter().find(|s| s.name == "Result").unwrap();
+        assert_eq!(alias.kind, SymbolKind::TypeAlias);
+        let sig = alias.signature.as_deref().unwrap_or("");
+        assert!(!sig.is_empty(), "type alias signature must not be None");
+        assert_eq!(sig, "type Result<T> = Success<T> | Error;",
+            "signature must be the exact first line of the declaration");
+    }
+
+    #[test]
+    fn js_class_field_extracted() {
+        let src = b"
+class Animal {
+    name = \"default\";
+    constructor(name) { this.name = name; }
+}
+";
+        let (symbols, _) = parse("test.js", src, TsDialect::JavaScript).unwrap();
+        let fields: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Field).collect();
+        assert!(!fields.is_empty(), "JS class field_definition must be extracted as Field child");
+        assert!(fields.iter().any(|s| s.name == "name"), "field 'name' must be extracted");
+    }
+
+    #[test]
+    fn js_decorated_class_field_name_not_decorator() {
+        // Regression guard for named_child(0) fallback bug: when a JS class field has a
+        // decorator, named_child(0) returns the decorator node, not the property name.
+        // child_by_field_name("property") must be used instead.
+        let src = b"
+class Tracker {
+    @observed count = 0;
+}
+";
+        let (symbols, _) = parse("test.js", src, TsDialect::JavaScript).unwrap();
+        let fields: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Field).collect();
+        assert!(!fields.is_empty(), "decorated JS class field must be extracted");
+        assert!(
+            fields.iter().any(|s| s.name == "count"),
+            "field name must be 'count', not the decorator; got: {:?}",
+            fields.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

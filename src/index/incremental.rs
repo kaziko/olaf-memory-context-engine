@@ -277,7 +277,7 @@ fn resolve_and_insert_file_edges(
         let tgt_id = fqn_map.get(tgt_fqn.as_str()).copied().or_else(|| {
             let valid_kinds: &[&str] = match kind.as_str() {
                 "calls" => &["function", "method"],
-                "uses_type" => &["class", "interface", "type_alias"],
+                "uses_type" => &["class", "interface", "type_alias", "enum"],
                 "extends" => &["class", "interface"],
                 "implements" => &["interface"],
                 "hooks_into" | "fires_hook" => &["function", "method"],

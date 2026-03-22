@@ -1,0 +1,20 @@
+# File Skeleton: src/js_outline.js
+
+### Animal (`src/js_outline.js::Animal`)
+File: `src/js_outline.js` lines 2-12
+Signature: `class Animal`
+#### name = "unknown"
+#### constructor(name)
+#### speak()
+
+### Dog (`src/js_outline.js::Dog`)
+File: `src/js_outline.js` lines 15-21
+Signature: `class Dog extends Animal`
+Dependencies: Animal (extends)
+#### breed = "mixed"
+#### bark()
+
+### createAnimal (`src/js_outline.js::createAnimal`)
+File: `src/js_outline.js` lines 24-26
+Signature: `function createAnimal(name)`
+

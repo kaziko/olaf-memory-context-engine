@@ -178,7 +178,7 @@ pub fn run(conn: &mut Connection, project_root: &Path) -> anyhow::Result<IndexSt
             // require exactly one match to avoid false edges.
             let valid_kinds: &[&str] = match kind.as_str() {
                 "calls" => &["function", "method"],
-                "uses_type" => &["class", "interface", "type_alias"],
+                "uses_type" => &["class", "interface", "type_alias", "enum"],
                 "extends" => &["class", "interface"],
                 "implements" => &["interface"],
                 "hooks_into" | "fires_hook" => &["function", "method"],
