@@ -26,6 +26,13 @@ pub(crate) fn parse(
     Ok((symbols, edges))
 }
 
+fn qualify_php_name(ns: Option<&str>, raw_name: &str) -> String {
+    match ns {
+        Some(ns) => format!("{}\\{}", ns, raw_name),
+        None => raw_name.to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_nodes(
     node: tree_sitter::Node<'_>,
@@ -101,10 +108,7 @@ fn extract_nodes(
         "class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let raw_name = name_node.utf8_text(source)?;
-                let qualified_name = match current_namespace.as_deref() {
-                    Some(ns) => format!("{}\\{}", ns, raw_name),
-                    None => raw_name.to_string(),
-                };
+                let qualified_name = qualify_php_name(current_namespace.as_deref(), raw_name);
                 symbols.push(make_symbol(
                     relative_path,
                     None,
@@ -160,9 +164,10 @@ fn extract_nodes(
             }
         }
         "property_declaration" => {
-            // Class property — extract as Field child
+            // Class property — extract as Field child. Pass the outer property_declaration node
+            // (not the inner property_element) so that visibility and type modifiers like
+            // `public string` appear in the signature.
             if let Some(parent) = parent_class {
-                // property_declaration can have multiple property_element children
                 let mut walker = node.walk();
                 for child in node.children(&mut walker) {
                     if child.kind() == "property_element"
@@ -171,19 +176,45 @@ fn extract_nodes(
                                 let prop_name = var.utf8_text(source)?.trim_start_matches('$');
                                 symbols.push(make_child_symbol(
                                     relative_path, parent, prop_name,
-                                    SymbolKind::Field, child, source,
+                                    SymbolKind::Field, node, source,
                                 ));
                             }
+                }
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let raw_name = name_node.utf8_text(source)?;
+                let qualified_name = qualify_php_name(current_namespace.as_deref(), raw_name);
+                symbols.push(make_symbol(
+                    relative_path,
+                    None,
+                    &qualified_name,
+                    SymbolKind::Interface,
+                    node,
+                    source,
+                ));
+                // body field is typed as declaration_list in tree-sitter-php grammar
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut walker = body.walk();
+                    for child in body.children(&mut walker) {
+                        if child.kind() == "method_declaration" {
+                            if let Some(mname_node) = child.child_by_field_name("name") {
+                                let mname = mname_node.utf8_text(source)?;
+                                symbols.push(make_child_symbol(
+                                    relative_path, &qualified_name, mname,
+                                    SymbolKind::TraitMethod, child, source,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
         "function_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let raw_name = name_node.utf8_text(source)?;
-                let qualified_name = match current_namespace.as_deref() {
-                    Some(ns) => format!("{}\\{}", ns, raw_name),
-                    None => raw_name.to_string(),
-                };
+                let qualified_name = qualify_php_name(current_namespace.as_deref(), raw_name);
                 let fn_fqn = make_fqn(relative_path, None, &qualified_name);
                 symbols.push(make_symbol(
                     relative_path,
@@ -324,5 +355,30 @@ mod tests {
         let (symbols, edges) = parse("comments.php", src).unwrap();
         assert!(symbols.is_empty());
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn php_property_visibility_in_signature() {
+        let src = b"<?php\nclass Widget {\n    public string $name = \"x\";\n}\n";
+        let (symbols, _) = parse("widget.php", src).unwrap();
+        let field = symbols.iter().find(|s| s.name == "name").expect("Field 'name' not found");
+        let sig = field.signature.as_deref().unwrap_or("");
+        assert!(
+            sig.contains("public"),
+            "Field signature must include visibility modifier 'public'; got: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn php_interface_methods_extracted() {
+        let src = b"<?php\ninterface Renderable {\n    public function render(): string;\n    public function getLabel(): string;\n}\n";
+        let (symbols, _) = parse("iface.php", src).unwrap();
+        let iface = symbols.iter().find(|s| s.name == "Renderable").expect("Interface not found");
+        assert_eq!(iface.kind, SymbolKind::Interface);
+        let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::TraitMethod).collect();
+        assert_eq!(methods.len(), 2, "Expected 2 TraitMethod children; got: {methods:?}");
+        let names: Vec<&str> = methods.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"render"), "Missing 'render' method");
+        assert!(names.contains(&"getLabel"), "Missing 'getLabel' method");
     }
 }

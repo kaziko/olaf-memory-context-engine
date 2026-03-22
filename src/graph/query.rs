@@ -3612,6 +3612,30 @@ mod tests {
         (dir, conn)
     }
 
+    /// Returns a shared, pre-indexed DB path for the skeleton fixture directory.
+    /// Avoids re-indexing the same fixtures in every golden-file test.
+    fn shared_skeleton_db_path() -> &'static std::path::Path {
+        use std::sync::OnceLock;
+        static DB: OnceLock<(tempfile::TempDir, std::path::PathBuf)> = OnceLock::new();
+        let (_, db_path) = DB.get_or_init(|| {
+            let fixture_root = skeleton_fixture_root();
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("index.db");
+            let mut conn = db::open(&db_path).unwrap();
+            index::run(&mut conn, &fixture_root).unwrap();
+            (dir, db_path)
+        });
+        db_path
+    }
+
+    fn assert_golden(source_file: &str, golden_file: &str) {
+        let db_path = shared_skeleton_db_path();
+        let conn = db::open(db_path).unwrap();
+        let output = get_file_skeleton(&conn, source_file, &ContentPolicy::default()).unwrap();
+        let expected = std::fs::read_to_string(skeleton_fixture_root().join(golden_file)).unwrap();
+        assert_eq!(output, expected);
+    }
+
     // --- Story 15.2: declaration-aware skeleton rendering ---
 
     #[test]
@@ -3751,18 +3775,46 @@ mod tests {
 
     #[test]
     fn get_file_skeleton_golden_rust_outline() {
-        let fixture_root = skeleton_fixture_root();
-        let (_db_dir, conn) = index_project_fixture(&fixture_root);
-        let output = get_file_skeleton(&conn, "src/rust_outline.rs", &ContentPolicy::default()).unwrap();
-        let expected = std::fs::read_to_string(fixture_root.join("rust_outline.golden.txt")).unwrap();
+        assert_golden("src/rust_outline.rs", "rust_outline.golden.txt");
+    }
 
-        assert_eq!(output, expected);
+    /// Regenerate golden files from the current skeleton output.
+    /// Run with: `cargo test update_golden_files -- --ignored`
+    #[test]
+    #[ignore]
+    fn update_golden_files() {
+        let fixture_root = skeleton_fixture_root();
+        let db_path = shared_skeleton_db_path();
+        let conn = db::open(db_path).unwrap();
+        for (src, golden) in [
+            ("src/go_outline.go", "go_outline.golden.txt"),
+            ("src/php_outline.php", "php_outline.golden.txt"),
+            ("src/py_outline.py", "py_outline.golden.txt"),
+        ] {
+            let output = get_file_skeleton(&conn, src, &ContentPolicy::default()).unwrap();
+            std::fs::write(fixture_root.join(golden), &output).unwrap();
+        }
+    }
+
+    #[test]
+    fn get_file_skeleton_golden_go_outline() {
+        assert_golden("src/go_outline.go", "go_outline.golden.txt");
+    }
+
+    #[test]
+    fn get_file_skeleton_golden_php_outline() {
+        assert_golden("src/php_outline.php", "php_outline.golden.txt");
+    }
+
+    #[test]
+    fn get_file_skeleton_golden_py_outline() {
+        assert_golden("src/py_outline.py", "py_outline.golden.txt");
     }
 
     #[test]
     fn get_file_skeleton_cross_language_nested_rendering() {
-        let fixture_root = skeleton_fixture_root();
-        let (_db_dir, conn) = index_project_fixture(&fixture_root);
+        let db_path = shared_skeleton_db_path();
+        let conn = db::open(db_path).unwrap();
         let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default()).unwrap();
 
         assert!(output.contains("### Greeter (`src/ts_outline.ts::Greeter`)"));
