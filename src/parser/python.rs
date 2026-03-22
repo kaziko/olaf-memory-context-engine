@@ -101,24 +101,21 @@ fn extract_nodes(
                         } else {
                             None
                         };
-                        if let Some(assign) = assign {
-                            if assign.child_by_field_name("type").is_some() {
-                                if let Some(left) = assign.child_by_field_name("left") {
-                                    if left.kind() == "identifier" {
-                                        if let Ok(n) = left.utf8_text(source) {
-                                            typed_field_names.insert(n.to_string());
-                                            symbols.push(make_child_symbol(
-                                                relative_path,
-                                                name,
-                                                n,
-                                                SymbolKind::Field,
-                                                assign,
-                                                source,
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
+                        if let Some(assign) = assign
+                            && assign.child_by_field_name("type").is_some()
+                            && let Some(left) = assign.child_by_field_name("left")
+                            && left.kind() == "identifier"
+                            && let Ok(n) = left.utf8_text(source)
+                        {
+                            typed_field_names.insert(n.to_string());
+                            symbols.push(make_child_symbol(
+                                relative_path,
+                                name,
+                                n,
+                                SymbolKind::Field,
+                                assign,
+                                source,
+                            ));
                         }
                     }
 
@@ -135,21 +132,19 @@ fn extract_nodes(
                         } else {
                             None
                         };
-                        if let Some(fn_node) = fn_node {
-                            if let Some(fn_name_node) = fn_node.child_by_field_name("name") {
-                                if fn_name_node.utf8_text(source)? == "__init__" {
-                                    if let Some(init_body) = fn_node.child_by_field_name("body") {
-                                        extract_init_attrs(
-                                            relative_path,
-                                            name,
-                                            &init_body,
-                                            source,
-                                            &typed_field_names,
-                                            symbols,
-                                        )?;
-                                    }
-                                }
-                            }
+                        if let Some(fn_node) = fn_node
+                            && let Some(fn_name_node) = fn_node.child_by_field_name("name")
+                            && fn_name_node.utf8_text(source)? == "__init__"
+                            && let Some(init_body) = fn_node.child_by_field_name("body")
+                        {
+                            extract_init_attrs(
+                                relative_path,
+                                name,
+                                &init_body,
+                                source,
+                                &typed_field_names,
+                                symbols,
+                            )?;
                         }
                     }
 

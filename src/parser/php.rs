@@ -198,14 +198,14 @@ fn extract_nodes(
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut walker = body.walk();
                     for child in body.children(&mut walker) {
-                        if child.kind() == "method_declaration" {
-                            if let Some(mname_node) = child.child_by_field_name("name") {
-                                let mname = mname_node.utf8_text(source)?;
-                                symbols.push(make_child_symbol(
-                                    relative_path, &qualified_name, mname,
-                                    SymbolKind::TraitMethod, child, source,
-                                ));
-                            }
+                        if child.kind() == "method_declaration"
+                            && let Some(mname_node) = child.child_by_field_name("name")
+                        {
+                            let mname = mname_node.utf8_text(source)?;
+                            symbols.push(make_child_symbol(
+                                relative_path, &qualified_name, mname,
+                                SymbolKind::TraitMethod, child, source,
+                            ));
                         }
                     }
                 }

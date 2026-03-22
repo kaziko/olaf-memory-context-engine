@@ -3787,6 +3787,7 @@ mod tests {
         let db_path = shared_skeleton_db_path();
         let conn = db::open(db_path).unwrap();
         for (src, golden) in [
+            ("src/rust_outline.rs", "rust_outline.golden.txt"),
             ("src/go_outline.go", "go_outline.golden.txt"),
             ("src/php_outline.php", "php_outline.golden.txt"),
             ("src/py_outline.py", "py_outline.golden.txt"),
