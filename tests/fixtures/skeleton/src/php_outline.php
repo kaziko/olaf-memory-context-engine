@@ -12,7 +12,7 @@ interface Renderable {
 class Widget implements Renderable {
     use Loggable;
 
-    const DEFAULT_WIDTH = 100;
+    public const DEFAULT_WIDTH = 100;
     public string $name;
     public int $width = 0;
 

@@ -13,7 +13,7 @@ Signature: `interface Renderable`
 File: `src/php_outline.php` lines 12-31
 Signature: `class Widget implements Renderable`
 #### Loggable
-#### const DEFAULT_WIDTH = 100;
+#### public const DEFAULT_WIDTH = 100;
 #### public string $name;
 #### public int $width = 0;
 #### public function __construct(string $name, int $width)

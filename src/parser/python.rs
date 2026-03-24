@@ -500,6 +500,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn python_decorated_init_signature_includes_decorator() {
+        // Decorated __init__ must: (1) include decorator in signature,
+        // (2) still allow the prepass to extract self.* fields.
+        let src = b"class Foo:\n    @some_decorator\n    def __init__(self):\n        self.x = 1\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let init = symbols.iter().find(|s| s.name == "__init__");
+        assert!(init.is_some(), "Decorated __init__ must be extracted");
+        let sig = init.unwrap().signature.as_deref().unwrap_or("");
+        assert!(sig.contains("@some_decorator"), "Signature must contain decorator; got: {sig:?}");
+        assert!(sig.contains("def __init__"), "Signature must contain def __init__; got: {sig:?}");
+        let field = symbols.iter().find(|s| s.name == "x" && s.kind == SymbolKind::Field);
+        assert!(field.is_some(), "self.x field must still be extracted from decorated __init__");
+    }
+
     // Note: bare \r (old Mac style) is NOT tested because tree-sitter-python
     // doesn't parse it as valid Python source (Python requires \n or \r\n).
     // The .lines() normalizer handles \r\n correctly, which IS the real-world case.

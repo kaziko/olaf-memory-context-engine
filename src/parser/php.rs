@@ -488,19 +488,22 @@ mod tests {
 
     #[test]
     fn php_fully_qualified_trait_not_double_prefixed() {
+        // `use \App\Loggable;` inside `namespace MyNs;`:
+        // Leading `\` is stripped, original FQN "App\Loggable" preserved.
+        // Must NOT be re-prefixed with current namespace (MyNs\App\Loggable).
         let src = b"<?php\nnamespace MyNs;\nclass Foo {\n    use \\App\\Loggable;\n}\n";
         let (symbols, edges) = parse("foo.php", src).unwrap();
         let field = symbols.iter().find(|s| s.kind == SymbolKind::Field);
         assert!(field.is_some(), "FQ trait use must emit a Field child");
         assert_eq!(
             field.unwrap().name, "App\\Loggable",
-            "Leading \\ must be stripped, not re-prefixed with namespace"
+            "Leading '\\' removed, original FQN preserved (no re-prefixing with current namespace MyNs)"
         );
         let edge = edges.iter().find(|e| e.kind == EdgeKind::UsesTrait);
         assert!(edge.is_some());
         assert_eq!(
             edge.unwrap().target_fqn, "App\\Loggable",
-            "Edge target: leading \\ stripped, no double-prefix"
+            "Edge target: leading '\\' removed, original FQN preserved (no re-prefixing with MyNs)"
         );
     }
 
