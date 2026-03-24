@@ -4,14 +4,16 @@
 File: `src/php_outline.php` lines 3-3
 
 ### Outline\Renderable (`src/php_outline.php::Outline\Renderable`)
-File: `src/php_outline.php` lines 5-8
+File: `src/php_outline.php` lines 7-10
 Signature: `interface Renderable`
 #### public function render(): string;
 #### public function getLabel(): string;
 
 ### Outline\Widget (`src/php_outline.php::Outline\Widget`)
-File: `src/php_outline.php` lines 10-26
+File: `src/php_outline.php` lines 12-31
 Signature: `class Widget implements Renderable`
+#### Loggable
+#### const DEFAULT_WIDTH = 100;
 #### public string $name;
 #### public int $width = 0;
 #### public function __construct(string $name, int $width)
@@ -19,6 +21,6 @@ Signature: `class Widget implements Renderable`
 #### public function getLabel(): string
 
 ### Outline\create_widget (`src/php_outline.php::Outline\create_widget`)
-File: `src/php_outline.php` lines 28-30
+File: `src/php_outline.php` lines 33-35
 Signature: `function create_widget(string $name): Widget`
 

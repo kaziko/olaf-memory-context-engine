@@ -2,12 +2,17 @@
 
 namespace Outline;
 
+trait Loggable {}
+
 interface Renderable {
     public function render(): string;
     public function getLabel(): string;
 }
 
 class Widget implements Renderable {
+    use Loggable;
+
+    const DEFAULT_WIDTH = 100;
     public string $name;
     public int $width = 0;
 

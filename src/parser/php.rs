@@ -182,6 +182,37 @@ fn extract_nodes(
                 }
             }
         }
+        "const_declaration" => {
+            // Class-level constants — hybrid signature rule:
+            // Single const_element → outer node preserves visibility (e.g., `public const STATUS = 1`)
+            // Multiple const_elements → inner nodes for per-constant specificity (`A = 1`, `B = 2`)
+            if let Some(parent) = parent_class {
+                let elements: Vec<_> = {
+                    let mut w = node.walk();
+                    node.children(&mut w)
+                        .filter(|c| c.kind() == "const_element")
+                        .collect()
+                };
+                let use_outer = elements.len() == 1;
+                for elem in &elements {
+                    // const_element has no field-name children in tree-sitter-php grammar;
+                    // find the `name` node by kind among named children.
+                    let mut ew = elem.walk();
+                    if let Some(name_node) = elem.named_children(&mut ew).find(|c| c.kind() == "name") {
+                        let const_name = name_node.utf8_text(source)?;
+                        let sig_node = if use_outer { node } else { *elem };
+                        symbols.push(make_child_symbol(
+                            relative_path,
+                            parent,
+                            const_name,
+                            SymbolKind::Constant,
+                            sig_node,
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
         "interface_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let raw_name = name_node.utf8_text(source)?;
@@ -242,20 +273,40 @@ fn extract_nodes(
             }
         }
         "use_declaration" => {
-            // Inside a class body: trait usage → UsesTrait edge
-            if let Some(class_fqn) = parent_class.map(|c| make_fqn(relative_path, None, c)) {
+            // Inside a class body: trait usage → UsesTrait edge + child symbol per trait
+            if let Some(parent) = parent_class {
+                let class_fqn = make_fqn(relative_path, None, parent);
                 let mut walker = node.walk();
                 for child in node.named_children(&mut walker) {
                     if child.kind() == "name"
                         || child.kind() == "qualified_name"
                         || child.kind() == "named_type"
                     {
-                        let trait_name = child.utf8_text(source)?;
+                        let raw_name = child.utf8_text(source)?;
+                        // FQ names (starting with \): strip leading \, don't re-prefix
+                        let qualified = if raw_name.starts_with('\\') {
+                            raw_name.trim_start_matches('\\').to_string()
+                        } else {
+                            qualify_php_name(current_namespace.as_deref(), raw_name)
+                        };
                         edges.push(Edge {
                             source_fqn: class_fqn.clone(),
-                            target_fqn: trait_name.to_string(),
+                            target_fqn: qualified.clone(),
                             kind: EdgeKind::UsesTrait,
                         });
+                        // Child symbol per trait — visible in skeleton as #### entry.
+                        // Use raw_name for the symbol name (short, unqualified) so
+                        // FQN stays clean (file::Parent::Loggable not file::Parent::Ns\Loggable).
+                        // The qualified form lives in the edge target_fqn for graph resolution.
+                        let short_name = raw_name.trim_start_matches('\\');
+                        symbols.push(make_child_symbol(
+                            relative_path,
+                            parent,
+                            short_name,
+                            SymbolKind::Field,
+                            child,
+                            source,
+                        ));
                     }
                 }
             }
@@ -380,5 +431,97 @@ mod tests {
         let names: Vec<&str> = methods.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"render"), "Missing 'render' method");
         assert!(names.contains(&"getLabel"), "Missing 'getLabel' method");
+    }
+
+    #[test]
+    fn php_class_constant_extracted() {
+        let src = b"<?php\nclass Foo {\n    const STATUS = 1;\n}\n";
+        let (symbols, _) = parse("foo.php", src).unwrap();
+        let c = symbols.iter().find(|s| s.name == "STATUS" && s.kind == SymbolKind::Constant);
+        assert!(c.is_some(), "Class constant STATUS must be extracted as Constant child");
+    }
+
+    #[test]
+    fn php_single_constant_preserves_visibility() {
+        let src = b"<?php\nclass Foo {\n    public const STATUS = 1;\n}\n";
+        let (symbols, _) = parse("foo.php", src).unwrap();
+        let c = symbols.iter().find(|s| s.name == "STATUS").expect("Constant not found");
+        let sig = c.signature.as_deref().unwrap_or("");
+        assert!(
+            sig.contains("public"),
+            "Single constant signature must contain visibility; got: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn php_multi_constant_each_separate() {
+        let src = b"<?php\nclass Foo {\n    const A = 1, B = 2;\n}\n";
+        let (symbols, _) = parse("foo.php", src).unwrap();
+        let consts: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Constant).collect();
+        assert_eq!(consts.len(), 2, "Each const_element must emit a separate Constant; got: {consts:?}");
+        let names: Vec<&str> = consts.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"A"), "Missing constant A");
+        assert!(names.contains(&"B"), "Missing constant B");
+    }
+
+    #[test]
+    fn php_trait_use_emits_child_symbols() {
+        let src = b"<?php\nclass Foo {\n    use Loggable, Serializable;\n}\n";
+        let (symbols, edges) = parse("foo.php", src).unwrap();
+        let fields: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Field).collect();
+        assert_eq!(fields.len(), 2, "Each trait must emit a Field child; got: {fields:?}");
+        let trait_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::UsesTrait).collect();
+        assert_eq!(trait_edges.len(), 2, "Each trait must emit a UsesTrait edge; got: {trait_edges:?}");
+    }
+
+    #[test]
+    fn php_trait_use_namespace_qualified() {
+        let src = b"<?php\nnamespace App;\nclass Foo {\n    use Loggable;\n}\n";
+        let (symbols, edges) = parse("foo.php", src).unwrap();
+        let field = symbols.iter().find(|s| s.kind == SymbolKind::Field);
+        assert!(field.is_some(), "Trait use must emit a Field child");
+        assert_eq!(field.unwrap().name, "Loggable", "Symbol name must be short/unqualified");
+        let edge = edges.iter().find(|e| e.kind == EdgeKind::UsesTrait);
+        assert!(edge.is_some());
+        assert_eq!(edge.unwrap().target_fqn, "App\\Loggable", "Edge target must be namespace-prefixed");
+    }
+
+    #[test]
+    fn php_fully_qualified_trait_not_double_prefixed() {
+        let src = b"<?php\nnamespace MyNs;\nclass Foo {\n    use \\App\\Loggable;\n}\n";
+        let (symbols, edges) = parse("foo.php", src).unwrap();
+        let field = symbols.iter().find(|s| s.kind == SymbolKind::Field);
+        assert!(field.is_some(), "FQ trait use must emit a Field child");
+        assert_eq!(
+            field.unwrap().name, "App\\Loggable",
+            "Leading \\ must be stripped, not re-prefixed with namespace"
+        );
+        let edge = edges.iter().find(|e| e.kind == EdgeKind::UsesTrait);
+        assert!(edge.is_some());
+        assert_eq!(
+            edge.unwrap().target_fqn, "App\\Loggable",
+            "Edge target: leading \\ stripped, no double-prefix"
+        );
+    }
+
+    #[test]
+    fn php_relative_qualified_trait_not_double_prefixed() {
+        // `use Sub\Loggable;` inside `namespace MyNs;` — relative qualified name
+        // should NOT be double-prefixed as `MyNs\Sub\Loggable` in the symbol name
+        let src = b"<?php\nnamespace MyNs;\nclass Foo {\n    use Sub\\Loggable;\n}\n";
+        let (symbols, edges) = parse("foo.php", src).unwrap();
+        let field = symbols.iter().find(|s| s.kind == SymbolKind::Field);
+        assert!(field.is_some(), "Relative qualified trait use must emit a Field child");
+        // Symbol name: short form from source
+        let name = &field.unwrap().name;
+        assert!(
+            !name.starts_with("MyNs\\"),
+            "Symbol name must not be namespace-prefixed; got: {name:?}"
+        );
+        // Edge target: namespace-qualified for graph resolution
+        let edge = edges.iter().find(|e| e.kind == EdgeKind::UsesTrait);
+        assert!(edge.is_some());
+        let target = &edge.unwrap().target_fqn;
+        assert_eq!(target, "MyNs\\Sub\\Loggable", "Edge target must be namespace-prefixed");
     }
 }
