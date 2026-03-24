@@ -473,6 +473,7 @@ fn test_parse_php_exact_symbol_set() {
         vec![
             "tests/fixtures/php/sample.php::MyPlugin",
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler",
+            "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::Loggable",
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::handle",
             "tests/fixtures/php/sample.php::MyPlugin\\PostHandler::on_save",
             "tests/fixtures/php/sample.php::MyPlugin\\bootstrap",
@@ -563,7 +564,7 @@ fn test_php_uses_trait_edge_exact() {
         1,
         "expected exactly 1 uses_trait edge (`use Loggable`)"
     );
-    assert_eq!(uses_trait[0].target_fqn, "Loggable");
+    assert_eq!(uses_trait[0].target_fqn, "MyPlugin\\Loggable");
     assert_eq!(
         uses_trait[0].source_fqn, "tests/fixtures/php/sample.php::MyPlugin\\PostHandler",
         "uses_trait source must be the class FQN, not a method FQN"

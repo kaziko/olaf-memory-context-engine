@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import cached_property
 
 
 class FileProcessor:
@@ -11,6 +12,14 @@ class FileProcessor:
 
     def process(self):
         pass
+
+    @property
+    def filename(self) -> str:
+        return self.path.split("/")[-1]
+
+    @cached_property
+    def extension(self):
+        return self.path.rsplit(".", 1)[-1]
 
 
 @dataclass

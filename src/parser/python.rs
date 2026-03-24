@@ -165,15 +165,70 @@ fn extract_nodes(
         "decorated_definition" => {
             // @decorator\ndef foo(): ... or @decorator\nclass Foo: ...
             if let Some(inner) = node.child_by_field_name("definition") {
-                extract_nodes(
-                    inner,
-                    source,
-                    relative_path,
-                    parent_class,
-                    _current_fqn,
-                    symbols,
-                    edges,
-                )?;
+                match inner.kind() {
+                    "function_definition" => {
+                        // Handle inline: extract name/kind from inner, but pass outer
+                        // `decorated_definition` node to make_symbol so extract_signature
+                        // captures decorator lines in the signature.
+                        if let Some(name_node) = inner.child_by_field_name("name") {
+                            let name = name_node.utf8_text(source)?;
+                            let kind = if parent_class.is_some() {
+                                SymbolKind::Method
+                            } else {
+                                SymbolKind::Function
+                            };
+                            let fqn = make_fqn(relative_path, parent_class, name);
+                            let mut sym = make_symbol(
+                                relative_path,
+                                parent_class,
+                                name,
+                                kind,
+                                node, // outer node includes decorators
+                                source,
+                            );
+                            // Normalize multi-line signature to single line.
+                            // Line-wise trim-and-join preserves meaningful spaces inside
+                            // decorator args (e.g., @app.route("/api", methods=["GET"]))
+                            // while collapsing inter-line whitespace.
+                            if let Some(ref mut sig) = sym.signature {
+                                *sig = sig
+                                    .lines()
+                                    .map(|line| line.trim())
+                                    .filter(|line| !line.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                            }
+                            symbols.push(sym);
+                            // Recurse into body with parent_class reset to None for
+                            // nested functions inside method bodies.
+                            if let Some(body) = inner.child_by_field_name("body") {
+                                extract_nodes(
+                                    body,
+                                    source,
+                                    relative_path,
+                                    None,
+                                    Some(&fqn),
+                                    symbols,
+                                    edges,
+                                )?;
+                            }
+                        }
+                    }
+                    "class_definition" => {
+                        // Recurse with inner — class handler does its own make_symbol.
+                        // Decorated class text (e.g., @dataclass) is NOT captured — out of scope.
+                        extract_nodes(
+                            inner,
+                            source,
+                            relative_path,
+                            parent_class,
+                            _current_fqn,
+                            symbols,
+                            edges,
+                        )?;
+                    }
+                    _ => {}
+                }
             }
         }
         "import_statement" => {
@@ -366,4 +421,101 @@ mod tests {
             "The typed annotation must win; expected 'str' in signature, got: {sig:?}"
         );
     }
+
+    #[test]
+    fn python_property_signature_includes_decorator() {
+        let src = b"class Foo:\n    @property\n    def bar(self) -> str:\n        return \"x\"\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let method = symbols.iter().find(|s| s.name == "bar");
+        assert!(method.is_some(), "@property method must be extracted");
+        let m = method.unwrap();
+        assert_eq!(m.kind, SymbolKind::Method, "@property must remain a Method");
+        let sig = m.signature.as_deref().unwrap_or("");
+        assert!(sig.contains("@property"), "Signature must contain @property; got: {sig:?}");
+        assert!(sig.contains("def bar"), "Signature must contain def bar; got: {sig:?}");
+    }
+
+    #[test]
+    fn python_cached_property_signature_includes_decorator() {
+        let src = b"class Foo:\n    @cached_property\n    def bar(self):\n        return 42\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let method = symbols.iter().find(|s| s.name == "bar");
+        assert!(method.is_some());
+        let sig = method.unwrap().signature.as_deref().unwrap_or("");
+        assert!(sig.contains("@cached_property"), "Signature must contain @cached_property; got: {sig:?}");
+    }
+
+    #[test]
+    fn python_dotted_cached_property_signature() {
+        let src = b"class Foo:\n    @functools.cached_property\n    def baz(self):\n        return 1\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let method = symbols.iter().find(|s| s.name == "baz");
+        assert!(method.is_some());
+        let sig = method.unwrap().signature.as_deref().unwrap_or("");
+        assert!(
+            sig.contains("functools.cached_property"),
+            "Signature must contain dotted decorator; got: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn python_non_class_decorated_function_keeps_decorator() {
+        let src = b"@app.route\ndef handler():\n    pass\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let func = symbols.iter().find(|s| s.name == "handler");
+        assert!(func.is_some());
+        let f = func.unwrap();
+        assert_eq!(f.kind, SymbolKind::Function, "Top-level decorated def must be Function");
+        let sig = f.signature.as_deref().unwrap_or("");
+        assert!(sig.contains("@app.route"), "Signature must contain @app.route; got: {sig:?}");
+    }
+
+    #[test]
+    fn python_decorated_signature_is_single_line() {
+        let src = b"class Foo:\n    @a\n    @b\n    def foo(self):\n        pass\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let method = symbols.iter().find(|s| s.name == "foo");
+        assert!(method.is_some());
+        let sig = method.unwrap().signature.as_deref().unwrap_or("");
+        assert!(!sig.contains('\n'), "Signature must not contain newlines; got: {sig:?}");
+        assert!(!sig.contains('\r'), "Signature must not contain carriage returns; got: {sig:?}");
+        assert!(sig.contains("@a"), "Must contain first decorator");
+        assert!(sig.contains("@b"), "Must contain second decorator");
+        assert!(sig.contains("def foo"), "Must contain def");
+    }
+
+    #[test]
+    fn python_decorated_signature_preserves_arg_spaces() {
+        // Decorator with parenthesized arguments containing multiple spaces.
+        // Line-wise join must NOT collapse intra-line spaces (unlike split_whitespace).
+        // The double space after the comma is the discriminating case:
+        // split_whitespace would collapse it to single, lines().trim().join(" ") preserves it.
+        let src = b"@app.route(\"/api\",  methods=[\"GET\"])\ndef handler():\n    pass\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let func = symbols.iter().find(|s| s.name == "handler").unwrap();
+        let sig = func.signature.as_deref().unwrap_or("");
+        assert!(
+            sig.contains("\"/api\",  methods="),
+            "Double space inside decorator args must be preserved (not collapsed); got: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn python_decorated_init_signature_includes_decorator() {
+        // Decorated __init__ must: (1) include decorator in signature,
+        // (2) still allow the prepass to extract self.* fields.
+        let src = b"class Foo:\n    @some_decorator\n    def __init__(self):\n        self.x = 1\n";
+        let (symbols, _) = parse("foo.py", src).unwrap();
+        let init = symbols.iter().find(|s| s.name == "__init__");
+        assert!(init.is_some(), "Decorated __init__ must be extracted");
+        let sig = init.unwrap().signature.as_deref().unwrap_or("");
+        assert!(sig.contains("@some_decorator"), "Signature must contain decorator; got: {sig:?}");
+        assert!(sig.contains("def __init__"), "Signature must contain def __init__; got: {sig:?}");
+        let field = symbols.iter().find(|s| s.name == "x" && s.kind == SymbolKind::Field);
+        assert!(field.is_some(), "self.x field must still be extracted from decorated __init__");
+    }
+
+    // Note: bare \r (old Mac style) is NOT tested because tree-sitter-python
+    // doesn't parse it as valid Python source (Python requires \n or \r\n).
+    // The .lines() normalizer handles \r\n correctly, which IS the real-world case.
 }
