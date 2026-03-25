@@ -124,6 +124,11 @@ pub(crate) fn list() -> Vec<Value> {
                     "file_path": {
                         "type": "string",
                         "description": "File path or partial path, e.g. 'src/auth.ts' or 'auth.ts'"
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "Level of skeleton detail: 'minimal' (names+lines only), 'standard' (default, full signatures and children), or 'detailed' (all members, lifted caps, extra metadata)",
+                        "enum": ["minimal", "standard", "detailed"]
                     }
                 },
                 "required": ["file_path"]
@@ -849,6 +854,7 @@ fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>, content_
 }
 
 fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
+    use crate::graph::DetailLevel;
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
     let file_path = args.get("file_path").and_then(|v| v.as_str())
@@ -857,7 +863,15 @@ fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>, c
     if file_path.is_empty() {
         return Err(ToolError::InvalidParams("file_path must not be empty".to_string()));
     }
-    crate::graph::query::get_file_skeleton(conn, file_path, content_policy)
+    let detail = match args.get("detail").and_then(|v| v.as_str()) {
+        None | Some("standard") => DetailLevel::Standard,
+        Some("minimal") => DetailLevel::Minimal,
+        Some("detailed") => DetailLevel::Detailed,
+        Some(other) => return Err(ToolError::InvalidParams(
+            format!("invalid detail level '{other}': must be 'minimal', 'standard', or 'detailed'")
+        )),
+    };
+    crate::graph::query::get_file_skeleton(conn, file_path, content_policy, detail)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
 }
 
@@ -1565,6 +1579,7 @@ fn handle_memory_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_list_contains_memory_health() {
@@ -2126,5 +2141,59 @@ mod tests {
         let result2 = handle_save_observation(&mut conn, dir.path(), "test-session", Some(&args2));
         assert!(matches!(result2, Err(ToolError::InvalidParams(_))),
             "project scope with symbol_fqn should be rejected");
+    }
+
+    // --- Story 15.5: detail parameter parsing ---
+
+    #[test]
+    fn handle_get_file_skeleton_parses_detail_param() {
+        // Index a real file and verify output differs between detail levels
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"\
+pub struct Config {\n\
+    pub name: String,\n\
+    pub port: u16,\n\
+}\n\
+pub fn init() -> Config {\n\
+    Config { name: String::new(), port: 8080 }\n\
+}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let policy = ContentPolicy::default();
+
+        // Standard (default): must contain Signature: and #### children
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let standard = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        assert!(standard.contains("Signature:"), "standard must show signatures");
+        assert!(standard.contains("####"), "standard must show children");
+
+        // Minimal: must NOT contain Signature: or #### children
+        let args = serde_json::json!({"file_path": "src/demo.rs", "detail": "minimal"});
+        let minimal = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        assert!(!minimal.contains("Signature:"), "minimal must omit signatures");
+        assert!(!minimal.contains("####"), "minimal must omit children");
+        assert!(minimal.contains("(Struct)") || minimal.contains("(Function)"),
+            "minimal must show Title Case kind in parentheses");
+
+        // Absent defaults to standard
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let default_output = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        assert_eq!(default_output, standard, "absent detail must equal standard");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_rejects_invalid_detail() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+
+        let args = serde_json::json!({"file_path": "some.rs", "detail": "compact"});
+        let result = handle_get_file_skeleton(&conn, Some(&args), &ContentPolicy::default());
+        assert!(matches!(result, Err(ToolError::InvalidParams(ref msg)) if msg.contains("compact")),
+            "invalid detail value must produce InvalidParams error; got: {result:?}");
     }
 }

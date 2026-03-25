@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::graph::DetailLevel;
 use crate::graph::skeleton::{
     SkeletonSymbol, format_parent_with_children, format_standalone, skeletonize,
 };
@@ -1067,6 +1068,63 @@ fn format_intent_header(profile: &IntentProfile, intent: &str) -> String {
     output
 }
 
+/// Render supporting symbols with budget-aware detail downgrade.
+/// Two-phase strategy: proactive Minimal after 60% budget consumed, reactive Minimal fallback
+/// before breaking when Standard doesn't fit.
+fn render_supporting_skeletons(
+    conn: &Connection,
+    supporting_with_reasons: &[(i64, String)],
+    skeleton_budget: usize,
+    content_policy: &ContentPolicy,
+    output: &mut String,
+    collected_fqns: &mut HashSet<String>,
+    collected_file_paths: &mut HashSet<String>,
+) -> Result<(), QueryError> {
+    if supporting_with_reasons.is_empty() {
+        return Ok(());
+    }
+    output.push_str("## Supporting Symbols\n\n");
+    let mut skeleton_tokens = 0usize;
+    let downgrade_threshold = skeleton_budget * 60 / 100;
+    for (id, reason) in supporting_with_reasons {
+        let Some(row) = load_symbol_row(conn, *id)? else { continue };
+        if is_sensitive(&row.file_path) { continue; }
+        if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
+
+        collected_fqns.insert(row.fqn.clone());
+        collected_file_paths.insert(row.file_path.clone());
+
+        let mut detail = if skeleton_tokens > downgrade_threshold {
+            DetailLevel::Minimal
+        } else {
+            DetailLevel::Standard
+        };
+        let mut skeleton = skeletonize(conn, row.id, detail)?;
+        let reason_line = format!("Why: {reason}\n");
+        let mut skeleton_tokens_needed = estimate_tokens(&skeleton);
+        let reason_tokens_needed = estimate_tokens(&reason_line);
+
+        if detail == DetailLevel::Standard
+            && skeleton_tokens + skeleton_tokens_needed > skeleton_budget
+        {
+            detail = DetailLevel::Minimal;
+            skeleton = skeletonize(conn, row.id, detail)?;
+            skeleton_tokens_needed = estimate_tokens(&skeleton);
+        }
+
+        if skeleton_tokens + skeleton_tokens_needed > skeleton_budget { break; }
+
+        output.push_str(&skeleton);
+        skeleton_tokens += skeleton_tokens_needed;
+
+        if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
+            output.push_str(&reason_line);
+            skeleton_tokens += reason_tokens_needed;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_context_brief(
     conn: &Connection,
@@ -1128,33 +1186,10 @@ fn build_context_brief(
         rendered_pivot_ids.insert(*id);
     }
 
-    if !supporting_with_reasons.is_empty() {
-        output.push_str("## Supporting Symbols\n\n");
-        let mut skeleton_tokens = 0usize;
-        for (id, reason) in &supporting_with_reasons {
-            let Some(row) = load_symbol_row(conn, *id)? else { continue };
-            if is_sensitive(&row.file_path) { continue; }
-            if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
-
-            all_fqns.insert(row.fqn.clone());
-            all_file_paths.insert(row.file_path.clone());
-
-            let skeleton = skeletonize(conn, row.id)?;
-            let reason_line = format!("Why: {reason}\n");
-            let skeleton_tokens_needed = estimate_tokens(&skeleton);
-            let reason_tokens_needed = estimate_tokens(&reason_line);
-
-            if skeleton_tokens + skeleton_tokens_needed > skeleton_budget { break; }
-
-            output.push_str(&skeleton);
-            skeleton_tokens += skeleton_tokens_needed;
-
-            if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
-                output.push_str(&reason_line);
-                skeleton_tokens += reason_tokens_needed;
-            }
-        }
-    }
+    render_supporting_skeletons(
+        conn, &supporting_with_reasons, skeleton_budget, content_policy,
+        &mut output, &mut all_fqns, &mut all_file_paths,
+    )?;
 
     // Memory + Rules injection — 10% budget total
     let fqns_vec: Vec<String> = all_fqns.iter().cloned().collect();
@@ -1553,32 +1588,10 @@ pub(crate) fn build_context_brief_multi(
     if !local_pivots.is_empty() {
         let local = &members[0];
         let (_, supporting_with_reasons) = traverse_bfs(local.conn, &local_pivots, policy)?;
-        if !supporting_with_reasons.is_empty() {
-            output.push_str("## Supporting Symbols\n\n");
-            let mut skeleton_tokens = 0usize;
-            for (id, reason) in &supporting_with_reasons {
-                let Some(row) = load_symbol_row(local.conn, *id)? else { continue };
-                if is_sensitive(&row.file_path) { continue; }
-                if content_policy.is_denied(&row.file_path, Some(&row.fqn)) { continue; }
-
-                local_fqns.insert(row.fqn.clone());
-                local_file_paths.insert(row.file_path.clone());
-
-                let skeleton = skeletonize(local.conn, row.id)?;
-                let reason_line = format!("Why: {reason}\n");
-                let skeleton_tokens_needed = estimate_tokens(&skeleton);
-                let reason_tokens_needed = estimate_tokens(&reason_line);
-
-                if skeleton_tokens + skeleton_tokens_needed > skeleton_budget { break; }
-                output.push_str(&skeleton);
-                skeleton_tokens += skeleton_tokens_needed;
-
-                if skeleton_tokens + reason_tokens_needed <= skeleton_budget {
-                    output.push_str(&reason_line);
-                    skeleton_tokens += reason_tokens_needed;
-                }
-            }
-        }
+        render_supporting_skeletons(
+            local.conn, &supporting_with_reasons, skeleton_budget, content_policy,
+            &mut output, &mut local_fqns, &mut local_file_paths,
+        )?;
     }
 
     // Memory + Rules injection — local only (10% budget total)
@@ -1751,7 +1764,7 @@ fn query_file_candidates(
     Ok(paths)
 }
 
-pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy) -> Result<String, QueryError> {
+pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy, detail: DetailLevel) -> Result<String, QueryError> {
     // Input-level sensitive check — returns "not permitted" to the caller
     if is_sensitive(file_path) {
         return Ok(format!("Access to sensitive file '{file_path}' is not permitted.\n"));
@@ -1849,9 +1862,20 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
 
     let mut dep_source_ids: Vec<i64> = parents.iter().map(|symbol| symbol.id).collect();
     dep_source_ids.extend(consumed_ids.iter().copied());
+    // Detailed mode: include child IDs so deps_map has their edges for rendering
+    if detail == DetailLevel::Detailed {
+        for children in children_map.values() {
+            dep_source_ids.extend(children.iter().map(|c| c.id));
+        }
+    }
     dep_source_ids.sort_unstable();
     dep_source_ids.dedup();
-    let deps_map = load_skeleton_dependencies(conn, &dep_source_ids)?;
+    let deps_map = if detail == DetailLevel::Minimal {
+        // Minimal skips all deps rendering — no need to query
+        HashMap::new()
+    } else {
+        load_skeleton_dependencies(conn, &dep_source_ids)?
+    };
 
     let mut output = format!("# File Skeleton: {resolved_path}\n\n");
     for parent in parents {
@@ -1901,9 +1925,9 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
                     Some((*method).clone())
                 })
                 .collect::<Vec<_>>();
-            output.push_str(&format_parent_with_children(parent, &children, &methods, &deps_map));
+            output.push_str(&format_parent_with_children(parent, &children, &methods, &deps_map, detail));
         } else {
-            output.push_str(&format_standalone(parent, &deps_map));
+            output.push_str(&format_standalone(parent, &deps_map, detail));
         }
     }
     Ok(output)
@@ -3631,7 +3655,7 @@ mod tests {
     fn assert_golden(source_file: &str, golden_file: &str) {
         let db_path = shared_skeleton_db_path();
         let conn = db::open(db_path).unwrap();
-        let output = get_file_skeleton(&conn, source_file, &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, source_file, &ContentPolicy::default(), DetailLevel::Standard).unwrap();
         let expected = std::fs::read_to_string(skeleton_fixture_root().join(golden_file)).unwrap();
         assert_eq!(output, expected);
     }
@@ -3646,7 +3670,7 @@ mod tests {
         insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::MyStruct::count", "count", "field", 2, 2, Some("count: usize"), None, Some("h"), Some(1));
         insert_sym(&conn, 3, 1, "src/lib.rs::MyStruct::process", "process", "method", 5, 20, Some("pub fn process(&self)"), Some("Process data"), Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
 
         assert!(output.contains("### MyStruct"), "struct must appear in skeleton");
         assert!(output.contains("pub struct MyStruct"), "struct signature must render");
@@ -3688,7 +3712,7 @@ mod tests {
         insert_sym(&conn, 2, 1, "src/lib.rs::Widget::new", "new", "method", 5, 10, Some("pub fn new() -> Self"), None, Some("h"));
         insert_sym(&conn, 3, 1, "src/lib.rs::Widget::<Display>::fmt", "fmt", "method", 12, 20, Some("fn fmt(&self, f: &mut Formatter)"), None, Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
 
         assert!(output.contains("### Widget (`src/lib.rs::Widget`)"));
         assert!(output.contains("#### pub fn new() -> Self"));
@@ -3703,7 +3727,7 @@ mod tests {
         conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
         insert_sym(&conn, 1, 1, "src/lib.rs::helper", "helper", "function", 1, 5, Some("pub fn helper()"), None, Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
 
         assert!(output.contains("### helper (`src/lib.rs::helper`)"));
         assert!(output.contains("Signature: `pub fn helper()`"));
@@ -3725,7 +3749,7 @@ mod tests {
         ).unwrap();
         let policy = ContentPolicy::load(dir.path());
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &policy).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap();
 
         assert!(output.contains("#### secret [redacted by policy]"));
         assert!(output.contains("#### visible: bool"));
@@ -3742,7 +3766,7 @@ mod tests {
         insert_sym(&conn, 3, 1, "src/lib.rs::Config", "Config", "struct", 35, 40, Some("pub struct Config"), None, Some("h"));
         conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (2, 3, 'calls')", []).unwrap();
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
 
         assert!(output.contains("#### pub fn new() -> Self"), "method must appear grouped");
         assert!(output.contains("Dependencies: Config (calls)"), "grouped method deps must render; got:\n{output}");
@@ -3766,7 +3790,7 @@ mod tests {
         ).unwrap();
         let policy = ContentPolicy::load(dir.path());
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &policy).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap();
 
         assert!(output.contains("#### secret_op [redacted by policy]"), "redacted method title must show; got:\n{output}");
         assert!(!output.contains("InternalApi (calls)"), "redacted method must NOT leak dep names; got:\n{output}");
@@ -3792,7 +3816,7 @@ mod tests {
             ("src/php_outline.php", "php_outline.golden.txt"),
             ("src/py_outline.py", "py_outline.golden.txt"),
         ] {
-            let output = get_file_skeleton(&conn, src, &ContentPolicy::default()).unwrap();
+            let output = get_file_skeleton(&conn, src, &ContentPolicy::default(), DetailLevel::Standard).unwrap();
             std::fs::write(fixture_root.join(golden), &output).unwrap();
         }
     }
@@ -3816,7 +3840,7 @@ mod tests {
     fn get_file_skeleton_golden_ts_outline_rich() {
         let fixture_root = skeleton_fixture_root();
         let (_db_dir, conn) = index_project_fixture(&fixture_root);
-        let output = get_file_skeleton(&conn, "src/ts_outline_rich.ts", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/ts_outline_rich.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
         let expected = std::fs::read_to_string(fixture_root.join("ts_outline_rich.golden.txt")).unwrap();
         assert_eq!(output, expected);
     }
@@ -3825,7 +3849,7 @@ mod tests {
     fn get_file_skeleton_golden_js_outline() {
         let fixture_root = skeleton_fixture_root();
         let (_db_dir, conn) = index_project_fixture(&fixture_root);
-        let output = get_file_skeleton(&conn, "src/js_outline.js", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/js_outline.js", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
         let expected = std::fs::read_to_string(fixture_root.join("js_outline.golden.txt")).unwrap();
         assert_eq!(output, expected);
     }
@@ -3834,7 +3858,7 @@ mod tests {
     fn get_file_skeleton_cross_language_nested_rendering() {
         let db_path = shared_skeleton_db_path();
         let conn = db::open(db_path).unwrap();
-        let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default()).unwrap();
+        let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
 
         assert!(output.contains("### Greeter (`src/ts_outline.ts::Greeter`)"));
         assert!(output.contains("#### message: string"));
@@ -3943,6 +3967,163 @@ function getStatus(s: Status): string {\n\
         let fqn = crate::graph::store::lookup_symbol_at_line(&conn, "src/a.rs", 15).unwrap();
         assert_eq!(fqn.as_deref(), Some("src/a.rs::Widget::render"),
             "narrowest symbol (method) must be returned, not the class");
+    }
+
+    // --- Story 15.5: skeleton detail level tests ---
+
+    #[test]
+    fn get_file_skeleton_minimal_omits_children() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Config", "Config", "struct", 1, 30, Some("pub struct Config"), None, Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::name", "name", "field", 2, 2, Some("pub name: String"), None, Some("h"), Some(1));
+        insert_sym(&conn, 3, 1, "src/lib.rs::Config::new", "new", "method", 5, 10, Some("pub fn new() -> Config"), None, Some("h"));
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Minimal).unwrap();
+
+        assert!(output.contains("# File Skeleton: src/lib.rs"), "global header must be present");
+        assert!(output.contains("### Config (Struct) — lines 1-30"), "minimal must show name+kind+lines");
+        assert!(!output.contains("####"), "minimal must omit all children and methods");
+        assert!(!output.contains("Signature:"), "minimal must omit signatures");
+        assert!(!output.contains("Dependencies"), "minimal must omit deps");
+    }
+
+    #[test]
+    fn get_file_skeleton_standard_matches_current() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Config", "Config", "struct", 1, 30, Some("pub struct Config"), None, Some("h"));
+        insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::name", "name", "field", 2, 2, Some("pub name: String"), None, Some("h"), Some(1));
+
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+
+        assert!(output.contains("### Config (`src/lib.rs::Config`)"), "standard must show FQN");
+        assert!(output.contains("File: `src/lib.rs`"), "standard must show File: line");
+        assert!(output.contains("Signature: `pub struct Config`"), "standard must show Signature:");
+        assert!(output.contains("#### pub name: String"), "standard must show child entries");
+    }
+
+    #[test]
+    fn get_file_skeleton_detailed_shows_all_children() {
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::Big", "Big", "struct", 1, 200, Some("pub struct Big"), None, Some("h"));
+
+        for i in 0..55i64 {
+            insert_sym_with_parent(
+                &conn, i + 2, 1,
+                &format!("src/lib.rs::Big::f{i}"), &format!("f{i}"),
+                "field", i + 2, i + 2,
+                Some(&format!("f{i}: u32")), None, Some("h"), Some(1),
+            );
+        }
+
+        let output_standard = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output_detailed = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Detailed).unwrap();
+
+        assert_eq!(output_standard.matches("#### ").count(), 50, "standard caps at 50");
+        assert!(output_standard.contains("... and 5 more"), "standard truncation message");
+        assert_eq!(output_detailed.matches("#### ").count(), 55, "detailed shows all 55");
+        assert!(!output_detailed.contains("... and"), "detailed no truncation");
+    }
+
+    // --- Story 15.5: supporting skeleton budget-aware downgrade tests ---
+
+    #[test]
+    fn supporting_skeletons_downgrade_when_budget_tight() {
+        // Verify that skeletonize with Minimal produces shorter output than Standard
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::handler", "handler", "function", 1, 50,
+            Some("pub fn handler(req: Request, ctx: Context) -> Response"), None, Some("h"));
+        insert_sym(&conn, 2, 1, "src/lib.rs::helper", "helper", "function", 55, 80,
+            Some("fn helper(x: i32)"), None, Some("h"));
+        conn.execute("INSERT INTO edges VALUES (1, 1, 2, 'calls')", []).unwrap();
+
+        let standard = skeletonize(&conn, 1, DetailLevel::Standard).unwrap();
+        let minimal = skeletonize(&conn, 1, DetailLevel::Minimal).unwrap();
+
+        // Standard includes signature and deps, minimal does not
+        assert!(standard.contains("Signature:"), "standard must have signature");
+        assert!(standard.contains("Dependencies:"), "standard must have deps");
+        assert!(!minimal.contains("Signature:"), "minimal must omit signature");
+        assert!(!minimal.contains("Dependencies:"), "minimal must omit deps");
+        assert!(minimal.len() < standard.len(), "minimal must be shorter than standard");
+    }
+
+    #[test]
+    fn supporting_skeletons_try_minimal_before_break() {
+        // Call the PRODUCTION render_supporting_skeletons with a budget that
+        // can't fit a standard skeleton but CAN fit a minimal one
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+        insert_sym(&conn, 1, 1, "src/lib.rs::big_fn", "big_fn", "function", 1, 100,
+            Some("pub fn big_fn(a: String, b: Vec<u8>, c: HashMap<String, Vec<i32>>) -> Result<(), Error>"),
+            Some("A function with a long signature and docstring to take up token budget"), Some("h"));
+
+        let standard_tokens = estimate_tokens(&skeletonize(&conn, 1, DetailLevel::Standard).unwrap());
+        let minimal_tokens = estimate_tokens(&skeletonize(&conn, 1, DetailLevel::Minimal).unwrap());
+
+        // Budget between minimal and standard — forces reactive fallback
+        let tight_budget = (standard_tokens + minimal_tokens) / 2;
+        assert!(tight_budget < standard_tokens, "budget must be too small for standard");
+        assert!(tight_budget >= minimal_tokens, "budget must fit minimal");
+
+        let supporting = vec![(1i64, "test reason".to_string())];
+        let mut output = String::new();
+        let mut fqns = HashSet::new();
+        let mut paths = HashSet::new();
+        render_supporting_skeletons(
+            &conn, &supporting, tight_budget, &ContentPolicy::default(),
+            &mut output, &mut fqns, &mut paths,
+        ).unwrap();
+
+        assert!(output.contains("## Supporting Symbols"), "section header must be present");
+        assert!(output.contains("big_fn"), "symbol must be rendered");
+        assert!(!output.contains("Signature:"), "minimal form must be used (no Signature:)");
+        assert!(output.contains("File:"), "minimal skeletonize includes File: line");
+    }
+
+    #[test]
+    fn downgrade_renders_more_supporting_symbols() {
+        // Call the PRODUCTION render_supporting_skeletons and compare symbol count
+        // with vs without downgrade (tight vs generous budget)
+        let conn = build_test_db();
+        conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
+
+        // Create 10 symbols with signatures
+        for i in 0..10i64 {
+            insert_sym(&conn, i + 1, 1,
+                &format!("src/lib.rs::fn_{i}"), &format!("fn_{i}"),
+                "function", i * 10 + 1, i * 10 + 9,
+                Some(&format!("pub fn fn_{i}(arg: Vec<String>) -> Result<HashMap<String, i64>, Error>")),
+                None, Some("h"));
+        }
+
+        let supporting: Vec<(i64, String)> = (1..=10)
+            .map(|i| (i, format!("reason {i}")))
+            .collect();
+
+        // Budget fits ~3 standard skeletons + reasons but not a 4th standard.
+        // The downgrade should fit more symbols via minimal tail.
+        let standard_size = estimate_tokens(&skeletonize(&conn, 1, DetailLevel::Standard).unwrap());
+        let reason_size = estimate_tokens("Why: reason 1\n");
+        let budget = (standard_size + reason_size) * 3 + standard_size / 2;
+
+        let mut output_downgrade = String::new();
+        let mut fqns = HashSet::new();
+        let mut paths = HashSet::new();
+        render_supporting_skeletons(
+            &conn, &supporting, budget, &ContentPolicy::default(),
+            &mut output_downgrade, &mut fqns, &mut paths,
+        ).unwrap();
+        let downgrade_count = output_downgrade.matches("### ").count();
+
+        // Without downgrade: use only Standard, no fallback — budget fits exactly 3
+        // We verify this by checking that downgrade renders MORE than 3
+        assert!(downgrade_count > 3,
+            "downgrade must render more than 3 symbols (got {downgrade_count}); \
+             minimal tail should extend coverage beyond standard-only budget");
     }
 }
 
@@ -4507,5 +4688,6 @@ mod eval {
         assert!(result.contains("[project]") && result.contains("CI/CD pipeline"),
             "punctuation-heavy intents should match; got: {result}");
     }
+
 
 }
