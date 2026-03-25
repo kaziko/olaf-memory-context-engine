@@ -2179,6 +2179,13 @@ pub fn init() -> Config {\n\
         assert!(minimal.contains("(Struct)") || minimal.contains("(Function)"),
             "minimal must show Title Case kind in parentheses");
 
+        // Detailed: must contain Signature: and children (like standard), distinct from minimal
+        let args = serde_json::json!({"file_path": "src/demo.rs", "detail": "detailed"});
+        let detailed = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        assert!(detailed.contains("Signature:"), "detailed must show signatures");
+        assert!(detailed.contains("####"), "detailed must show children");
+        assert_ne!(detailed, minimal, "detailed must differ from minimal");
+
         // Absent defaults to standard
         let args = serde_json::json!({"file_path": "src/demo.rs"});
         let default_output = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
