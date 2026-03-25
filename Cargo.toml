@@ -36,7 +36,7 @@ toml = "0.8"
 glob = "0.3"
 libc = "0.2"
 ctrlc = "2"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 unicode-width = "0.2"
 fastembed = { version = "4", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
