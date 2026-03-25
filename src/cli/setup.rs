@@ -26,7 +26,7 @@ ToolSearch("select:mcp__olaf__get_brief,mcp__olaf__get_context,mcp__olaf__get_fi
 |-|-|-|-|
 | Explore codebase (start here) | `get_brief` | Multiple Grep + Read | Auto-reindexes; broad entry point |
 | Fine-grained context control | `get_context` | Multiple Grep + Read | Auto-reindexes |
-| Quick file structure overview | `get_file_skeleton` | Reading entire file | Fast, does NOT reindex |
+| Quick file structure overview | `get_file_skeleton` | Reading entire file | Fast, does NOT reindex. Accepts `detail`: `minimal` / `standard` (default) / `detailed` |
 | Analyze dependencies/impact | `get_impact` | Grep for usages | Does NOT reindex |
 | Trace execution paths | `trace_flow` | Manual file-by-file tracing | Does NOT reindex |
 | Diagnose errors/failures | `analyze_failure` | Ad-hoc investigation | Auto-reindexes local repo |
@@ -43,7 +43,9 @@ If results seem stale after edits: call `get_brief` or `get_context` to trigger 
 ### Pre-edit understanding
 
 Before editing a file over 200 lines, use `get_file_skeleton` to understand its structure first. \
-This saves 90%+ tokens compared to reading the full file and gives you signatures, docstrings, and dependency edges.
+This saves 90%+ tokens compared to reading the full file and gives you signatures, docstrings, and dependency edges. \
+Use `detail: "minimal"` when you only need names and line ranges (e.g. scanning many files). \
+Use `detail: "detailed"` when you need all children and their dependency edges for a deep type inspection.
 
 ### When to use native tools instead
 

@@ -95,7 +95,7 @@ This creates the `.olaf/` database, registers the MCP server in `.mcp.json`, ins
 - `get_brief` — start here. Context brief for any task with optional impact analysis
 - `get_context` — token-budgeted context retrieval (fine-grained control)
 - `get_impact` — find symbols that call, extend, or depend on a given symbol
-- `get_file_skeleton` — IDE-like outline of a file: signatures, edges, enum variants, struct fields, trait items nested under parents, impl methods grouped under their type
+- `get_file_skeleton` — IDE-like outline of a file: signatures, edges, enum variants, struct fields, trait items nested under parents, impl methods grouped under their type. Supports `detail` parameter: `"minimal"` (~3× fewer tokens), `"standard"` (default), `"detailed"` (200-child cap, child dependency edges)
 - `analyze_failure` — parse a stack trace or error and get a context brief focused on the failure path
 
 **Session memory:**
