@@ -1764,15 +1764,18 @@ fn query_file_candidates(
     Ok(paths)
 }
 
-pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy, detail: DetailLevel) -> Result<String, QueryError> {
+/// Returns `(output_string, resolved_db_path)`. `resolved_db_path` is `None` for early-return
+/// error branches (sensitive, not found, multiple matches) — the handler uses this to decide
+/// whether to append a freshness footer.
+pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_policy: &ContentPolicy, detail: DetailLevel) -> Result<(String, Option<String>), QueryError> {
     // Input-level sensitive check — returns "not permitted" to the caller
     if is_sensitive(file_path) {
-        return Ok(format!("Access to sensitive file '{file_path}' is not permitted.\n"));
+        return Ok((format!("Access to sensitive file '{file_path}' is not permitted.\n"), None));
     }
 
     // Content policy deny — return "not found" so denied files are invisible
     if content_policy.is_denied(file_path, None) {
-        return Ok(format!("No file found matching: {file_path}\n\nEnsure the file is indexed with `olaf index`.\n"));
+        return Ok((format!("No file found matching: {file_path}\n\nEnsure the file is indexed with `olaf index`.\n"), None));
     }
 
     // Stage 1: exact file match
@@ -1791,15 +1794,15 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
     candidates.retain(|p| !content_policy.is_denied(p, None));
 
     if candidates.is_empty() {
-        return Ok(format!(
+        return Ok((format!(
             "No file found matching: {file_path}\n\nEnsure the file is indexed with `olaf index`.\n"
-        ));
+        ), None));
     }
     if candidates.len() > 1 {
-        return Ok(format!(
+        return Ok((format!(
             "Multiple files match '{file_path}':\n{}\nProvide a more specific path.\n",
             candidates.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n")
-        ));
+        ), None));
     }
     let resolved_path = &candidates[0];
 
@@ -1829,9 +1832,9 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
         .collect::<Result<_, _>>()?;
 
     if symbols.is_empty() {
-        return Ok(format!(
+        return Ok((format!(
             "No symbols found in file: {resolved_path}. The file may not contain indexable symbols.\n"
-        ));
+        ), Some(resolved_path.clone())));
     }
 
     let parents: Vec<&SkeletonSymbol> = symbols.iter().filter(|symbol| symbol.parent_id.is_none()).collect();
@@ -1930,7 +1933,8 @@ pub(crate) fn get_file_skeleton(conn: &Connection, file_path: &str, content_poli
             output.push_str(&format_standalone(parent, &deps_map, detail));
         }
     }
-    Ok(output)
+    let resolved = resolved_path.clone();
+    Ok((output, Some(resolved)))
 }
 
 pub(crate) fn index_status(conn: &Connection) -> Result<String, QueryError> {
@@ -1957,10 +1961,10 @@ pub(crate) fn get_impact(
     symbol_fqn: &str,
     depth: usize,
     content_policy: &ContentPolicy,
-) -> Result<String, QueryError> {
+) -> Result<(String, HashSet<String>), QueryError> {
     // Direct-query guard: denied FQN (by fqn_prefix or path rules) returns "not found"
     if content_policy.is_denied_by_fqn(symbol_fqn) {
-        return Ok(format!("Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."));
+        return Ok((format!("Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."), HashSet::new()));
     }
 
     let depth = depth.min(MAX_IMPACT_DEPTH);
@@ -1971,9 +1975,9 @@ pub(crate) fn get_impact(
     ).optional()?;
 
     let Some(symbol_id) = symbol_id else {
-        return Ok(format!(
+        return Ok((format!(
             "Symbol not found: {symbol_fqn}\n\nRun `olaf index` first."
-        ));
+        ), HashSet::new()));
     };
 
     let mut visited: HashSet<i64> = HashSet::from([symbol_id]);
@@ -2038,7 +2042,124 @@ pub(crate) fn get_impact(
         ));
     }
 
-    Ok(output)
+    let mut file_paths: HashSet<String> = results.iter().map(|(_, _, p, _, _)| p.clone()).collect();
+    // Include the root symbol's file — even with zero dependents, its freshness matters
+    if let Ok(root_path) = conn.query_row(
+        "SELECT f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=?1",
+        params![symbol_id],
+        |r| r.get::<_, String>(0),
+    )
+        && !is_sensitive(&root_path) && !content_policy.is_denied(&root_path, None)
+    {
+        file_paths.insert(root_path);
+    }
+    Ok((output, file_paths))
+}
+
+// ─── Freshness metadata types and check functions ──────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshnessStatus {
+    Current,
+    Stale,
+    Unknown,
+}
+
+impl std::fmt::Display for FreshnessStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FreshnessStatus::Current => write!(f, "current"),
+            FreshnessStatus::Stale => write!(f, "stale"),
+            FreshnessStatus::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FileFreshness {
+    pub status: FreshnessStatus,
+    pub indexed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FreshnessMode {
+    SingleFile,   // freshness: {status} | indexed_at: {ts}
+    MultiFile,    // freshness: {status} | oldest_indexed_at: {ts}
+    LocalOnly,    // local_freshness: {status} | indexed_at: {ts}
+}
+
+fn format_unix_ts(ts: i64) -> String {
+    use chrono::{DateTime, Utc};
+    DateTime::from_timestamp(ts, 0)
+        .map(|dt: DateTime<Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(crate) fn format_freshness_footer(
+    freshness: &FileFreshness,
+    mode: FreshnessMode,
+) -> String {
+    let ts_str = freshness.indexed_at.map(format_unix_ts).unwrap_or_else(|| "never".to_string());
+    match mode {
+        FreshnessMode::SingleFile => format!("\n---\nfreshness: {} | indexed_at: {}\n", freshness.status, ts_str),
+        FreshnessMode::MultiFile => format!("\n---\nfreshness: {} | oldest_indexed_at: {}\n", freshness.status, ts_str),
+        FreshnessMode::LocalOnly => format!("\n---\nlocal_freshness: {} | indexed_at: {}\n", freshness.status, ts_str),
+    }
+}
+
+pub(crate) fn check_file_freshness(conn: &Connection, project_root: &Path, rel_path: &str) -> FileFreshness {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT blake3_hash, last_indexed_at FROM files WHERE path = ?1",
+            params![rel_path],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    let Some((stored_hash, indexed_at)) = row else {
+        return FileFreshness { status: FreshnessStatus::Unknown, indexed_at: None };
+    };
+
+    let abs_path = project_root.join(rel_path);
+    let bytes = match std::fs::read(&abs_path) {
+        Ok(b) => b,
+        Err(_) => return FileFreshness { status: FreshnessStatus::Unknown, indexed_at: Some(indexed_at) },
+    };
+
+    let current_hash = blake3::hash(&bytes).to_hex().to_string();
+    if current_hash == stored_hash {
+        FileFreshness { status: FreshnessStatus::Current, indexed_at: Some(indexed_at) }
+    } else {
+        FileFreshness { status: FreshnessStatus::Stale, indexed_at: Some(indexed_at) }
+    }
+}
+
+pub(crate) fn check_files_freshness(conn: &Connection, project_root: &Path, paths: &HashSet<String>) -> FileFreshness {
+    if paths.is_empty() {
+        return FileFreshness { status: FreshnessStatus::Unknown, indexed_at: None };
+    }
+
+    let mut overall_status = FreshnessStatus::Current;
+    let mut earliest_ts: Option<i64> = None;
+
+    for path in paths {
+        let f = check_file_freshness(conn, project_root, path);
+        match f.status {
+            FreshnessStatus::Stale => overall_status = FreshnessStatus::Stale,
+            FreshnessStatus::Unknown => {
+                if overall_status == FreshnessStatus::Current {
+                    overall_status = FreshnessStatus::Unknown;
+                }
+            }
+            FreshnessStatus::Current => {}
+        }
+        if let Some(ts) = f.indexed_at {
+            earliest_ts = Some(earliest_ts.map_or(ts, |e: i64| e.min(ts)));
+        }
+    }
+
+    FileFreshness { status: overall_status, indexed_at: earliest_ts }
 }
 
 #[cfg(test)]
@@ -2864,7 +2985,7 @@ mod tests {
         insert_sym(&conn, 2, 2, "src/handler.ts::handleRequest", "handleRequest", "fn", 1, 5, None, None, None);
         conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::MyInterface", 2, &ContentPolicy::default()).unwrap();
+        let result = get_impact(&conn, "src/types.ts::MyInterface", 2, &ContentPolicy::default()).unwrap().0;
         assert!(result.contains("handleRequest"), "type user must appear in impact results");
         assert!(result.contains("uses_type"), "edge kind must be shown in output");
     }
@@ -2878,7 +2999,7 @@ mod tests {
         insert_sym(&conn, 2, 2, "src/other.ts::Ref", "Ref", "fn", 1, 5, None, None, None);
         conn.execute("INSERT INTO edges VALUES (1,2,1,'references')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::Target", 2, &ContentPolicy::default()).unwrap();
+        let result = get_impact(&conn, "src/types.ts::Target", 2, &ContentPolicy::default()).unwrap().0;
         assert!(!result.contains("Ref"), "references edge must NOT appear in impact results");
     }
 
@@ -2897,7 +3018,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,2,1,'uses_type')", []).unwrap();
         conn.execute("INSERT INTO edges VALUES (2,3,2,'calls')", []).unwrap();
 
-        let result = get_impact(&conn, "src/types.ts::A", 3, &ContentPolicy::default()).unwrap();
+        let result = get_impact(&conn, "src/types.ts::A", 3, &ContentPolicy::default()).unwrap().0;
         assert!(result.contains("B"), "B (uses_type A) must appear at depth 1");
         assert!(result.contains("C"), "C (calls B) must appear at depth 2");
         assert!(result.contains("uses_type"), "uses_type edge kind must be shown");
@@ -2922,7 +3043,7 @@ mod tests {
             ).unwrap();
         }
 
-        let result = get_impact(&conn, "src/types.ts::Target", 1, &ContentPolicy::default()).unwrap();
+        let result = get_impact(&conn, "src/types.ts::Target", 1, &ContentPolicy::default()).unwrap().0;
         assert!(result.contains("Results truncated"), "truncation warning must appear when >100 dependents");
     }
 
@@ -3655,7 +3776,7 @@ mod tests {
     fn assert_golden(source_file: &str, golden_file: &str) {
         let db_path = shared_skeleton_db_path();
         let conn = db::open(db_path).unwrap();
-        let output = get_file_skeleton(&conn, source_file, &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, source_file, &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
         let expected = std::fs::read_to_string(skeleton_fixture_root().join(golden_file)).unwrap();
         assert_eq!(output, expected);
     }
@@ -3670,7 +3791,7 @@ mod tests {
         insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::MyStruct::count", "count", "field", 2, 2, Some("count: usize"), None, Some("h"), Some(1));
         insert_sym(&conn, 3, 1, "src/lib.rs::MyStruct::process", "process", "method", 5, 20, Some("pub fn process(&self)"), Some("Process data"), Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("### MyStruct"), "struct must appear in skeleton");
         assert!(output.contains("pub struct MyStruct"), "struct signature must render");
@@ -3712,7 +3833,7 @@ mod tests {
         insert_sym(&conn, 2, 1, "src/lib.rs::Widget::new", "new", "method", 5, 10, Some("pub fn new() -> Self"), None, Some("h"));
         insert_sym(&conn, 3, 1, "src/lib.rs::Widget::<Display>::fmt", "fmt", "method", 12, 20, Some("fn fmt(&self, f: &mut Formatter)"), None, Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("### Widget (`src/lib.rs::Widget`)"));
         assert!(output.contains("#### pub fn new() -> Self"));
@@ -3727,7 +3848,7 @@ mod tests {
         conn.execute("INSERT INTO files (id, path, hash) VALUES (1, 'src/lib.rs', 'abc')", []).unwrap();
         insert_sym(&conn, 1, 1, "src/lib.rs::helper", "helper", "function", 1, 5, Some("pub fn helper()"), None, Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("### helper (`src/lib.rs::helper`)"));
         assert!(output.contains("Signature: `pub fn helper()`"));
@@ -3749,7 +3870,7 @@ mod tests {
         ).unwrap();
         let policy = ContentPolicy::load(dir.path());
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("#### secret [redacted by policy]"));
         assert!(output.contains("#### visible: bool"));
@@ -3766,7 +3887,7 @@ mod tests {
         insert_sym(&conn, 3, 1, "src/lib.rs::Config", "Config", "struct", 35, 40, Some("pub struct Config"), None, Some("h"));
         conn.execute("INSERT INTO edges (source_id, target_id, kind) VALUES (2, 3, 'calls')", []).unwrap();
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("#### pub fn new() -> Self"), "method must appear grouped");
         assert!(output.contains("Dependencies: Config (calls)"), "grouped method deps must render; got:\n{output}");
@@ -3790,7 +3911,7 @@ mod tests {
         ).unwrap();
         let policy = ContentPolicy::load(dir.path());
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &policy, DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("#### secret_op [redacted by policy]"), "redacted method title must show; got:\n{output}");
         assert!(!output.contains("InternalApi (calls)"), "redacted method must NOT leak dep names; got:\n{output}");
@@ -3816,7 +3937,7 @@ mod tests {
             ("src/php_outline.php", "php_outline.golden.txt"),
             ("src/py_outline.py", "py_outline.golden.txt"),
         ] {
-            let output = get_file_skeleton(&conn, src, &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+            let output = get_file_skeleton(&conn, src, &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
             std::fs::write(fixture_root.join(golden), &output).unwrap();
         }
     }
@@ -3840,7 +3961,7 @@ mod tests {
     fn get_file_skeleton_golden_ts_outline_rich() {
         let fixture_root = skeleton_fixture_root();
         let (_db_dir, conn) = index_project_fixture(&fixture_root);
-        let output = get_file_skeleton(&conn, "src/ts_outline_rich.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/ts_outline_rich.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
         let expected = std::fs::read_to_string(fixture_root.join("ts_outline_rich.golden.txt")).unwrap();
         assert_eq!(output, expected);
     }
@@ -3849,7 +3970,7 @@ mod tests {
     fn get_file_skeleton_golden_js_outline() {
         let fixture_root = skeleton_fixture_root();
         let (_db_dir, conn) = index_project_fixture(&fixture_root);
-        let output = get_file_skeleton(&conn, "src/js_outline.js", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/js_outline.js", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
         let expected = std::fs::read_to_string(fixture_root.join("js_outline.golden.txt")).unwrap();
         assert_eq!(output, expected);
     }
@@ -3858,7 +3979,7 @@ mod tests {
     fn get_file_skeleton_cross_language_nested_rendering() {
         let db_path = shared_skeleton_db_path();
         let conn = db::open(db_path).unwrap();
-        let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/ts_outline.ts", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("### Greeter (`src/ts_outline.ts::Greeter`)"));
         assert!(output.contains("#### message: string"));
@@ -3979,7 +4100,7 @@ function getStatus(s: Status): string {\n\
         insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::name", "name", "field", 2, 2, Some("pub name: String"), None, Some("h"), Some(1));
         insert_sym(&conn, 3, 1, "src/lib.rs::Config::new", "new", "method", 5, 10, Some("pub fn new() -> Config"), None, Some("h"));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Minimal).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Minimal).unwrap().0;
 
         assert!(output.contains("# File Skeleton: src/lib.rs"), "global header must be present");
         assert!(output.contains("### Config (Struct) — lines 1-30"), "minimal must show name+kind+lines");
@@ -3995,7 +4116,7 @@ function getStatus(s: Status): string {\n\
         insert_sym(&conn, 1, 1, "src/lib.rs::Config", "Config", "struct", 1, 30, Some("pub struct Config"), None, Some("h"));
         insert_sym_with_parent(&conn, 2, 1, "src/lib.rs::Config::name", "name", "field", 2, 2, Some("pub name: String"), None, Some("h"), Some(1));
 
-        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
+        let output = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
 
         assert!(output.contains("### Config (`src/lib.rs::Config`)"), "standard must show FQN");
         assert!(output.contains("File: `src/lib.rs`"), "standard must show File: line");
@@ -4018,8 +4139,8 @@ function getStatus(s: Status): string {\n\
             );
         }
 
-        let output_standard = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap();
-        let output_detailed = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Detailed).unwrap();
+        let output_standard = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Standard).unwrap().0;
+        let output_detailed = get_file_skeleton(&conn, "src/lib.rs", &ContentPolicy::default(), DetailLevel::Detailed).unwrap().0;
 
         assert_eq!(output_standard.matches("#### ").count(), 50, "standard caps at 50");
         assert!(output_standard.contains("... and 5 more"), "standard truncation message");
@@ -4689,5 +4810,100 @@ mod eval {
             "punctuation-heavy intents should match; got: {result}");
     }
 
+    // ─── Story 15.6: freshness metadata unit tests ──────
+
+    fn setup_freshness_db(tmp: &std::path::Path) -> rusqlite::Connection {
+        let db_path = tmp.join(".olaf").join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        // Insert a file row with known blake3 hash
+        let content = b"fn main() {}";
+        let hash = blake3::hash(content).to_hex().to_string();
+        let ts = 1711360200; // 2024-03-25T10:30:00Z
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, language, last_indexed_at) VALUES (?1, ?2, 'rust', ?3)",
+            rusqlite::params![&"src/main.rs", &hash, ts],
+        ).unwrap();
+        // Write matching file to disk
+        let src_dir = tmp.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("main.rs"), content).unwrap();
+        conn
+    }
+
+    #[test]
+    fn check_freshness_matching_hash_is_current() {
+        let tmp = tempdir().unwrap();
+        let conn = setup_freshness_db(tmp.path());
+        let f = check_file_freshness(&conn, tmp.path(), "src/main.rs");
+        assert_eq!(f.status, FreshnessStatus::Current);
+        assert_eq!(f.indexed_at, Some(1711360200));
+    }
+
+    #[test]
+    fn check_freshness_mismatched_hash_is_stale() {
+        let tmp = tempdir().unwrap();
+        let conn = setup_freshness_db(tmp.path());
+        // Overwrite with different content
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn changed() {}").unwrap();
+        let f = check_file_freshness(&conn, tmp.path(), "src/main.rs");
+        assert_eq!(f.status, FreshnessStatus::Stale);
+        assert_eq!(f.indexed_at, Some(1711360200));
+    }
+
+    #[test]
+    fn check_freshness_missing_row_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(".olaf").join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        let f = check_file_freshness(&conn, tmp.path(), "nonexistent.rs");
+        assert_eq!(f.status, FreshnessStatus::Unknown);
+        assert_eq!(f.indexed_at, None);
+    }
+
+    #[test]
+    fn check_freshness_missing_disk_file_is_unknown() {
+        let tmp = tempdir().unwrap();
+        let conn = setup_freshness_db(tmp.path());
+        // Delete the file from disk
+        std::fs::remove_file(tmp.path().join("src/main.rs")).unwrap();
+        let f = check_file_freshness(&conn, tmp.path(), "src/main.rs");
+        assert_eq!(f.status, FreshnessStatus::Unknown);
+        assert_eq!(f.indexed_at, Some(1711360200));
+    }
+
+    #[test]
+    fn check_files_freshness_aggregate_stale() {
+        let tmp = tempdir().unwrap();
+        let conn = setup_freshness_db(tmp.path());
+        // Add a second file row that will be stale
+        let content2 = b"fn other() {}";
+        let hash2 = blake3::hash(content2).to_hex().to_string();
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, language, last_indexed_at) VALUES (?1, ?2, 'rust', ?3)",
+            rusqlite::params![&"src/other.rs", &hash2, 1711360100],
+        ).unwrap();
+        // Write different content so it's stale
+        std::fs::write(tmp.path().join("src/other.rs"), b"fn modified() {}").unwrap();
+
+        let paths: HashSet<String> = ["src/main.rs".to_string(), "src/other.rs".to_string()].into();
+        let f = check_files_freshness(&conn, tmp.path(), &paths);
+        assert_eq!(f.status, FreshnessStatus::Stale);
+        // earliest timestamp should be from other.rs
+        assert_eq!(f.indexed_at, Some(1711360100));
+    }
+
+    #[test]
+    fn format_freshness_footer_current() {
+        let f = FileFreshness { status: FreshnessStatus::Current, indexed_at: Some(1711360200) };
+        let footer = format_freshness_footer(&f, FreshnessMode::SingleFile);
+        assert_eq!(footer, "\n---\nfreshness: current | indexed_at: 2024-03-25T09:50:00Z\n");
+    }
+
+    #[test]
+    fn format_freshness_footer_never() {
+        let f = FileFreshness { status: FreshnessStatus::Unknown, indexed_at: None };
+        let footer = format_freshness_footer(&f, FreshnessMode::SingleFile);
+        assert_eq!(footer, "\n---\nfreshness: unknown | indexed_at: never\n");
+    }
 
 }

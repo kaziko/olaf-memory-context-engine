@@ -4,6 +4,10 @@ use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
+use crate::graph::query::{
+    check_file_freshness, check_files_freshness, format_freshness_footer,
+    FileFreshness, FreshnessMode, FreshnessStatus,
+};
 use crate::policy::ContentPolicy;
 
 /// Error types for tool dispatch — maps to MCP error codes in server.rs.
@@ -87,7 +91,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_impact",
-            "description": "Find symbols that call, extend, implement, or use a given symbol FQN as a type. Import relationships are not yet tracked at symbol level. For combined context+impact, use get_brief with symbol_fqn. Use get_impact when you already have a specific symbol and want only its dependents.",
+            "description": "Find symbols that call, extend, implement, or use a given symbol FQN as a type. Import relationships are not yet tracked at symbol level. For combined context+impact, use get_brief with symbol_fqn. Use get_impact when you already have a specific symbol and want only its dependents. Response includes freshness metadata footer when dependents are found.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -117,7 +121,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_file_skeleton",
-            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. When to use instead of: Read for any file over 200 lines that you need to understand before editing. Returns 90%+ fewer tokens than reading the full file while showing the complete structure. Example: {\"file_path\": \"src/mcp/tools.rs\"} returns all function signatures, struct definitions, and imports without method bodies. Accepts exact or partial file paths.",
+            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. When to use instead of: Read for any file over 200 lines that you need to understand before editing. Returns 90%+ fewer tokens than reading the full file while showing the complete structure. Example: {\"file_path\": \"src/mcp/tools.rs\"} returns all function signatures, struct definitions, and imports without method bodies. Accepts exact or partial file paths. Response includes freshness metadata (current/stale/unknown). Set refresh_if_stale to true to trigger a targeted reindex if stale.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -129,6 +133,10 @@ pub(crate) fn list() -> Vec<Value> {
                         "type": "string",
                         "description": "Level of skeleton detail: 'minimal' (names+lines only), 'standard' (default, full signatures and children), or 'detailed' (all members, lifted caps, extra metadata)",
                         "enum": ["minimal", "standard", "detailed"]
+                    },
+                    "refresh_if_stale": {
+                        "type": "boolean",
+                        "description": "If true and file is stale, trigger a targeted reindex before returning. Default: false."
                     }
                 },
                 "required": ["file_path"]
@@ -136,7 +144,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "trace_flow",
-            "description": "Find execution paths between two symbols in the call graph. When to use instead of: manually reading files one-by-one to trace how code connects. Traverses calls/extends/implements edges and returns shortest paths up to max_paths.",
+            "description": "Find execution paths between two symbols in the call graph. When to use instead of: manually reading files one-by-one to trace how code connects. Traverses calls/extends/implements edges and returns shortest paths up to max_paths. Response includes freshness metadata footer when paths are found.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -311,14 +319,14 @@ pub(crate) fn dispatch(ws: &mut crate::workspace::Workspace, session_id: &str, p
         "get_context"          => handle_get_context(ws, args),
         // Local-only tools
         "analyze_failure"  => { let (c, r) = ws.local_parts(); handle_analyze_failure(c, r, session_id, args) }
-        "get_impact"       => { let cp = ContentPolicy::load(ws.local_root()); handle_get_impact(ws.local_conn(), args, &cp) }
-        "get_file_skeleton" => { let cp = ContentPolicy::load(ws.local_root()); handle_get_file_skeleton(ws.local_conn(), args, &cp) }
+        "get_impact"       => { let cp = ContentPolicy::load(ws.local_root()); let r = ws.local_root().to_path_buf(); handle_get_impact(ws.local_conn(), &r, args, &cp) }
+        "get_file_skeleton" => { let cp = ContentPolicy::load(ws.local_root()); let (c, r) = ws.local_parts(); handle_get_file_skeleton(c, r, args, &cp) }
         "index_status"     => handle_index_status(ws.local_conn()),
         "save_observation"     => { let (c, r) = ws.local_parts(); handle_save_observation(c, r, session_id, args) }
         "get_session_history"  => { let cp = ContentPolicy::load(ws.local_root()); let (c, r) = ws.local_parts(); handle_get_session_history(c, r, args, &cp) }
         "list_restore_points"  => handle_list_restore_points(ws.local_root(), args),
         "undo_change"          => { let (c, r) = ws.local_parts(); handle_undo_change(c, r, session_id, args) }
-        "trace_flow"           => { let cp = ContentPolicy::load(ws.local_root()); handle_trace_flow(ws.local_conn(), args, &cp) }
+        "trace_flow"           => { let cp = ContentPolicy::load(ws.local_root()); let r = ws.local_root().to_path_buf(); handle_trace_flow(ws.local_conn(), &r, args, &cp) }
         "submit_lsp_edges"     => handle_submit_lsp_edges(ws.local_conn(), args),
         "memory_health"        => { let (c, r) = ws.local_parts(); handle_memory_health(c, r, args) }
         _ => Err(ToolError::UnknownTool(tool_name.to_string())),
@@ -839,21 +847,28 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
     result.push_str(&ws.format_warnings_with_freshness());
     // Append retrieval notes (budget-exempt)
     result.push_str(&retrieval_notes);
+
+    // Freshness footer (budget-exempt) — data was just auto-reindexed
+    append_auto_reindex_freshness(ws, &mut result);
+
     Ok(result)
 }
 
-fn handle_get_impact(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
+fn handle_get_impact(conn: &rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
     let symbol_fqn = args.get("symbol_fqn").and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("missing required field: symbol_fqn".to_string()))?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(3);
 
-    crate::graph::query::get_impact(conn, symbol_fqn, depth, content_policy)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+    let (mut output, file_paths) = crate::graph::query::get_impact(conn, symbol_fqn, depth, content_policy)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    append_multi_file_freshness(conn, project_root, &file_paths, &mut output);
+    Ok(output)
 }
 
-fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
+fn handle_get_file_skeleton(conn: &mut rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     use crate::graph::DetailLevel;
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
@@ -871,8 +886,43 @@ fn handle_get_file_skeleton(conn: &rusqlite::Connection, args: Option<&Value>, c
             format!("invalid detail level '{other}': must be 'minimal', 'standard', or 'detailed'")
         )),
     };
-    crate::graph::query::get_file_skeleton(conn, file_path, content_policy, detail)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))
+    let refresh = match args.get("refresh_if_stale") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ToolError::InvalidParams(
+            "refresh_if_stale must be a boolean".to_string()
+        )),
+    };
+
+    let (mut output, resolved_path) = crate::graph::query::get_file_skeleton(conn, file_path, content_policy, detail)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+
+    if let Some(ref resolved) = resolved_path {
+        let mut freshness = check_file_freshness(conn, project_root, resolved);
+        if freshness.status == FreshnessStatus::Stale && refresh {
+            match crate::index::incremental::reindex_single_file(conn, project_root, resolved) {
+                Ok(crate::index::incremental::ReindexOutcome::Changed(_)) => {
+                    // Symbols changed — re-render skeleton from fresh DB data using resolved path
+                    let (new_output, _) = crate::graph::query::get_file_skeleton(conn, resolved, content_policy, detail)
+                        .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
+                    output = new_output;
+                    freshness = check_file_freshness(conn, project_root, resolved);
+                }
+                Ok(crate::index::incremental::ReindexOutcome::Unchanged) => {
+                    freshness = check_file_freshness(conn, project_root, resolved);
+                }
+                Ok(crate::index::incremental::ReindexOutcome::SoftFailure(_)) => {
+                    // Expected failure (IO, unsupported lang, parse error) — freshness stays Stale
+                }
+                Err(e) => {
+                    return Err(ToolError::Internal(anyhow::anyhow!("refresh_if_stale reindex failed: {e}")));
+                }
+            }
+        }
+        output.push_str(&format_freshness_footer(&freshness, FreshnessMode::SingleFile));
+    }
+
+    Ok(output)
 }
 
 fn handle_index_status(conn: &rusqlite::Connection) -> Result<String, ToolError> {
@@ -1352,10 +1402,10 @@ fn handle_get_brief(
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
-    // Build impact section (local-only)
+    // Build impact section (local-only) — ignore file_paths (.0 only), already auto-reindexed
     let impact_output = if let Some(fqn) = symbol_fqn {
         crate::graph::query::get_impact(ws.local_conn(), fqn, depth, &content_policy)
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?.0
     } else {
         "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
     };
@@ -1374,10 +1424,13 @@ fn handle_get_brief(
     // Append retrieval notes (budget-exempt)
     output.push_str(&retrieval_notes);
 
+    // Freshness footer (budget-exempt) — data was just auto-reindexed
+    append_auto_reindex_freshness(ws, &mut output);
+
     Ok(output)
 }
 
-fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
+fn handle_trace_flow(conn: &rusqlite::Connection, project_root: &Path, args: Option<&Value>, content_policy: &ContentPolicy) -> Result<String, ToolError> {
     let empty = serde_json::json!({});
     let args = args.unwrap_or(&empty);
 
@@ -1414,7 +1467,33 @@ fn handle_trace_flow(conn: &rusqlite::Connection, args: Option<&Value>, content_
     let result = crate::graph::trace::trace_flow(conn, source_id, target_id, max_paths)
         .map_err(anyhow::Error::from)?;
 
-    Ok(crate::graph::trace::format_trace_result(source_fqn, target_fqn, &result, content_policy))
+    // format_trace_result returns visible file paths alongside the output — single source of truth
+    let (mut output, file_paths) = crate::graph::trace::format_trace_result(source_fqn, target_fqn, &result, content_policy);
+
+    append_multi_file_freshness(conn, project_root, &file_paths, &mut output);
+    Ok(output)
+}
+
+/// Appends freshness footer for tools that auto-reindex before returning (get_context, get_brief).
+/// Skips the footer entirely if the DB has no files (nothing to be fresh about).
+fn append_auto_reindex_freshness(ws: &mut crate::workspace::Workspace, output: &mut String) {
+    let conn = ws.local_conn();
+    let ts: Option<i64> = conn.query_row(
+        "SELECT MAX(last_indexed_at) FROM files", [], |r| r.get(0),
+    ).unwrap_or(None);
+    if let Some(ts) = ts {
+        let freshness = FileFreshness { status: FreshnessStatus::Current, indexed_at: Some(ts) };
+        let mode = if ws.has_remotes() { FreshnessMode::LocalOnly } else { FreshnessMode::SingleFile };
+        output.push_str(&format_freshness_footer(&freshness, mode));
+    }
+}
+
+/// Appends multi-file freshness footer if `file_paths` is non-empty.
+fn append_multi_file_freshness(conn: &rusqlite::Connection, project_root: &Path, file_paths: &HashSet<String>, output: &mut String) {
+    if !file_paths.is_empty() {
+        let freshness = check_files_freshness(conn, project_root, file_paths);
+        output.push_str(&format_freshness_footer(&freshness, FreshnessMode::MultiFile));
+    }
 }
 
 /// Truncates `s` so that `s.len().div_ceil(4) <= token_budget` after appending the note.
@@ -1600,16 +1679,18 @@ mod tests {
     #[test]
     fn test_trace_flow_missing_source_fqn() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let tmp = tempdir().unwrap();
         let args = serde_json::json!({ "target_fqn": "src/b.rs::bar" });
-        let result = handle_trace_flow(&conn, Some(&args), &ContentPolicy::default());
+        let result = handle_trace_flow(&conn, tmp.path(), Some(&args), &ContentPolicy::default());
         assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
     #[test]
     fn test_trace_flow_missing_target_fqn() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let tmp = tempdir().unwrap();
         let args = serde_json::json!({ "source_fqn": "src/a.rs::foo" });
-        let result = handle_trace_flow(&conn, Some(&args), &ContentPolicy::default());
+        let result = handle_trace_flow(&conn, tmp.path(), Some(&args), &ContentPolicy::default());
         assert!(matches!(result, Err(ToolError::InvalidParams(_))));
     }
 
@@ -2167,13 +2248,13 @@ pub fn init() -> Config {\n\
 
         // Standard (default): must contain Signature: and #### children
         let args = serde_json::json!({"file_path": "src/demo.rs"});
-        let standard = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        let standard = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &policy).unwrap();
         assert!(standard.contains("Signature:"), "standard must show signatures");
         assert!(standard.contains("####"), "standard must show children");
 
         // Minimal: must NOT contain Signature: or #### children
         let args = serde_json::json!({"file_path": "src/demo.rs", "detail": "minimal"});
-        let minimal = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        let minimal = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &policy).unwrap();
         assert!(!minimal.contains("Signature:"), "minimal must omit signatures");
         assert!(!minimal.contains("####"), "minimal must omit children");
         assert!(minimal.contains("(Struct)") || minimal.contains("(Function)"),
@@ -2181,14 +2262,15 @@ pub fn init() -> Config {\n\
 
         // Detailed: must contain Signature: and children (like standard), distinct from minimal
         let args = serde_json::json!({"file_path": "src/demo.rs", "detail": "detailed"});
-        let detailed = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        let detailed = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &policy).unwrap();
         assert!(detailed.contains("Signature:"), "detailed must show signatures");
         assert!(detailed.contains("####"), "detailed must show children");
         assert_ne!(detailed, minimal, "detailed must differ from minimal");
 
         // Absent defaults to standard
         let args = serde_json::json!({"file_path": "src/demo.rs"});
-        let default_output = handle_get_file_skeleton(&conn, Some(&args), &policy).unwrap();
+        let default_output = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &policy).unwrap();
+        // Both standard and default include freshness footer — compare
         assert_eq!(default_output, standard, "absent detail must equal standard");
     }
 
@@ -2196,11 +2278,213 @@ pub fn init() -> Config {\n\
     fn handle_get_file_skeleton_rejects_invalid_detail() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("index.db");
-        let conn = crate::db::open(&db_path).unwrap();
+        let mut conn = crate::db::open(&db_path).unwrap();
 
         let args = serde_json::json!({"file_path": "some.rs", "detail": "compact"});
-        let result = handle_get_file_skeleton(&conn, Some(&args), &ContentPolicy::default());
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default());
         assert!(matches!(result, Err(ToolError::InvalidParams(ref msg)) if msg.contains("compact")),
             "invalid detail value must produce InvalidParams error; got: {result:?}");
+    }
+
+    // --- Story 15.6: freshness on get_file_skeleton ---
+
+    #[test]
+    fn handle_get_file_skeleton_includes_freshness() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result.contains("freshness:"), "response must contain freshness footer; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_refresh_if_stale_reindexes() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        // Modify the file to make it stale
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello_v2() {}\n").unwrap();
+
+        // Without refresh: should be stale and show OLD symbol name
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let result_no_refresh = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result_no_refresh.contains("freshness: stale"), "without refresh should be stale; got: {result_no_refresh}");
+        assert!(result_no_refresh.contains("hello"), "stale result should show old symbol 'hello'; got: {result_no_refresh}");
+        assert!(!result_no_refresh.contains("hello_v2"), "stale result must NOT show new symbol; got: {result_no_refresh}");
+
+        // With refresh: should reindex, re-render with NEW symbol, and report current
+        let args = serde_json::json!({"file_path": "src/demo.rs", "refresh_if_stale": true});
+        let result_refresh = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result_refresh.contains("freshness: current"), "with refresh should be current; got: {result_refresh}");
+        assert!(result_refresh.contains("hello_v2"), "refreshed result must show new symbol 'hello_v2'; got: {result_refresh}");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_rejects_invalid_refresh() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+
+        let args = serde_json::json!({"file_path": "some.rs", "refresh_if_stale": "yes"});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default());
+        assert!(matches!(result, Err(ToolError::InvalidParams(ref msg)) if msg.contains("refresh_if_stale")),
+            "string value for refresh_if_stale must produce InvalidParams; got: {result:?}");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_refresh_soft_failure_stays_stale() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        // Replace with a file that will fail to parse (unsupported extension)
+        // by updating the DB path to point to a non-Rust file
+        conn.execute("UPDATE files SET path = 'src/demo.txt' WHERE path = 'src/demo.rs'", []).unwrap();
+        std::fs::rename(src_dir.join("demo.rs"), src_dir.join("demo.txt")).unwrap();
+        // Modify to make it stale
+        std::fs::write(src_dir.join("demo.txt"), b"changed content").unwrap();
+
+        let args = serde_json::json!({"file_path": "src/demo.txt", "refresh_if_stale": true});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result.contains("freshness: stale"),
+            "soft failure reindex should leave freshness as stale; got: {result}");
+    }
+
+    #[test]
+    fn tool_list_contains_refresh_if_stale() {
+        let tools = list();
+        let skeleton = tools.iter().find(|t| t["name"] == "get_file_skeleton").unwrap();
+        let props = &skeleton["inputSchema"]["properties"];
+        assert!(props.get("refresh_if_stale").is_some(),
+            "get_file_skeleton schema must contain refresh_if_stale");
+        assert_eq!(props["refresh_if_stale"]["type"], "boolean");
+    }
+
+    #[test]
+    fn handle_get_impact_no_dependents_includes_root_freshness() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn leaf() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let args = serde_json::json!({"symbol_fqn": "src/demo.rs::leaf"});
+        let result = handle_get_impact(&conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        // Root symbol's file freshness is always included, even with zero dependents
+        assert!(result.contains("freshness:"),
+            "leaf symbol should still have freshness from root file; got: {result}");
+    }
+
+    #[test]
+    fn handle_trace_flow_freshness_ignores_hidden_paths() {
+        // Test that format_trace_result filters sensitive paths and returns empty file_paths,
+        // so the handler omits the freshness footer.
+        use crate::graph::trace::{PathNode, TraceResult, format_trace_result};
+
+        // All paths go through .env (sensitive) — should be filtered out
+        let result = TraceResult {
+            paths: vec![vec![
+                PathNode { fqn: "src/a.rs::source".into(), file_path: "src/a.rs".into() },
+                PathNode { fqn: ".env::secret".into(), file_path: ".env".into() },
+                PathNode { fqn: "src/b.rs::target".into(), file_path: "src/b.rs".into() },
+            ]],
+            depth_limit_hit: false,
+            neighbor_cap_hit: false,
+        };
+        let (_, visible_file_paths) = format_trace_result(
+            "src/a.rs::source", "src/b.rs::target", &result, &ContentPolicy::default(),
+        );
+        assert!(visible_file_paths.is_empty(),
+            "paths through sensitive files must be filtered; got: {visible_file_paths:?}");
+
+        // Paths that don't touch sensitive files should return file paths
+        let clean_result = TraceResult {
+            paths: vec![vec![
+                PathNode { fqn: "src/a.rs::source".into(), file_path: "src/a.rs".into() },
+                PathNode { fqn: "src/b.rs::target".into(), file_path: "src/b.rs".into() },
+            ]],
+            depth_limit_hit: false,
+            neighbor_cap_hit: false,
+        };
+        let (_, clean_paths) = format_trace_result(
+            "src/a.rs::source", "src/b.rs::target", &clean_result, &ContentPolicy::default(),
+        );
+        assert_eq!(clean_paths.len(), 2, "clean paths should return 2 file paths; got: {clean_paths:?}");
+    }
+
+    #[test]
+    fn handle_get_brief_single_repo_uses_freshness() {
+        // Single-repo mode (no remotes): should use "freshness:" not "local_freshness:"
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join(".olaf").join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let mut ws = crate::workspace::Workspace::single(conn, dir.path().to_path_buf(), vec![]);
+        let args = serde_json::json!({"intent": "understand hello function"});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(result.contains("freshness: current"),
+            "single-repo get_brief must include 'freshness: current'; got: {result}");
+        assert!(!result.contains("local_freshness:"),
+            "single-repo get_brief must NOT use 'local_freshness:'; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_workspace_uses_local_freshness() {
+        // Workspace mode (has remotes): should use "local_freshness:" not bare "freshness:"
+        use crate::workspace::{WorkspaceConfig, WorkspaceMember};
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join(".olaf").join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        // Create a remote member directory with its own DB
+        let remote_dir = dir.path().join("remote_repo");
+        let remote_src = remote_dir.join("src");
+        std::fs::create_dir_all(&remote_src).unwrap();
+        std::fs::write(remote_src.join("lib.rs"), b"pub fn remote_fn() {}\n").unwrap();
+        let remote_db_path = remote_dir.join(".olaf").join("index.db");
+        let mut remote_conn = crate::db::open(&remote_db_path).unwrap();
+        crate::index::run(&mut remote_conn, &remote_dir).unwrap();
+        drop(remote_conn);
+
+        let config = WorkspaceConfig {
+            members: vec![WorkspaceMember {
+                path: remote_dir.canonicalize().unwrap(),
+                label: "remote".to_string(),
+                role: None,
+            }],
+            warnings: vec![],
+        };
+        let mut ws = crate::workspace::Workspace::load(conn, dir.path().to_path_buf(), &config);
+        assert!(ws.has_remotes(), "workspace must have remotes for this test");
+
+        let args = serde_json::json!({"intent": "understand hello function"});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(result.contains("local_freshness: current"),
+            "workspace get_brief must include 'local_freshness: current'; got: {result}");
     }
 }
