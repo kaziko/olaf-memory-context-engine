@@ -2042,7 +2042,17 @@ pub(crate) fn get_impact(
         ));
     }
 
-    let file_paths: HashSet<String> = results.iter().map(|(_, _, p, _, _)| p.clone()).collect();
+    let mut file_paths: HashSet<String> = results.iter().map(|(_, _, p, _, _)| p.clone()).collect();
+    // Include the root symbol's file — even with zero dependents, its freshness matters
+    if let Ok(root_path) = conn.query_row(
+        "SELECT f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=?1",
+        params![symbol_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        if !is_sensitive(&root_path) && !content_policy.is_denied(&root_path, None) {
+            file_paths.insert(root_path);
+        }
+    }
     Ok((output, file_paths))
 }
 

@@ -902,18 +902,20 @@ fn handle_get_file_skeleton(conn: &mut rusqlite::Connection, project_root: &Path
         if freshness.status == FreshnessStatus::Stale && refresh {
             match crate::index::incremental::reindex_single_file(conn, project_root, resolved) {
                 Ok(crate::index::incremental::ReindexOutcome::Changed(_)) => {
-                    // Symbols changed — re-render skeleton from fresh DB data
-                    let (new_output, _) = crate::graph::query::get_file_skeleton(conn, file_path, content_policy, detail)
+                    // Symbols changed — re-render skeleton from fresh DB data using resolved path
+                    let (new_output, _) = crate::graph::query::get_file_skeleton(conn, resolved, content_policy, detail)
                         .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
                     output = new_output;
                     freshness = check_file_freshness(conn, project_root, resolved);
                 }
                 Ok(crate::index::incremental::ReindexOutcome::Unchanged) => {
-                    // Hash matched after reindex — content is the same, just update freshness
                     freshness = check_file_freshness(conn, project_root, resolved);
                 }
-                Ok(crate::index::incremental::ReindexOutcome::SoftFailure(_)) | Err(_) => {
-                    // Reindex failed — freshness stays Stale, output stays as-is
+                Ok(crate::index::incremental::ReindexOutcome::SoftFailure(_)) => {
+                    // Expected failure (IO, unsupported lang, parse error) — freshness stays Stale
+                }
+                Err(e) => {
+                    return Err(ToolError::Internal(anyhow::anyhow!("refresh_if_stale reindex failed: {e}")));
                 }
             }
         }
@@ -2374,7 +2376,7 @@ pub fn init() -> Config {\n\
     }
 
     #[test]
-    fn handle_get_impact_no_dependents_omits_footer() {
+    fn handle_get_impact_no_dependents_includes_root_freshness() {
         let dir = tempdir().unwrap();
         let src_dir = dir.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -2385,8 +2387,9 @@ pub fn init() -> Config {\n\
 
         let args = serde_json::json!({"symbol_fqn": "src/demo.rs::leaf"});
         let result = handle_get_impact(&conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
-        assert!(!result.contains("freshness:"),
-            "leaf symbol with no dependents should omit freshness footer; got: {result}");
+        // Root symbol's file freshness is always included, even with zero dependents
+        assert!(result.contains("freshness:"),
+            "leaf symbol should still have freshness from root file; got: {result}");
     }
 
     #[test]
