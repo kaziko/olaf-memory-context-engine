@@ -2048,10 +2048,10 @@ pub(crate) fn get_impact(
         "SELECT f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=?1",
         params![symbol_id],
         |r| r.get::<_, String>(0),
-    ) {
-        if !is_sensitive(&root_path) && !content_policy.is_denied(&root_path, None) {
-            file_paths.insert(root_path);
-        }
+    )
+        && !is_sensitive(&root_path) && !content_policy.is_denied(&root_path, None)
+    {
+        file_paths.insert(root_path);
     }
     Ok((output, file_paths))
 }
