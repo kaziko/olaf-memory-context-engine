@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.1 — 2026-03-26
+
+### Added
+
+- **Skeleton detail levels** — `get_file_skeleton` accepts a `detail` parameter (`minimal`, `standard`, `detailed`) to control rendering verbosity. Minimal shows names and line ranges; detailed includes all children and dependency edges.
+- **Declaration-aware skeleton rendering for Python, Go, and PHP** — skeletons now render nested children (class fields, enum variants, interface members) under their parent declarations, matching the existing Rust/TS/JS behavior.
+- **Python decorator signatures** — decorated methods now include `@decorator` lines in skeleton output.
+- **PHP constants and trait usage** — class constants and `use TraitName` statements are extracted as child symbols and rendered in skeletons.
+- **Freshness metadata on all read tools** — `get_file_skeleton`, `get_impact`, `trace_flow`, `get_brief`, and `get_context` now append a `freshness:` footer indicating whether indexed data is current or stale. Uses blake3 hash comparison between disk and database. Stale files trigger on-demand reindex with `refresh_if_stale`. Workspace mode scopes freshness to `local_freshness` since remote members are not demand-reindexed.
+
+### Fixed
+
+- **TS/JS skeleton rendering** — fixed enum kind display, type alias signatures, JS class field extraction, and edge resolution for TypeScript and JavaScript parsers.
+- **DB corruption recovery** — `open`/`migrate` now detects corrupt databases and automatically recreates them instead of crashing.
+
+### Changed
+
+- bump `ratatui` 0.29 → 0.30 (fixes `lru` CVE)
+- bump `rustls-webpki` 0.103.9 → 0.103.10
+
 ## 0.7.0 — 2026-03-21
 
 ### Added
