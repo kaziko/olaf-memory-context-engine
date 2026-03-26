@@ -118,13 +118,18 @@ fn resolve_node(conn: &rusqlite::Connection, id: i64) -> Result<PathNode, rusqli
     )
 }
 
-pub(crate) fn format_trace_result(source_fqn: &str, target_fqn: &str, result: &TraceResult, content_policy: &ContentPolicy) -> String {
+use std::collections::HashSet;
+
+/// Returns `(formatted_output, visible_file_paths)`. The visible file paths are the set of
+/// unique file paths from paths that passed the sensitive/policy filter. Used by the handler
+/// for freshness checks — avoids duplicating the filter logic.
+pub(crate) fn format_trace_result(source_fqn: &str, target_fqn: &str, result: &TraceResult, content_policy: &ContentPolicy) -> (String, HashSet<String>) {
     // Direct-query guard: denied FQNs (by fqn_prefix or path rules) return "not found"
     if content_policy.is_denied_by_fqn(source_fqn) {
-        return format!("Symbol not found: {source_fqn}\n\nRun `olaf index` first.");
+        return (format!("Symbol not found: {source_fqn}\n\nRun `olaf index` first."), HashSet::new());
     }
     if content_policy.is_denied_by_fqn(target_fqn) {
-        return format!("Symbol not found: {target_fqn}\n\nRun `olaf index` first.");
+        return (format!("Symbol not found: {target_fqn}\n\nRun `olaf index` first."), HashSet::new());
     }
 
     let mut out = format!("# Trace Flow: {source_fqn} → {target_fqn}\n\n");
@@ -134,6 +139,10 @@ pub(crate) fn format_trace_result(source_fqn: &str, target_fqn: &str, result: &T
         .filter(|path| !path.iter().any(|n|
             is_sensitive(&n.file_path) || content_policy.is_denied(&n.file_path, Some(&n.fqn))
         ))
+        .collect();
+
+    let visible_file_paths: HashSet<String> = visible_paths.iter()
+        .flat_map(|path| path.iter().map(|node| node.file_path.clone()))
         .collect();
 
     if visible_paths.is_empty() {
@@ -159,7 +168,7 @@ pub(crate) fn format_trace_result(source_fqn: &str, target_fqn: &str, result: &T
     if result.neighbor_cap_hit {
         out.push_str(&format!("⚠ Neighbor cap ({MAX_NEIGHBORS_PER_HOP}) hit on at least one node — some paths may not have been explored\n"));
     }
-    out
+    (out, visible_file_paths)
 }
 
 #[cfg(test)]
@@ -290,7 +299,7 @@ mod tests {
             depth_limit_hit: true,
             neighbor_cap_hit: false,
         };
-        let out = format_trace_result("A", "B", &result, &ContentPolicy::default());
+        let (out, _) = format_trace_result("A", "B", &result, &ContentPolicy::default());
         assert!(out.contains("Depth limit"), "must contain depth limit warning; got: {out}");
         assert!(!out.contains("Neighbor cap"), "must not contain neighbor cap warning; got: {out}");
     }
@@ -302,7 +311,7 @@ mod tests {
             depth_limit_hit: false,
             neighbor_cap_hit: true,
         };
-        let out = format_trace_result("A", "B", &result, &ContentPolicy::default());
+        let (out, _) = format_trace_result("A", "B", &result, &ContentPolicy::default());
         assert!(out.contains("Neighbor cap"), "must contain neighbor cap warning; got: {out}");
         assert!(!out.contains("Depth limit"), "must not contain depth limit warning; got: {out}");
     }
@@ -317,7 +326,7 @@ mod tests {
             depth_limit_hit: false,
             neighbor_cap_hit: false,
         };
-        let out = format_trace_result("A", "B", &result, &ContentPolicy::default());
+        let (out, _) = format_trace_result("A", "B", &result, &ContentPolicy::default());
         assert!(out.contains("No execution path found"), "sensitive path must be filtered; got: {out}");
     }
 
