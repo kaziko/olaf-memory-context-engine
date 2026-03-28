@@ -1179,15 +1179,19 @@ fn build_context_brief(
             }
         };
 
+        // Capture primary file as soon as an eligible pivot is found — even if
+        // the formatted entry exceeds pivot_budget and the loop breaks before
+        // rendering it. This ensures get_brief sees the edit target for skeleton.
+        if primary_file.is_none() {
+            primary_file = Some(row.file_path.clone());
+        }
+
         let entry = format_pivot_entry(&row, &source);
         let entry_tokens = estimate_tokens(&entry);
         if pivot_tokens + entry_tokens > pivot_budget { break; }
         output.push_str(&entry);
         pivot_tokens += entry_tokens;
         rendered_pivot_ids.insert(*id);
-        if primary_file.is_none() {
-            primary_file = Some(row.file_path.clone());
-        }
     }
 
     render_supporting_skeletons(
@@ -1567,6 +1571,12 @@ pub(crate) fn build_context_brief_multi(
             }
         };
 
+        // Capture primary file before budget check — ensures skeleton target
+        // is available even when the pivot entry doesn't fit the budget
+        if primary_file.is_none() && tp.member_index == 0 {
+            primary_file = Some(row.file_path.clone());
+        }
+
         let entry = if tp.member_index != 0 {
             format!(
                 "## {} (`{}`) [{}]\nFile: `{}` lines {}-{}\n\n```\n{}\n```\n\n",
@@ -1580,9 +1590,6 @@ pub(crate) fn build_context_brief_multi(
         output.push_str(&entry);
         pivot_tokens += entry_tokens;
         rendered_pivot_ids.insert((tp.member_index, tp.pivot.id));
-        if primary_file.is_none() && tp.member_index == 0 {
-            primary_file = Some(row.file_path.clone());
-        }
     }
 
     // Supporting symbols — BFS per member (local only for traversal, per story scope)

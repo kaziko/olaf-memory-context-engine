@@ -1428,20 +1428,17 @@ fn handle_get_brief(
             let (conn, _) = ws.local_parts();
             if let Ok((skel_content, _)) = crate::graph::query::get_file_skeleton(
                 conn, primary_path, &content_policy, detail,
-            ) {
-                if crate::graph::query::estimate_tokens(&skel_content) <= skel_budget {
-                    // Insert detail between indexed_at and coverage
-                    let fc_with_detail = if let Some(pos) = fc_line.find(" | coverage:") {
-                        format!("{} | detail: {}{}", &fc_line[..pos], detail, &fc_line[pos..])
-                    } else {
-                        format!("{fc_line} | detail: {detail}")
-                    };
-                    section = Some(format!(
-                        "\n## Skeleton: {primary_path}\n_{fc_with_detail}_\n\n{skel_content}\n"
-                    ));
-                    break;
-                }
-                // Standard too big — try Minimal on next iteration
+            ) && crate::graph::query::estimate_tokens(&skel_content) <= skel_budget {
+                // Insert detail between indexed_at and coverage
+                let fc_with_detail = if let Some(pos) = fc_line.find(" | coverage:") {
+                    format!("{} | detail: {}{}", &fc_line[..pos], detail, &fc_line[pos..])
+                } else {
+                    format!("{fc_line} | detail: {detail}")
+                };
+                section = Some(format!(
+                    "\n## Skeleton: {primary_path}\n_{fc_with_detail}_\n\n{skel_content}\n"
+                ));
+                break;
             }
         }
         section
