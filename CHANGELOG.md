@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 — 2026-03-28
+
+### Added
+
+- **Auto-skeleton in `get_brief`** — implementation and bugfix intents now auto-include a file skeleton of the primary edit target, giving agents immediate structural context without a second tool call.
+- **Coverage and omission signals on `get_file_skeleton`** — skeleton responses include a `coverage:` footer indicating parser completeness (strong/unknown) and `omitted:` hints listing known parser blind spots per language.
+
 ## 0.7.1 — 2026-03-26
 
 ### Added
