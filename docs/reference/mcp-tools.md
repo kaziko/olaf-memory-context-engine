@@ -6,10 +6,10 @@ Once connected, Claude can use these tools:
 
 | Tool | Description |
 |-|-|
-| `get_brief` | Start here. Context brief for any task; includes impact analysis when `symbol_fqn` is provided. Use `get_context` or `get_impact` for fine-grained control. Accepts optional `branch` param (`"all"` for cross-branch). |
+| `get_brief` | Start here. Context brief for any task; includes impact analysis when `symbol_fqn` is provided. For implementation/bugfix intents, auto-includes the skeleton of the primary edit target. Use `get_context` or `get_impact` for fine-grained control. Accepts optional `branch` param (`"all"` for cross-branch). |
 | `get_context` | Token-budgeted context brief for a task; triggers incremental re-index. Accepts optional `branch` param (`"all"` for cross-branch). |
 | `get_impact` | Find symbols that call, extend, implement, or use a given symbol FQN as a type |
-| `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies). Accepts optional `detail` param: `"minimal"` (names + line ranges only, ~3× fewer tokens), `"standard"` (default), or `"detailed"` (200-child cap, dependency edges on children) |
+| `get_file_skeleton` | Signatures, docstrings, and edges for a file (no implementation bodies). Accepts optional `detail` param: `"minimal"` (names + line ranges only, ~3× fewer tokens), `"standard"` (default), or `"detailed"` (200-child cap, dependency edges on children). Footer includes freshness, coverage level (`strong`/`unknown`), and known parser omissions per language |
 | `analyze_failure` | Parse a stack trace or error output and return a context brief focused on the failure path |
 
 ## Session memory
