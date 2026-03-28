@@ -364,7 +364,7 @@ pub(crate) struct TaggedPivotScore {
     pub member_index: usize,
 }
 
-fn estimate_tokens(s: &str) -> usize {
+pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len().div_ceil(4)
 }
 
@@ -1137,12 +1137,13 @@ fn build_context_brief(
     branch: Option<&str>,
     content_policy: &ContentPolicy,
     embedder: Option<&dyn crate::memory::embedder::EmbedText>,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let mut output = intent_header.to_string();
+    let mut primary_file: Option<String> = None;
 
     if pivot_scores.is_empty() {
         output.push_str(NO_SYMBOLS_IN_INDEX);
-        return Ok((output, String::new()));
+        return Ok((output, String::new(), None));
     }
 
     let pivot_ids: Vec<i64> = pivot_scores.iter().map(|ps| ps.id).collect();
@@ -1177,6 +1178,13 @@ fn build_context_brief(
                 }
             }
         };
+
+        // Capture primary file as soon as an eligible pivot is found — even if
+        // the formatted entry exceeds pivot_budget and the loop breaks before
+        // rendering it. This ensures get_brief sees the edit target for skeleton.
+        if primary_file.is_none() {
+            primary_file = Some(row.file_path.clone());
+        }
 
         let entry = format_pivot_entry(&row, &source);
         let entry_tokens = estimate_tokens(&entry);
@@ -1327,7 +1335,7 @@ fn build_context_brief(
     let omitted = pivot_scores.len() - rendered.len();
     let retrieval_notes = format_retrieval_notes(&rendered, &intent_label, omitted);
 
-    Ok((output, retrieval_notes))
+    Ok((output, retrieval_notes, primary_file))
 }
 
 pub(crate) fn get_context(
@@ -1338,7 +1346,7 @@ pub(crate) fn get_context(
     token_budget: usize,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
@@ -1362,7 +1370,7 @@ pub(crate) fn get_context_from_pivot_scores(
     branch: Option<&str>,
     content_policy: &ContentPolicy,
     embedder: Option<&dyn crate::memory::embedder::EmbedText>,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
@@ -1385,7 +1393,7 @@ pub(crate) fn get_context_with_pivots(
     token_budget: usize,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
@@ -1409,7 +1417,7 @@ pub(crate) fn get_context_with_pivots(
     if pivot_scores.is_empty() {
         let mut output = intent_header;
         output.push_str(NO_SYMBOLS_FOR_FQNS);
-        return Ok((output, String::new()));
+        return Ok((output, String::new(), None));
     }
 
     let embedder = create_embedder(project_root);
@@ -1516,13 +1524,14 @@ pub(crate) fn build_context_brief_multi(
     branch: Option<&str>,
     content_policy: &ContentPolicy,
     embedder: Option<&dyn crate::memory::embedder::EmbedText>,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let members = workspace.all_read_conns();
     let mut output = intent_header.to_string();
+    let mut primary_file: Option<String> = None;
 
     if tagged_pivots.is_empty() {
         output.push_str(NO_SYMBOLS_IN_INDEX);
-        return Ok((output, String::new()));
+        return Ok((output, String::new(), None));
     }
 
     let pivot_budget = token_budget * 70 / 100;
@@ -1561,6 +1570,12 @@ pub(crate) fn build_context_brief_multi(
                 _ => row.signature.as_deref().unwrap_or("(source unavailable)").to_string(),
             }
         };
+
+        // Capture primary file before budget check — ensures skeleton target
+        // is available even when the pivot entry doesn't fit the budget
+        if primary_file.is_none() && tp.member_index == 0 {
+            primary_file = Some(row.file_path.clone());
+        }
 
         let entry = if tp.member_index != 0 {
             format!(
@@ -1729,7 +1744,7 @@ pub(crate) fn build_context_brief_multi(
     let omitted = tagged_pivots.len() - rendered.len();
     let retrieval_notes = format_retrieval_notes_multi(&rendered, &intent_label, omitted, &labels);
 
-    Ok((output, retrieval_notes))
+    Ok((output, retrieval_notes, primary_file))
 }
 
 /// Top-level workspace-aware context retrieval.
@@ -1740,7 +1755,7 @@ pub(crate) fn get_context_workspace(
     token_budget: usize,
     branch: Option<&str>,
     content_policy: &ContentPolicy,
-) -> Result<(String, String), QueryError> {
+) -> Result<(String, String, Option<String>), QueryError> {
     let profile = detect_intent_profile(intent);
     let policy = derive_traversal_policy(&profile);
     let intent_header = format_intent_header(&profile, intent);
@@ -2090,7 +2105,7 @@ pub(crate) enum FreshnessMode {
     LocalOnly,    // local_freshness: {status} | indexed_at: {ts}
 }
 
-fn format_unix_ts(ts: i64) -> String {
+pub(crate) fn format_unix_ts(ts: i64) -> String {
     use chrono::{DateTime, Utc};
     DateTime::from_timestamp(ts, 0)
         .map(|dt: DateTime<Utc>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -2622,7 +2637,7 @@ mod tests {
         insert_symbol(&conn, 1, "lib::pivot", "pivot", 1);
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "fix the crash", &[], 4000, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, root, "fix the crash", &[], 4000, None, &ContentPolicy::default()).unwrap();
         assert!(result.contains("intent_mode: bug-fix\n"), "get_context output must include intent_mode header line");
         assert!(result.contains("intent_confidence:"), "get_context output must include intent_confidence");
         assert!(result.contains("intent_signals:"), "get_context output must include intent_signals");
@@ -2840,7 +2855,7 @@ mod tests {
         conn.execute(&format!("INSERT INTO files VALUES (1,'{filename}','h')"), []).unwrap();
         insert_sym(&conn, 1, 1, "crate::my_pivot", "my_pivot", "fn", 1, 4, None, None, None);
 
-        let (result, _notes) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, &tmp_dir, "implement my_pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         assert!(result.contains("```"), "AC1: pivot output must contain fenced code block");
         assert!(result.contains("fn my_pivot"), "AC1: pivot source body must appear in output");
@@ -2856,7 +2871,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC2: supporting section must contain Signature line");
@@ -2873,7 +2888,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, root, "implement pivot", &[], 4000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
         assert!(supporting_section.contains("Signature:"), "AC3: Signature line must be present when sig is set");
@@ -2895,7 +2910,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (1,1,2,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, root, "implement pivot", &[], 50, None, &ContentPolicy::default()).unwrap();
 
         // Pivot must be present — proves pivot-first ordering was honoured
         assert!(result.contains("## pivot"), "AC4: pivot symbol must appear in output");
@@ -2917,7 +2932,7 @@ mod tests {
         conn.execute("INSERT INTO edges VALUES (3,1,4,'calls')", []).unwrap();
 
         let root = std::path::Path::new("/nonexistent");
-        let (result, _notes) = get_context(&conn, root, "implement pivot", &[], 50000, None, &ContentPolicy::default()).unwrap();
+        let (result, _notes, _) = get_context(&conn, root, "implement pivot", &[], 50000, None, &ContentPolicy::default()).unwrap();
 
         let supporting_section = result.split("## Supporting Symbols").nth(1).unwrap_or("");
 
@@ -3125,7 +3140,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("auth.rs"), "fn login() { todo!() }\n").unwrap();
 
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix login bug",
             &["src/auth.rs::login".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
@@ -3137,7 +3152,7 @@ mod tests {
     fn get_context_with_pivots_no_match() {
         let conn = build_test_db();
         let tmpdir = tempfile::tempdir().unwrap();
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix bug",
             &["nonexistent::symbol".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
@@ -3171,7 +3186,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix error",
             &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
@@ -3496,7 +3511,7 @@ mod tests {
         insert_sym(&conn, 1, 1, "pkg::target", "target", "fn", 1, 10, None, None, None);
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let (_, notes) = get_context_with_pivots(
+        let (_, notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix bug", &["pkg::target".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
         assert!(notes.contains("caller-supplied"), "CallerSupplied pivots must show 'caller-supplied' in retrieval notes");
@@ -3509,7 +3524,7 @@ mod tests {
         insert_sym(&conn, 1, 1, "pkg::handler", "handler", "fn", 1, 10, None, None, None);
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let (result, notes) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000, None, &ContentPolicy::default()).unwrap();
+        let (result, notes, _) = get_context(&conn, tmpdir.path(), "handler request", &[], 4000, None, &ContentPolicy::default()).unwrap();
         assert!(result.contains("Pivot Symbols"), "brief must have pivots");
         assert!(notes.contains("## Retrieval Notes"), "retrieval notes must be generated");
         assert!(notes.contains("handler"), "rendered pivot must appear in retrieval notes");
@@ -3618,7 +3633,7 @@ mod tests {
         // sensitive filter is what excludes the .env symbol, not a vacuous empty result.
         conn.execute("INSERT INTO files VALUES (2, 'src/config.rs', 'h2')", []).unwrap();
         insert_sym(&conn, 2, 2, "config::load", "load", "function", 1, 5, Some("pub fn load()"), None, None);
-        let (result, _notes) = get_context(
+        let (result, _notes, _) = get_context(
             &conn,
             Path::new("/nonexistent"),
             "load config",
@@ -4572,7 +4587,7 @@ mod eval {
                     get_context(&conn, &corpus, &intent, &hints, 4000, None, &ContentPolicy::default())
                 }));
                 match result {
-                    Ok(Ok((output, notes))) => {
+                    Ok(Ok((output, notes, _))) => {
                         let elapsed = start.elapsed().as_millis();
                         let tokens = estimate_tokens(&output) + estimate_tokens(&notes);
                         (Some(tokens), Some(elapsed))
@@ -4794,7 +4809,7 @@ mod eval {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix authentication JWT tokens issue",
             &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
@@ -4819,7 +4834,7 @@ mod eval {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix authentication JWT tokens issue",
             &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();
@@ -4843,7 +4858,7 @@ mod eval {
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
         // Very small budget — project sub-budget will be tiny (20% of ~5% of 50 = ~0-1 tokens)
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix authentication handler middleware",
             &["src/a.rs::handler".to_string()], 50, None, &ContentPolicy::default(),
         ).unwrap();
@@ -4868,7 +4883,7 @@ mod eval {
         std::fs::write(src.join("a.rs"), "fn handler() {}\n").unwrap();
 
         // Intent with punctuation-heavy terms
-        let (result, _notes) = get_context_with_pivots(
+        let (result, _notes, _) = get_context_with_pivots(
             &conn, tmpdir.path(), "fix CI/CD pipeline node.js deployment",
             &["src/a.rs::handler".to_string()], 4000, None, &ContentPolicy::default(),
         ).unwrap();

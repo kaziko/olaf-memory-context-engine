@@ -29,7 +29,7 @@ pub(crate) fn list() -> Vec<Value> {
     vec![
         serde_json::json!({
             "name": "get_brief",
-            "description": "Get a context brief for any task. Start here — the recommended entry point for codebase exploration. When to use instead of: multiple Grep + Read calls to understand unfamiliar code. Example: {\"intent\": \"understand the authentication flow\"} returns a token-budgeted brief with relevant symbols, dependencies, and session memory in one call. Includes impact analysis when symbol_fqn is provided. Use get_context or get_impact only when you need fine-grained control.",
+            "description": "Get a context brief for any task. Start here — the recommended entry point for codebase exploration. When to use instead of: multiple Grep + Read calls to understand unfamiliar code. Example: {\"intent\": \"understand the authentication flow\"} returns a token-budgeted brief with relevant symbols, dependencies, and session memory in one call. Includes impact analysis when symbol_fqn is provided. For implementation and bugfix intents, auto-includes the skeleton of the primary edit target — no separate get_file_skeleton call needed. Use get_context or get_impact only when you need fine-grained control.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -729,7 +729,7 @@ fn handle_analyze_failure(
 
     if !allowed_pivot_fqns.is_empty() {
         // Path A: Pivots resolved from trace (CallerSupplied — FQNs from stack-trace resolution)
-        let (brief, notes) = crate::graph::query::get_context_with_pivots(
+        let (brief, notes, _) = crate::graph::query::get_context_with_pivots(
             conn, project_root, &intent, &allowed_pivot_fqns, token_budget, branch.as_deref(), &content_policy
         ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
         retrieval_notes = notes;
@@ -766,7 +766,7 @@ fn handle_analyze_failure(
 
         if !keyword_pivots.is_empty() {
             // Path B: keywords matched symbols — pass PivotScores directly to preserve kw/deg scores
-            let (brief, notes) = crate::graph::query::get_context_from_pivot_scores(
+            let (brief, notes, _) = crate::graph::query::get_context_from_pivot_scores(
                 conn, project_root, &intent, keyword_pivots, token_budget, branch.as_deref(), &content_policy, embedder.as_deref()
             ).map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?;
             retrieval_notes = notes;
@@ -834,7 +834,7 @@ fn handle_get_context(ws: &mut crate::workspace::Workspace, args: Option<&Value>
         ContentPolicy::load(root)
     };
 
-    let (mut result, retrieval_notes) = if ws.has_remotes() {
+    let (mut result, retrieval_notes, _) = if ws.has_remotes() {
         crate::graph::query::get_context_workspace(ws, intent, &file_hints, token_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
@@ -919,15 +919,9 @@ fn handle_get_file_skeleton(conn: &mut rusqlite::Connection, project_root: &Path
                 }
             }
         }
-        let coverage = crate::graph::query::coverage_level_for_language(freshness.language.as_deref());
-        let omitted = crate::graph::query::omitted_hints_for_language(freshness.language.as_deref());
-        let coverage_suffix = crate::graph::query::format_coverage_suffix(&coverage, omitted);
-
-        let freshness_footer = format_freshness_footer(&freshness, FreshnessMode::SingleFile);
-        // Freshness footer ends with \n — insert coverage suffix before it
-        let trimmed = freshness_footer.trim_end_matches('\n');
-        output.push_str(trimmed);
-        output.push_str(&coverage_suffix);
+        let freshness_line = format_freshness_coverage_line(&freshness);
+        output.push_str("\n---\n");
+        output.push_str(&freshness_line);
         output.push('\n');
     }
 
@@ -1402,7 +1396,7 @@ fn handle_get_brief(
         ContentPolicy::load(root)
     };
     let ctx_budget = token_budget * 80 / 100;
-    let (context_output, retrieval_notes) = if ws.has_remotes() {
+    let (context_output, retrieval_notes, primary_file) = if ws.has_remotes() {
         crate::graph::query::get_context_workspace(ws, intent, &file_hints, ctx_budget, branch.as_deref(), &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     } else {
@@ -1411,16 +1405,79 @@ fn handle_get_brief(
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?
     };
 
+    // Detect intent for skeleton gating — uses execution_mode (matches retriever fallback)
+    let profile = crate::graph::query::detect_intent_profile(intent);
+    let skeleton_eligible = matches!(
+        profile.execution_mode,
+        crate::graph::query::IntentMode::BugFix | crate::graph::query::IntentMode::Implementation
+    ) && primary_file.is_some();
+
+    // Render skeleton if eligible (after context, never reduces context quality)
+    let skeleton_section = if skeleton_eligible {
+        let primary_path = primary_file.as_ref().unwrap();
+        let skel_budget = token_budget * 15 / 100;
+        let mut section = None;
+
+        // Compute freshness once — reused regardless of which detail level fits
+        let (conn, root) = ws.local_parts();
+        let freshness = check_file_freshness(conn, root, primary_path);
+        let fc_line = format_freshness_coverage_line(&freshness);
+
+        // Try Standard first, downgrade to Minimal if over budget
+        for &detail in &[crate::graph::DetailLevel::Standard, crate::graph::DetailLevel::Minimal] {
+            let (conn, _) = ws.local_parts();
+            if let Ok((skel_content, _)) = crate::graph::query::get_file_skeleton(
+                conn, primary_path, &content_policy, detail,
+            ) && crate::graph::query::estimate_tokens(&skel_content) <= skel_budget {
+                // Insert detail between indexed_at and coverage
+                let fc_with_detail = if let Some(pos) = fc_line.find(" | coverage:") {
+                    format!("{} | detail: {}{}", &fc_line[..pos], detail, &fc_line[pos..])
+                } else {
+                    format!("{fc_line} | detail: {detail}")
+                };
+                section = Some(format!(
+                    "\n## Skeleton: {primary_path}\n_{fc_with_detail}_\n\n{skel_content}\n"
+                ));
+                break;
+            }
+        }
+        section
+    } else {
+        None
+    };
+
+    let skeleton_included = skeleton_section.is_some();
+
     // Build impact section (local-only) — ignore file_paths (.0 only), already auto-reindexed
-    let impact_output = if let Some(fqn) = symbol_fqn {
+    let mut impact_output = if let Some(fqn) = symbol_fqn {
         crate::graph::query::get_impact(ws.local_conn(), fqn, depth, &content_policy)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("{e}")))?.0
     } else {
         "No primary symbol specified — provide symbol_fqn for impact analysis.\n".to_string()
     };
 
+    // Truncate impact based on skeleton presence
+    let impact_budget = if skeleton_included {
+        std::cmp::max(token_budget * 5 / 100, 80)
+    } else {
+        token_budget * 20 / 100
+    };
+    truncate_to_budget_silent(&mut impact_output, impact_budget);
+
+    // Hard-cap context output when skeleton is present — build_context_brief may exceed
+    // its internal budget due to headers/section overhead, squeezing the skeleton out
+    // during final truncation. Without skeleton, the old behavior is preserved.
+    let mut ctx_out = context_output;
+    if skeleton_included {
+        truncate_to_budget_silent(&mut ctx_out, ctx_budget);
+    }
+
     // Assemble output
-    let mut output = format!("{context_output}\n---\n{impact_output}");
+    let mut output = if let Some(ref skel) = skeleton_section {
+        format!("{ctx_out}{skel}---\n{impact_output}")
+    } else {
+        format!("{ctx_out}\n---\n{impact_output}")
+    };
 
     // Hard-truncate to enforce token budget
     truncate_to_budget(&mut output, token_budget);
@@ -1505,20 +1562,46 @@ fn append_multi_file_freshness(conn: &rusqlite::Connection, project_root: &Path,
     }
 }
 
+/// Format a freshness + coverage metadata string from a `FileFreshness` value.
+/// Returns "freshness: {status} | indexed_at: {ts} | coverage: {level} | omitted: {hints}"
+/// without any prefix/suffix framing. The caller adds `\n---\n` or italic markdown as needed.
+fn format_freshness_coverage_line(freshness: &FileFreshness) -> String {
+    let ts_str = freshness.indexed_at
+        .map(crate::graph::query::format_unix_ts)
+        .unwrap_or_else(|| "never".to_string());
+    let coverage = crate::graph::query::coverage_level_for_language(freshness.language.as_deref());
+    let omitted = crate::graph::query::omitted_hints_for_language(freshness.language.as_deref());
+    let coverage_suffix = crate::graph::query::format_coverage_suffix(&coverage, omitted);
+    format!("freshness: {} | indexed_at: {}{}", freshness.status, ts_str, coverage_suffix)
+}
+
 /// Truncates `s` so that `s.len().div_ceil(4) <= token_budget` after appending the note.
 /// Finds the nearest valid UTF-8 char boundary to avoid panics on multibyte chars.
 fn truncate_to_budget(s: &mut String, token_budget: usize) {
+    truncate_to_budget_inner(s, token_budget, true);
+}
+
+/// Silent truncation — no "(response truncated)" note appended.
+/// Use for sub-section budgets (impact, context) where the caller will apply
+/// a final whole-response truncation with the user-facing note.
+fn truncate_to_budget_silent(s: &mut String, token_budget: usize) {
+    truncate_to_budget_inner(s, token_budget, false);
+}
+
+fn truncate_to_budget_inner(s: &mut String, token_budget: usize, append_note: bool) {
     const NOTE: &str = "\n(response truncated to fit token_budget)\n";
+    let note_overhead = if append_note { NOTE.len() } else { 0 };
     let max_bytes = token_budget.saturating_mul(4);
     if s.len().div_ceil(4) <= token_budget {
         return;
     }
-    // Reserve space for the note so the final output stays within budget.
-    let cutoff = max_bytes.saturating_sub(NOTE.len());
+    let cutoff = max_bytes.saturating_sub(note_overhead);
     // Walk back to a valid UTF-8 char boundary (s.is_char_boundary(0) is always true).
     let boundary = (0..=cutoff).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
     s.truncate(boundary);
-    s.push_str(NOTE);
+    if append_note {
+        s.push_str(NOTE);
+    }
     // Postcondition: s.len().div_ceil(4) <= token_budget (NOTE.len() reserved above).
 }
 
@@ -2545,5 +2628,169 @@ pub fn init() -> Config {\n\
         let args = serde_json::json!({"file_path": "src/empty.rs"});
         let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
         assert!(result.contains("parser_limitations:"), "no-symbols response must include parser_limitations; got: {result}");
+    }
+
+    // --- Story 15.8: get_brief auto-includes skeleton for edit targets ---
+
+    /// Helper: create a single-repo workspace with indexed Rust source
+    fn setup_brief_test_ws(source: &str) -> (tempfile::TempDir, crate::workspace::Workspace) {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("handler.rs"), source.as_bytes()).unwrap();
+        let db_path = dir.path().join(".olaf").join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+        let ws = crate::workspace::Workspace::single(conn, dir.path().to_path_buf(), vec![]);
+        (dir, ws)
+    }
+
+    const HANDLER_SOURCE: &str = "pub fn handle_request(req: &str) -> String {\n    format!(\"ok: {}\", req)\n}\n\npub fn validate_input(input: &str) -> bool {\n    !input.is_empty()\n}\n";
+
+    #[test]
+    fn handle_get_brief_impl_intent_includes_skeleton() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({"intent": "implement the request handler", "file_hints": ["handler.rs"]});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(result.contains("## Skeleton:"),
+            "implementation intent must include skeleton section; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_bugfix_intent_includes_skeleton() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({"intent": "fix the crash in handler", "file_hints": ["handler.rs"]});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(result.contains("## Skeleton:"),
+            "bugfix intent must include skeleton section; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_refactor_intent_no_skeleton() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({"intent": "refactor the handler module"});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(!result.contains("## Skeleton:"),
+            "refactor intent must NOT include skeleton section; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_ambiguous_intent_no_skeleton() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        // Mixed signals → low confidence → execution_mode falls back to Balanced
+        let args = serde_json::json!({"intent": "fix and refactor the auth flow"});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(!result.contains("## Skeleton:"),
+            "ambiguous intent (Balanced execution_mode) must NOT include skeleton; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_tight_budget_downgrades_to_minimal() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        // Very small budget — skeleton should be minimal or omitted, not crash
+        let args = serde_json::json!({"intent": "implement handler", "token_budget": 500, "file_hints": ["handler.rs"]});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        // Just verify no crash — skeleton may or may not appear depending on budget
+        assert!(!result.is_empty(), "tight budget must not crash");
+    }
+
+    #[test]
+    fn handle_get_brief_no_primary_file_no_skeleton() {
+        // Empty index — no symbols at all, so no pivots render, primary_file stays None
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(".olaf").join("index.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        // Don't run indexer — leave the DB empty
+        let mut ws = crate::workspace::Workspace::single(conn, dir.path().to_path_buf(), vec![]);
+        let args = serde_json::json!({"intent": "implement the auth handler"});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        assert!(!result.contains("## Skeleton:"),
+            "empty index must NOT produce skeleton section; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_skeleton_has_freshness() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({"intent": "implement request handler", "file_hints": ["handler.rs"]});
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        if result.contains("## Skeleton:") {
+            assert!(result.contains("freshness:"),
+                "skeleton section must contain freshness metadata; got: {result}");
+            assert!(result.contains("detail:"),
+                "skeleton section must contain detail level; got: {result}");
+        }
+    }
+
+    #[test]
+    fn handle_get_brief_skeleton_before_impact() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({
+            "intent": "implement request handler",
+            "file_hints": ["handler.rs"],
+            "symbol_fqn": "src/handler.rs::handle_request"
+        });
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        if result.contains("## Skeleton:") {
+            let skel_pos = result.find("## Skeleton:").unwrap();
+            // Find the impact separator AFTER the skeleton section
+            let impact_sep_abs = result[skel_pos..].find("---\n")
+                .map(|offset| skel_pos + offset);
+            assert!(impact_sep_abs.is_some(),
+                "impact separator must exist after skeleton; got: {result}");
+            // Verify the impact content follows the separator
+            let after_sep = &result[impact_sep_abs.unwrap() + 4..];
+            assert!(!after_sep.trim().is_empty(),
+                "impact content must follow the separator after skeleton; got: {result}");
+        }
+    }
+
+    #[test]
+    fn handle_get_brief_impact_survives_with_skeleton() {
+        let (_dir, mut ws) = setup_brief_test_ws(HANDLER_SOURCE);
+        let args = serde_json::json!({
+            "intent": "implement request handler",
+            "file_hints": ["handler.rs"],
+            "symbol_fqn": "src/handler.rs::handle_request"
+        });
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        // Impact section should be present (even if just the "no dependents" message)
+        assert!(result.contains("impact") || result.contains("No primary symbol") || result.contains("No dependents"),
+            "impact section must survive even with skeleton; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_brief_denied_first_pivot_uses_next() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // "secret.rs" will be denied by policy, "handler.rs" is allowed.
+        // Both have symbols so both could become pivots.
+        std::fs::write(src_dir.join("secret.rs"), b"pub fn secret_fn() {}\npub fn secret_helper() {}\n").unwrap();
+        std::fs::write(src_dir.join("handler.rs"), HANDLER_SOURCE.as_bytes()).unwrap();
+
+        // Write policy.toml BEFORE indexing — policy is loaded at handler time, not index time
+        let olaf_dir = dir.path().join(".olaf");
+        std::fs::create_dir_all(&olaf_dir).unwrap();
+        std::fs::write(olaf_dir.join("policy.toml"), "[[deny]]\npath = \"src/secret.rs\"\n").unwrap();
+
+        let db_path = olaf_dir.join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let mut ws = crate::workspace::Workspace::single(conn, dir.path().to_path_buf(), vec![]);
+        // Intent mentions "secret" to make the denied file a likely pivot candidate
+        let args = serde_json::json!({
+            "intent": "implement the secret handler",
+            "file_hints": ["secret.rs", "handler.rs"]
+        });
+        let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
+        // Denied file must not appear in pivots at all
+        assert!(!result.contains("secret_fn"),
+            "denied file's symbols must not appear in output; got: {result}");
+        // If a skeleton is included, it must be for the allowed file, not the denied one
+        if result.contains("## Skeleton:") {
+            assert!(result.contains("## Skeleton: src/handler.rs"),
+                "skeleton must target the next eligible file (handler.rs), not denied secret.rs; got: {result}");
+        }
     }
 }

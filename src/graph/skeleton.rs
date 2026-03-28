@@ -13,6 +13,16 @@ pub(crate) enum DetailLevel {
     Detailed,
 }
 
+impl std::fmt::Display for DetailLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetailLevel::Minimal => write!(f, "minimal"),
+            DetailLevel::Standard => write!(f, "standard"),
+            DetailLevel::Detailed => write!(f, "detailed"),
+        }
+    }
+}
+
 /// Maps raw DB kind strings (snake_case) to Title Case display form.
 /// Returns `Cow::Borrowed` for known kinds (zero allocation), `Cow::Owned` for unknown fallback.
 fn display_kind(kind: &str) -> Cow<'static, str> {
