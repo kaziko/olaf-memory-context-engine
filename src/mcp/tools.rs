@@ -121,7 +121,7 @@ pub(crate) fn list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "get_file_skeleton",
-            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. When to use instead of: Read for any file over 200 lines that you need to understand before editing. Returns 90%+ fewer tokens than reading the full file while showing the complete structure. Example: {\"file_path\": \"src/mcp/tools.rs\"} returns all function signatures, struct definitions, and imports without method bodies. Accepts exact or partial file paths. Response includes freshness metadata (current/stale/unknown). Set refresh_if_stale to true to trigger a targeted reindex if stale.",
+            "description": "Get all symbol signatures, docstrings, and dependency edges for a file — no implementation bodies. When to use instead of: Read for any file over 200 lines that you need to understand before editing. Returns 90%+ fewer tokens than reading the full file while showing the complete structure. Example: {\"file_path\": \"src/mcp/tools.rs\"} returns all function signatures, struct definitions, and imports without method bodies. Accepts exact or partial file paths. Response includes freshness metadata (current/stale/unknown) and coverage metadata (strong/unknown with known parser omissions per language). Set refresh_if_stale to true to trigger a targeted reindex if stale.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -919,7 +919,16 @@ fn handle_get_file_skeleton(conn: &mut rusqlite::Connection, project_root: &Path
                 }
             }
         }
-        output.push_str(&format_freshness_footer(&freshness, FreshnessMode::SingleFile));
+        let coverage = crate::graph::query::coverage_level_for_language(freshness.language.as_deref());
+        let omitted = crate::graph::query::omitted_hints_for_language(freshness.language.as_deref());
+        let coverage_suffix = crate::graph::query::format_coverage_suffix(&coverage, omitted);
+
+        let freshness_footer = format_freshness_footer(&freshness, FreshnessMode::SingleFile);
+        // Freshness footer ends with \n — insert coverage suffix before it
+        let trimmed = freshness_footer.trim_end_matches('\n');
+        output.push_str(trimmed);
+        output.push_str(&coverage_suffix);
+        output.push('\n');
     }
 
     Ok(output)
@@ -1482,7 +1491,7 @@ fn append_auto_reindex_freshness(ws: &mut crate::workspace::Workspace, output: &
         "SELECT MAX(last_indexed_at) FROM files", [], |r| r.get(0),
     ).unwrap_or(None);
     if let Some(ts) = ts {
-        let freshness = FileFreshness { status: FreshnessStatus::Current, indexed_at: Some(ts) };
+        let freshness = FileFreshness { status: FreshnessStatus::Current, indexed_at: Some(ts), language: None };
         let mode = if ws.has_remotes() { FreshnessMode::LocalOnly } else { FreshnessMode::SingleFile };
         output.push_str(&format_freshness_footer(&freshness, mode));
     }
@@ -2486,5 +2495,55 @@ pub fn init() -> Config {\n\
         let result = handle_get_brief(&mut ws, Some(&args)).unwrap();
         assert!(result.contains("local_freshness: current"),
             "workspace get_brief must include 'local_freshness: current'; got: {result}");
+    }
+
+    // --- coverage and omission signals on get_file_skeleton ---
+
+    #[test]
+    fn handle_get_file_skeleton_includes_coverage() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result.contains("coverage: strong"), "response must contain coverage: strong; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_coverage_with_omissions() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("demo.rs"), b"pub fn hello() {}\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let args = serde_json::json!({"file_path": "src/demo.rs"});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        // Rust files should have omitted hints
+        assert!(result.contains("omitted:"), "Rust file must have omitted field; got: {result}");
+        assert!(result.contains("macro"), "Rust omitted must mention macros; got: {result}");
+    }
+
+    #[test]
+    fn handle_get_file_skeleton_no_symbols_has_parser_limitations() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // Write a Rust file with no indexable symbols (just a comment)
+        std::fs::write(src_dir.join("empty.rs"), b"// just a comment, no symbols\n").unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::index::run(&mut conn, dir.path()).unwrap();
+
+        let args = serde_json::json!({"file_path": "src/empty.rs"});
+        let result = handle_get_file_skeleton(&mut conn, dir.path(), Some(&args), &ContentPolicy::default()).unwrap();
+        assert!(result.contains("parser_limitations:"), "no-symbols response must include parser_limitations; got: {result}");
     }
 }
